@@ -1,0 +1,19 @@
+version: v2
+inputs:
+  - directory: .
+    paths:
+      - proto/perl.proto
+plugins:
+  # wasm2go binding — emits the bridge plus the transpiled internal/wasm2go tree
+  # under build/wasm2go/. go-perl consumes that bundle (released as
+  # perl_wasm2go.tar.gz). The wasm= path resolves against the CWD of
+  # `buf generate` (project root); the pipeline runs `wasmify wasm-build` first,
+  # so the file is present. The bundle's own import path
+  # (github.com/goccy/perlwasm2go) comes from the proto's wasm2go_package
+  # option, which gen-proto writes from wasmify.json's bridge.Wasm2GoImportPath.
+  - local: protoc-gen-wasmify-go
+    out: build/wasm2go
+    opt:
+      - module=github.com/goccy/go-perl
+      - runtime=wasm2go
+      - wasm=.wasmify/wasm-build/output/perl.wasm
