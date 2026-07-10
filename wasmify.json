@@ -1,0 +1,79 @@
+{
+  "version": "1.0",
+  "upstream": {
+    "path": "./perl5",
+    "commit": "b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed",
+    "branch": "v5.42.2"
+  },
+  "project": {
+    "name": "perl",
+    "root_dir": "./perl5",
+    "language": "c",
+    "language_standard": "c11"
+  },
+  "build_system": {
+    "type": "other",
+    "files": [
+      "perl5/Configure",
+      "perl5/Makefile.SH",
+      "perl5/config_h.SH"
+    ]
+  },
+  "targets": [
+    {
+      "name": "libperl",
+      "type": "library",
+      "build_target": "libperl.a",
+      "source_dirs": [
+        "perl5"
+      ],
+      "description": "Static Perl interpreter library (wasm32-wasi). The embedding API in perl.h (perl_new/perl_eval/perl_close) links against this. Perl's C core is a flat set of ~50 .c files at the repo root (perl.c, sv.c, op.c, pp*.c, regcomp.c, run.c, ...)."
+    },
+    {
+      "name": "perl",
+      "type": "executable",
+      "build_target": "perl",
+      "source_dirs": [
+        "perl5"
+      ],
+      "description": "Standalone perl.wasm interpreter executable (perlmain.c entry)."
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "wasi-sdk",
+      "type": "tool",
+      "required": true
+    }
+  ],
+  "required_tools": [
+    {
+      "name": "make",
+      "installed": true
+    }
+  ],
+  "build_commands": {
+    "configure": "bash scripts/wasi-configure.sh",
+    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
+  },
+  "user_selection": {
+    "target_name": "libperl",
+    "build_type": "library"
+  },
+  "bridge": {
+    "CustomBridgeSources": [
+      "perl.cc"
+    ],
+    "GoPackage": "github.com/goccy/go-perl;perl",
+    "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
+    "HostSockets": true,
+    "HostSubprocess": true,
+    "StackSize": 8388608,
+    "ExportFunctions": [
+      "perl_new",
+      "perl_eval",
+      "perl_close",
+      "perl_interrupt_addr"
+    ]
+  }
+}
