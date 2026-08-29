@@ -27,15 +27,10 @@ Trim (everything that is meaningless in the embedded, statically-linked build):
 The unicore/ Unicode tables (*.pl / *.txt) ARE kept — required for \w, \p{...},
 case folding, and Encode.
 
-An optional overlay directory (scripts/compat) is merged on top of lib/: it
-carries pure-Perl emulations of modules the wasm build cannot link as XS
-(Time::HiRes, whose clock ids are type-incompatible with wasi-libc). Overlay
-files win over same-named lib/ files.
-
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
 
-Usage: make-stdlib-zip.py <perl5/lib dir> <output zip> [overlay dir]
+Usage: make-stdlib-zip.py <perl5/lib dir> <output zip>
 """
 
 import os
@@ -79,24 +74,15 @@ def collect(lib_dir: str) -> list[str]:
 
 
 def main() -> int:
-    if len(sys.argv) not in (3, 4):
-        sys.stderr.write("usage: make-stdlib-zip.py <perl5/lib dir> <output zip> [overlay dir]\n")
+    if len(sys.argv) != 3:
+        sys.stderr.write("usage: make-stdlib-zip.py <perl5/lib dir> <output zip>\n")
         return 2
     lib_dir, out_path = sys.argv[1], sys.argv[2]
-    overlay_dir = sys.argv[3] if len(sys.argv) == 4 else None
     if not os.path.isdir(lib_dir):
         sys.stderr.write(f"not a directory: {lib_dir}\n")
         return 1
-    if overlay_dir is not None and not os.path.isdir(overlay_dir):
-        sys.stderr.write(f"not a directory: {overlay_dir}\n")
-        return 1
 
-    # rel -> source root; the overlay wins on collision.
     sources = {rel: lib_dir for rel in collect(lib_dir)}
-    if overlay_dir is not None:
-        for rel in collect(overlay_dir):
-            sources[rel] = overlay_dir
-
     rels = sorted(sources)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in rels:

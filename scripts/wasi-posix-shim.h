@@ -24,6 +24,31 @@
  * values (distinct from FE_TONEAREST); they are never actually selected because
  * wasi's fegetround() always returns FE_TONEAREST, so POSIX::rint et al. round
  * to nearest, which is the only mode wasm implements. */
+/* wasi's clock ids are STRUCT POINTERS (clockid_t = const struct __clockid *,
+ * CLOCK_REALTIME = &_CLOCK_REALTIME), while perl-world code moves clock ids
+ * through IVs — generated constant tables (ExtUtils::Constant's const-c.inc
+ * in Time::HiRes) assign the macros to IV, and feature probes assign them to
+ * clockid_t. The clock_* FUNCTIONS are configured off for perl
+ * (d_clock_gettime='undef' & friends in wasi-configure.sh), so nothing can
+ * ever pass these ids to wasi-libc; replace the pointer macros with the
+ * conventional integer ids so both idioms compile. CLOCK_REALTIME must be 0:
+ * feature probes assign it to clockid_t, and 0 is the one integer that is
+ * also a valid null pointer constant. */
+#include <time.h>
+#undef CLOCK_REALTIME
+#undef CLOCK_MONOTONIC
+#undef CLOCK_PROCESS_CPUTIME_ID
+#undef CLOCK_THREAD_CPUTIME_ID
+#undef CLOCK_MONOTONIC_RAW
+#undef CLOCK_REALTIME_COARSE
+#undef CLOCK_MONOTONIC_COARSE
+#undef CLOCK_BOOTTIME
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID 3
+#define CLOCK_MONOTONIC_RAW 4
+
 #include <fenv.h>
 #ifndef FE_DOWNWARD
 #define FE_DOWNWARD   0x400
