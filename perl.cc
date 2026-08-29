@@ -68,11 +68,6 @@ void boot_Unicode__Collate(pTHX_ CV *cv);
 void boot_Unicode__Normalize(pTHX_ CV *cv);
 void boot_mro(pTHX_ CV *cv);
 void boot_re(pTHX_ CV *cv);
-/* Vendored CPAN XS distributions (xsdist/, built by build-xsdists.sh).
- * Registered under "<Module>::bootstrap" so the stock XSLoader/DynaLoader
- * static fallback resolves them at `use` time. */
-void boot_Text__Xslate(pTHX_ CV *cv);
-void boot_Text__Xslate__Methods(pTHX_ CV *cv);
 }
 
 static void xs_init(pTHX) {
@@ -116,10 +111,6 @@ static void xs_init(pTHX) {
     newXS("Unicode::Normalize::bootstrap", boot_Unicode__Normalize, file);
     newXS("mro::bootstrap", boot_mro, file);
     newXS("re::bootstrap", boot_re, file);
-
-    /* xsdist/ vendored extensions */
-    newXS("Text::Xslate::bootstrap", boot_Text__Xslate, file);
-    newXS("Text::Xslate::Methods::bootstrap", boot_Text__Xslate__Methods, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */
