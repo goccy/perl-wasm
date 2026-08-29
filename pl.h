@@ -116,4 +116,28 @@ std::string perl_call(uint64_t h, const char *sub_name, const char *args_json);
  * that calls the glue with the Go function's id). */
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
 
+/* ---- Native XS support ---------------------------------------------------
+ *
+ * Lets the host register XSUBs whose implementation lives OUTSIDE the wasm -
+ * in a host-native shared library the embedder dlopen'd (go-perl's native XS
+ * SDK). Perl-side each such sub is an ordinary XS backed by a generic thunk
+ * that forwards the call over the wasmify callback import with the reserved
+ * method id -1: payload [u32 fn_id][u32 items][u32 sv_tokens...], response
+ * [u8 ok] then on success [u32 nret][u32 sv_tokens...] or on failure the
+ * croak message. The host runs the native XSUB, using perl_xs_helper for
+ * every SV operation, and the thunk pushes the returned (mortal) SVs. */
+
+/* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
+ * key for the actual native function (stored in the CV's XSANY). */
+void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
+
+/* SV micro-operations the host-side SDK vtable is built from. op selects:
+ *   1 SV_IV      a=sv                   -> IV (as u64)
+ *   2 SV_PV      a=sv                   -> (ptr<<32)|len into linear memory
+ *   3 NEW_IV     a=iv                   -> new SV token
+ *   4 NEW_PVN    s=bytes b=len          -> new SV token
+ *   5 SV_MORTAL  a=sv                   -> sv (now mortal)
+ * Unknown ops return 0. */
+uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
+
 #endif /* PERLEMBED_H */

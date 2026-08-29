@@ -132,6 +132,10 @@ extern "C" int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_i
  * to. 0 = no dispatcher registered (perl_set_go_dispatcher not called). */
 static int32_t g_go_cb = 0;
 
+/* Reserved callback method id for native-XS dispatch (see pl.h). Ordinary
+ * bound Go functions use positive ids. */
+#define GOPERL_NATIVE_METHOD_ID (-1)
+
 /* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
  * via a plain linear-memory write (perl_interrupt_addr returns its address); no
  * wasm code runs on the instance. The interruptible run loop clears it and
@@ -223,6 +227,61 @@ XS(XS___plwasm_go_invoke) {
     }
     ST(0) = sv_2mortal(out);
     XSRETURN(1);
+}
+
+/* Generic thunk backing every host-native XSUB (see pl.h "Native XS
+ * support"). Marshals the call frame's SV tokens to the host over the
+ * wasmify callback import and pushes the returned (mortal) SVs. */
+XS(XS_goperl_native_thunk);
+XS(XS_goperl_native_thunk) {
+    dXSARGS;
+    int32_t fn_id = XSANY.any_i32;
+    if (g_go_cb == 0)
+        Perl_croak(aTHX_ "no Go dispatcher registered for this instance");
+
+    size_t payload_len = sizeof(uint32_t) * (2 + (size_t)items);
+    uint32_t *payload = (uint32_t *)malloc(payload_len);
+    if (!payload) Perl_croak(aTHX_ "native XS dispatch: out of memory");
+    payload[0] = (uint32_t)fn_id;
+    payload[1] = (uint32_t)items;
+    for (I32 i = 0; i < items; i++)
+        payload[2 + i] = (uint32_t)(uintptr_t)ST(i);
+
+    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_NATIVE_METHOD_ID,
+                                         payload, payload_len);
+    free(payload);
+
+    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    if (resp_ptr == 0 || resp_len < 1)
+        Perl_croak(aTHX_ "native XS dispatch: empty response");
+    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+
+    if (resp[0] == 0) { /* failure: the rest is the croak message */
+        char msg[512];
+        size_t n = resp_len - 1;
+        if (n > sizeof(msg) - 1) n = sizeof(msg) - 1;
+        memcpy(msg, resp + 1, n);
+        msg[n] = '\0';
+        free(resp);
+        Perl_croak(aTHX_ "%s", msg);
+    }
+    if (resp_len < 5) { free(resp); Perl_croak(aTHX_ "native XS dispatch: short response"); }
+    uint32_t nret;
+    memcpy(&nret, resp + 1, sizeof(nret));
+    if (resp_len < 5 + (size_t)nret * 4) {
+        free(resp);
+        Perl_croak(aTHX_ "native XS dispatch: truncated response");
+    }
+    XSprePUSH;
+    EXTEND(SP, (SSize_t)nret);
+    for (uint32_t k = 0; k < nret; k++) {
+        uint32_t tok;
+        memcpy(&tok, resp + 5 + k * 4, sizeof(tok));
+        ST(k) = (SV *)(uintptr_t)tok;
+    }
+    free(resp);
+    XSRETURN(nret);
 }
 
 /* Bridge glue, eval'd once at perl_new. JSON::PP + Scalar::Util (both in the
@@ -623,4 +682,34 @@ std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id) {
     if (h == 0) return;
     g_go_cb = callback_id;
+}
+
+void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id) {
+    if (!g_my_perl || h == 0 || !name || !*name) return;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    CV *cv = newXS(name, XS_goperl_native_thunk, __FILE__);
+    CvXSUBANY(cv).any_i32 = fn_id;
+}
+
+uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s) {
+    if (!g_my_perl || h == 0) return 0;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    switch (op) {
+    case 1: /* SV_IV */
+        return (uint64_t)(int64_t)SvIV((SV *)(uintptr_t)a);
+    case 2: { /* SV_PV: (linear-memory ptr << 32) | len */
+        STRLEN len = 0;
+        const char *p = SvPV((SV *)(uintptr_t)a, len);
+        return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+    }
+    case 3: /* NEW_IV */
+        return (uint64_t)(uintptr_t)newSViv((IV)(int64_t)a);
+    case 4: /* NEW_PVN */
+        return (uint64_t)(uintptr_t)newSVpvn(s ? s : "", (STRLEN)b);
+    case 5: /* SV_MORTAL */
+        return (uint64_t)(uintptr_t)sv_2mortal((SV *)(uintptr_t)a);
+    }
+    return 0;
 }
