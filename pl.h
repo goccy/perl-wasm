@@ -91,7 +91,7 @@ uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to tr
  * BY HANDLE ({"k":"r","h":id,"t":reftype,"c":class}), an id into a guest
  * registry that pins the actual SV. Sending a handle back dereferences to
  * THE SAME SV, so object identity and aliasing survive round trips. See
- * GO_BRIDGE_GLUE in perl.cc for the codec, the registry (pin/release/retain)
+ * GO_BRIDGE_GLUE in perl.cc for the codec, the registry (pin/release)
  * and the handle operations (method call, code invoke, data export). */
 
 /* Call the named Perl subroutine in list context. `sub_name` is a fully

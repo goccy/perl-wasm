@@ -243,9 +243,12 @@ XS(XS___plwasm_go_invoke) {
  * registry (refcount held, id deduped by refaddr so the same SV always gets
  * the same id) and only the id crosses. Decoding an "r" node returns THE SAME
  * reference, so identity, aliasing, and blessedness survive a round trip
- * through Go. The host releases a pin via __plwasm_release; arguments of a
- * Perl->Go call are pinned only for the call's duration (the Go side calls
- * __plwasm_retain to keep one). utf8 mode: the C boundary carries bytes, so
+ * through Go. Every "r" node handed to the host carries one pin the HOST
+ * owns — its wrapper's finalizer/Free releases it via __plwasm_release (or
+ * batched, __plwasm_release_all) — so host-side liveness and the guest
+ * refcount stay aligned in both directions: the registry keeps the SV alive
+ * while the host can still reach it, and Perl's own refcounting resumes when
+ * the last pin drops. utf8 mode: the C boundary carries bytes, so
  * encode/decode speak UTF-8 octets and non-ASCII round-trips. */
 static const char *GO_BRIDGE_GLUE =
     "sub main::__plwasm_json {"
@@ -278,11 +281,11 @@ static const char *GO_BRIDGE_GLUE =
     "  }"
     "  return 1;"
     "}"
-    "sub main::__plwasm_retain {"
-    "  my ($id) = @_;"
-    "  return 0 unless exists $main::__plwasm_reg{$id};"
-    "  $main::__plwasm_pins{$id}++;"
-    "  return 1;"
+    /* Batched release: the host's finalizer queue drains through one call.
+     * Returns the number of still-live handles (test observability). */
+    "sub main::__plwasm_release_all {"
+    "  __plwasm_release($_) for @_;"
+    "  return 0 + keys %main::__plwasm_reg;"
     "}"
     "sub main::__plwasm_handle {"
     "  my ($id) = @_;"
@@ -327,19 +330,16 @@ static const char *GO_BRIDGE_GLUE =
     "  my @ret = &{$name}(@args);"
     "  return __plwasm_json()->encode([ map { __plwasm_enc($_) } @ret ]);"
     "}"
-    /* --- Perl -> Go dispatch (bound subs) --- */
+    /* --- Perl -> Go dispatch (bound subs) ---
+     * Reference arguments are pinned by __plwasm_enc and OWNED by the host
+     * side: its wrapper attaches a finalizer/Free that releases each pin, so
+     * a handler may simply keep a reference beyond the call. */
     "sub main::__plwasm_go_call {"
     "  my ($id, @args) = @_;"
     "  __plwasm_json();" /* load JSON::PP + Scalar::Util before encoding */
-    "  my (@nodes, @borrowed);"
-    "  for my $a (@args) {"
-    "    my $n = __plwasm_enc($a);"
-    "    push @borrowed, $n->{h} if $n->{k} eq 'r';"
-    "    push @nodes, $n;"
-    "  }"
+    "  my @nodes = map { __plwasm_enc($_) } @args;"
     "  my $resp = __plwasm_json()->decode("
     "      main::__plwasm_go_invoke($id, __plwasm_json()->encode(\\@nodes)));"
-    "  __plwasm_release($_) for @borrowed;"
     "  die $resp->{error} unless $resp->{ok};"
     "  my @out = map { __plwasm_dec($_) } @{$resp->{result}};"
     "  return wantarray ? @out : $out[0];"
