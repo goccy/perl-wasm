@@ -183,7 +183,7 @@ libperl='libperl.a'
 # single-threaded, %SIG-emulated wasi build anyway.)
 d_sigsetjmp='undef'
 # wasi-sdk emulation opt-ins for POSIX features Perl needs but wasi lacks
-# natively: process clocks (times), signals (%SIG), mman (mmap), getpid ($$).
+# natively: process clocks (times), signals (%SIG), mman (mmap), getpid (\$\$).
 # Each pairs a -D_WASI_EMULATED_* compile define with a -lwasi-emulated-* lib
 # at link time (see libs). The headers #error without the define. $WASI_EMU and
 # $SYSROOT expand here (heredoc), baking literal flags into config.sh.

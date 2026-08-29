@@ -56,6 +56,10 @@ def included(rel_path: str) -> bool:
         return False
     if base == ".exists":
         return False
+    # Build log with an embedded generation timestamp; not needed at runtime
+    # and the only nondeterministic byte source in the tree.
+    if rel_path == "unicore/mktables.lst":
+        return False
     for ext in (".a", ".ld", ".bs", ".pod", ".t"):
         if rel_path.endswith(ext):
             return False
