@@ -122,21 +122,41 @@ void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
  * in a host-native shared library the embedder dlopen'd (go-perl's native XS
  * SDK). Perl-side each such sub is an ordinary XS backed by a generic thunk
  * that forwards the call over the wasmify callback import with the reserved
- * method id -1: payload [u32 fn_id][u32 items][u32 sv_tokens...], response
- * [u8 ok] then on success [u32 nret][u32 sv_tokens...] or on failure the
- * croak message. The host runs the native XSUB, using perl_xs_helper for
- * every SV operation, and the thunk pushes the returned (mortal) SVs. */
+ * method id -1: payload [u32 fn_id][u32 cv_token][u32 items][u32
+ * sv_tokens...], response [u8 ok] then on success [u32 nret][u32
+ * sv_tokens...] or on failure the croak message. The host runs the native
+ * XSUB (real XSUBs receive their own CV, hence the cv token), using
+ * perl_xs_helper for every SV operation, and the thunk pushes the returned
+ * (mortal) SVs.
+ *
+ * A second reserved method id, -2, flows the OTHER way on teardown: freeing
+ * a guest SV that carries goperl anchor magic (op SV_MAGIC_ATTACH) sends
+ * the u32 host magic id so the host can run the native module's svt_free
+ * and drop its mirror MAGIC chain. */
 
 /* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
  * key for the actual native function (stored in the CV's XSANY). */
 void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
 
-/* SV micro-operations the host-side SDK vtable is built from. op selects:
- *   1 SV_IV      a=sv                   -> IV (as u64)
- *   2 SV_PV      a=sv                   -> (ptr<<32)|len into linear memory
- *   3 NEW_IV     a=iv                   -> new SV token
- *   4 NEW_PVN    s=bytes b=len          -> new SV token
- *   5 SV_MORTAL  a=sv                   -> sv (now mortal)
+/* SV micro-operations the host-side SDK vtable is built from. The full op
+ * table lives in perl.cc (and mirrors the GOPERL_OP_* enum in the go-perl
+ * native SDK header); representative entries:
+ *   1  SV_IV       a=sv                  -> IV (as u64)
+ *   2  SV_PV       a=sv                  -> (ptr<<32)|len into linear memory
+ *   3  NEW_IV      a=iv                  -> new SV token
+ *   4  NEW_PVN     s=bytes b=len         -> new SV token
+ *   5  SV_MORTAL   a=sv                  -> sv (now mortal)
+ *   ...
+ *   23-64          sv_setsv/setiv/setnv/catsv families, NV ops, AV/HV entry
+ *                  and iterator ops, ENTER/LEAVE/SAVETMPS/FREETMPS
+ *   65 CALL_SV     a=flags<<32|sv, s+b=packed u32 arg tokens
+ *                  -> died<<63 | count<<32 | mortal-AV token of results
+ *   66 CALL_METHOD like CALL_SV but s = "name\0" + packed tokens
+ *   68 SAVE_OP     scope-save PL_op (the SAVEOP() macro)
+ *   69 RUN_PP_SCRATCH a=op_flags<<32|op_type, s+b=arg tokens: run one pp
+ *                  function on a scratch OP in list context
+ *   70-72          host-side MAGIC anchor attach / id lookup / unattach
+ *   73-74,80       PL_* interpreter-variable get/set and local'ised hooks
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
 
