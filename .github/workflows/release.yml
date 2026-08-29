@@ -43,7 +43,7 @@ permissions:
 env:
   # Keep in lock-step with build.yml. The tag is baked into the cache key so a
   # wasmify upgrade rolls the cache forward cleanly.
-  WASMIFY_IMAGE: ghcr.io/goccy/wasmify:v0.4.10
+  WASMIFY_IMAGE: ghcr.io/goccy/wasmify:v0.6.8
   CACHE_IMAGE: ghcr.io/${{ github.repository_owner }}/perl-wasm-cache
 
 jobs:
