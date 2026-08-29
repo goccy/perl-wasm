@@ -81,4 +81,33 @@ void perl_close(uint64_t h);
  * not preempted until it returns to the run loop. */
 uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
 
+/* ---- Go <-> Perl bridge --------------------------------------------------
+ *
+ * Values cross the boundary as JSON: scalars map to JSON strings/numbers,
+ * array refs to arrays, hash refs to objects (encoded/decoded guest-side by
+ * JSON::PP from the standard library, loaded lazily on first use). */
+
+/* Call the named Perl subroutine in list context. `sub_name` is a fully
+ * qualified sub name ("main::handler", "My::App::run") or a main:: sub name;
+ * `args_json` is a JSON array holding the argument list (NULL/empty means no
+ * arguments). Returns
+ *
+ *   {"ok":<bool>,"result":<array>,"error":<string>}
+ *
+ * where "result" is the sub's return list re-encoded as a JSON array. On a
+ * Perl-level die (including "no such sub"), "ok" is false and "error" holds
+ * $@. Unlike perl_eval, STDOUT/STDERR are NOT redirected: prints go to the
+ * instance's WASI fds. */
+std::string perl_call(uint64_t h, const char *sub_name, const char *args_json);
+
+/* Register the Go-side dispatcher for this instance. `callback_id` is the id
+ * the host returned when registering its callback handler; every Perl->Go
+ * call from this interpreter is routed to it. Perl code reaches Go through
+ * main::__plwasm_go_invoke($func_id, $payload_json) — an XS installed by
+ * perl_new that forwards to the wasmify callback import — and the
+ * main::__plwasm_go_call glue that wraps it with JSON encode/decode (the
+ * host binds a named Perl sub to a Go function by eval'ing a one-line sub
+ * that calls the glue with the Go function's id). */
+void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
+
 #endif /* PERLEMBED_H */

@@ -116,6 +116,22 @@ static void xs_init(pTHX) {
 /* ---- interpreter state --------------------------------------------------- */
 static PerlInterpreter *g_my_perl = nullptr;
 
+/* ---- Perl -> Go dispatch -------------------------------------------------
+ * The wasmify callback import: the ONE host entry point every C++->Go (here:
+ * Perl->Go) call goes through. Declared here rather than via the generated
+ * bridge header so perl.cc stays self-contained; the signature must match
+ * bridge/api_bridge.h's WASM_IMPORT(wasmify, callback_invoke). The i64 result
+ * packs (resp_ptr << 32) | resp_len; the response buffer transfers to us (we
+ * free it), while the request buffer only lends: the host reads it during the
+ * call and we keep ownership (it lives in a Perl SV). */
+__attribute__((import_module("wasmify"), import_name("callback_invoke")))
+extern "C" int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_id,
+                                           void *req, size_t req_len);
+
+/* The Go-side callback id every Perl->Go call from this instance dispatches
+ * to. 0 = no dispatcher registered (perl_set_go_dispatcher not called). */
+static int32_t g_go_cb = 0;
+
 /* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
  * via a plain linear-memory write (perl_interrupt_addr returns its address); no
  * wasm code runs on the instance. The interruptible run loop clears it and
@@ -178,6 +194,63 @@ static std::string json_field(const char *key, const std::string &val, bool comm
     if (comma) s += ",";
     return s;
 }
+
+/* XS trampoline: main::__plwasm_go_invoke($func_id, $payload) -> $response.
+ * Forwards the payload bytes to the host through wasmify_callback_invoke and
+ * returns the response bytes as a Perl string. The JSON encode/decode around
+ * it lives in Perl (GO_BRIDGE_GLUE below); this function only moves bytes. */
+XS(XS___plwasm_go_invoke);
+XS(XS___plwasm_go_invoke) {
+    dXSARGS;
+    if (items != 2) Perl_croak(aTHX_ "usage: __plwasm_go_invoke(func_id, payload)");
+    if (g_go_cb == 0)
+        Perl_croak(aTHX_ "no Go dispatcher registered for this instance");
+    IV func_id = SvIV(ST(0));
+    STRLEN len = 0;
+    const char *payload = SvPV(ST(1), len);
+    int64_t rc = wasmify_callback_invoke(g_go_cb, static_cast<int32_t>(func_id),
+                                         const_cast<char *>(payload),
+                                         static_cast<size_t>(len));
+    uint32_t resp_ptr = static_cast<uint32_t>(static_cast<uint64_t>(rc) >> 32);
+    uint32_t resp_len = static_cast<uint32_t>(static_cast<uint64_t>(rc) & 0xFFFFFFFFu);
+    SV *out;
+    if (resp_ptr != 0 && resp_len != 0) {
+        out = newSVpvn(reinterpret_cast<const char *>(static_cast<uintptr_t>(resp_ptr)),
+                       static_cast<STRLEN>(resp_len));
+        free(reinterpret_cast<void *>(static_cast<uintptr_t>(resp_ptr)));
+    } else {
+        out = newSVpvn("", 0);
+    }
+    ST(0) = sv_2mortal(out);
+    XSRETURN(1);
+}
+
+/* Bridge glue, eval'd once at perl_new. JSON::PP (pure Perl, in the shipped
+ * stdlib) is loaded lazily on the first bridge call so interpreters that never
+ * cross the boundary don't pay for it. utf8 mode: the C boundary carries
+ * bytes, so encode/decode speak UTF-8 octets and non-ASCII round-trips. */
+static const char *GO_BRIDGE_GLUE =
+    "sub main::__plwasm_json {"
+    "  $main::__plwasm_json_obj ||= do {"
+    "    require JSON::PP;"
+    "    JSON::PP->new->utf8->allow_nonref->allow_blessed->convert_blessed;"
+    "  };"
+    "}"
+    "sub main::__plwasm_call_dispatch {"
+    "  my ($name, $args_json) = @_;"
+    "  my $args = __plwasm_json()->decode($args_json);"
+    "  no strict 'refs';"
+    "  my @ret = &{$name}(@$args);"
+    "  return __plwasm_json()->encode(\\@ret);"
+    "}"
+    "sub main::__plwasm_go_call {"
+    "  my ($id, @args) = @_;"
+    "  my $resp = __plwasm_json()->decode("
+    "      main::__plwasm_go_invoke($id, __plwasm_json()->encode(\\@args)));"
+    "  die $resp->{error} unless $resp->{ok};"
+    "  my $r = $resp->{result};"
+    "  return wantarray ? @$r : $r->[0];"
+    "}";
 
 /* The eval wrapper (run via eval_pv): redirect STDOUT/STDERR onto in-memory
  * scalars (the built-in PerlIO scalar layer), string-eval the user source, and
@@ -248,6 +321,16 @@ uint64_t perl_new(const char *lib_dir) {
     PL_runops = runops_interruptible;
     g_interrupt = 0;
 
+    /* Install the Go bridge: the XS byte-mover plus the Perl-side JSON glue
+     * (see GO_BRIDGE_GLUE). Cheap - JSON::PP itself loads lazily. */
+    {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        newXS("main::__plwasm_go_invoke", XS___plwasm_go_invoke, __FILE__);
+        eval_pv(GO_BRIDGE_GLUE, TRUE);
+    }
+    g_go_cb = 0;
+
     return 1; /* opaque handle */
 }
 
@@ -311,4 +394,62 @@ void perl_close(uint64_t h) {
 uint32_t perl_interrupt_addr(uint64_t h) {
     (void)h;
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
+}
+
+/* Build the perl_call error envelope. "result" is always a valid (empty)
+ * array so the caller can decode the document with one shape. */
+static std::string call_error_json(const std::string &msg) {
+    std::string j = "{\"ok\":false,\"result\":[],";
+    j += json_field("error", msg, false);
+    j += "}";
+    return j;
+}
+
+std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
+    if (!g_my_perl || h == 0) return call_error_json("no interpreter");
+    if (!sub_name || !*sub_name) return call_error_json("empty sub name");
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    dSP;
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    EXTEND(SP, 2);
+    mPUSHs(newSVpv(sub_name, 0));
+    mPUSHs(newSVpv(args_json && *args_json ? args_json : "[]", 0));
+    PUTBACK;
+
+    /* G_EVAL: a die inside the sub (or the JSON decode) lands in ERRSV instead
+     * of longjmp'ing past us. The dispatcher runs the target sub in list
+     * context internally and returns ONE scalar (the encoded result array). */
+    int count = call_pv("__plwasm_call_dispatch", G_SCALAR | G_EVAL);
+    SPAGAIN;
+
+    std::string encoded;
+    bool ok = true;
+    std::string err;
+    if (SvTRUE(ERRSV)) {
+        ok = false;
+        err = sv_to_std(aTHX_ ERRSV);
+        if (count > 0) (void)POPs; /* discard the undef the failed call left */
+    } else if (count > 0) {
+        SV *sv = POPs;
+        encoded = sv_to_std(aTHX_ sv);
+    }
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+
+    if (!ok) return call_error_json(err);
+    std::string j = "{\"ok\":true,\"result\":";
+    /* `encoded` is already JSON (the dispatcher's encode(\@ret)); embed raw. */
+    j += encoded.empty() ? "[]" : encoded;
+    j += ",\"error\":\"\"}";
+    return j;
+}
+
+void perl_set_go_dispatcher(uint64_t h, int32_t callback_id) {
+    if (h == 0) return;
+    g_go_cb = callback_id;
 }
