@@ -60,6 +60,23 @@ struct sockaddr_un {
 #define SIG_SETMASK 2
 #endif
 
+/* Socket constants wasi-libc omits but Socket.xs bakes into its constant
+ * table when defined — and pure-Perl networking code imports at compile time:
+ * IO::Socket::INET does `use Socket qw(... SOCK_RAW)` (its icmp socket type),
+ * so a missing macro kills the import of IO::Socket, IO::Socket::IP, and
+ * everything above them (Mojolicious, Plack middlewares, LWP). Standard
+ * musl/Linux values; actually OPENING a raw/seqpacket socket still fails at
+ * socket() time under the host socket layer, which is the correct place. */
+#ifndef SOCK_RAW
+#define SOCK_RAW 3
+#endif
+#ifndef SOCK_SEQPACKET
+#define SOCK_SEQPACKET 5
+#endif
+#ifndef SOMAXCONN
+#define SOMAXCONN 128
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

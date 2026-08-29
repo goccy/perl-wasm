@@ -105,7 +105,7 @@ wasm-host:
 # first — a pristine perl5/lib holds only the ~73 core .pm; the dual-life
 # modules and the generated Config.pm are written there during the build.
 stdlib-zip:
-	python3 scripts/make-stdlib-zip.py perl5/lib perl_stdlib.zip
+	python3 scripts/make-stdlib-zip.py perl5/lib perl_stdlib.zip scripts/compat
 
 # Write go.mod into the wasm2go bundle so the released tarball is a
 # self-contained Go module. Parses bridge.Wasm2GoImportPath out of wasmify.json
