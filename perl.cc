@@ -142,20 +142,92 @@ static int32_t g_go_cb = 0;
  * module's svt_free and drop its mirror MAGIC chain. */
 #define GOPERL_MG_FREE_METHOD_ID (-2)
 
+/* Reserved callback method id for pp hooks: a native module that patched a
+ * PL_ppaddr slot (host-side proxy table) gets called for every execution of
+ * that op type. Payload [u32 op][u32 op_type][u32 n][u32 stack-top tokens];
+ * response [1][u32 next_op] on success, [0]+croak-message on failure. The
+ * hook runs the ORIGINAL pp itself (perl_xs_helper op RUN_ORIGINAL) and
+ * decides the next op, exactly like a real PL_ppaddr replacement. */
+#define GOPERL_PP_HOOK_METHOD_ID (-3)
+
+/* Reserved callback method id for save-stack destructors registered via
+ * perl_xs_helper op SAVE_DESTRUCTOR: fires with the u32 host id when the
+ * enclosing guest scope pops (normally or during die unwinding). */
+#define GOPERL_DTOR_METHOD_ID (-4)
+
 /* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
  * via a plain linear-memory write (perl_interrupt_addr returns its address); no
  * wasm code runs on the instance. The interruptible run loop clears it and
  * croaks. `volatile` so the compiler always reloads it in the op loop. */
 static volatile uint32_t g_interrupt = 0;
 
+/* pp hooks: a host-native module (via the go-perl XS SDK) can claim op
+ * types; the run loop then routes every execution of those types to the
+ * host (callback method -3) instead of the pp function. The guest PL_ppaddr
+ * itself is never patched — the "original" op is always available to the
+ * hook through the RUN_ORIGINAL helper. */
+static uint8_t g_pp_hooked[MAXO];
+static uint32_t g_pp_hook_count = 0;
+
+static OP *goperl_call_pp_hook(pTHX_ OP *op) {
+    if (g_go_cb == 0) return op->op_ppaddr(aTHX);
+    /* payload: op token, op type, and a peek at the top of the perl stack
+     * (hooks like pp_entersub_profiler read *SP to identify the callee). */
+    uint32_t buf[3 + 8];
+    SSize_t depth = PL_stack_sp - PL_stack_base;
+    uint32_t n = depth > 8 ? 8 : (depth > 0 ? (uint32_t)depth : 0);
+    buf[0] = (uint32_t)(uintptr_t)op;
+    buf[1] = (uint32_t)op->op_type;
+    buf[2] = n;
+    for (uint32_t i = 0; i < n; i++)
+        buf[3 + i] = (uint32_t)(uintptr_t)PL_stack_sp[-(SSize_t)(n - 1 - i)];
+    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_PP_HOOK_METHOD_ID,
+                                         buf, sizeof(uint32_t) * (3 + n));
+    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    if (resp_ptr == 0 || resp_len < 1)
+        Perl_croak(aTHX_ "pp hook: empty response");
+    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+    if (resp[0] == 0) {
+        char msg[512];
+        size_t ml = resp_len - 1;
+        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
+        memcpy(msg, resp + 1, ml);
+        msg[ml] = '\0';
+        free(resp);
+        Perl_croak(aTHX_ "%s", msg);
+    }
+    uint32_t next = 0;
+    if (resp_len >= 5) memcpy(&next, resp + 1, 4);
+    free(resp);
+    return (OP *)(uintptr_t)next;
+}
+
+static inline OP *goperl_exec_op(pTHX_ OP *op) {
+    if (g_pp_hook_count && op->op_type < MAXO && g_pp_hooked[op->op_type])
+        return goperl_call_pp_hook(aTHX_ op);
+    return op->op_ppaddr(aTHX);
+}
+
+/* Save-stack destructor bridging save_destructor_x for host modules: fires
+ * the host id over callback method -4 when the guest scope pops. */
+static void goperl_dtor_thunk(pTHX_ void *p) {
+    uint32_t id = (uint32_t)(uintptr_t)p;
+    if (g_go_cb == 0) return;
+    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_DTOR_METHOD_ID, &id,
+                                         sizeof(id));
+    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+    if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+}
+
 /* PL_runops replacement: checks the interrupt flag on every opcode. When set,
  * Perl_croak longjmps out to the nearest eval trap — for perl_eval that is the
  * `eval $src` inside the wrapper, so the eval returns ok=false with the message
  * in $@, exactly like a Perl-level die. Otherwise identical to
- * Perl_runops_standard (see run.c). */
+ * Perl_runops_standard (see run.c), plus the pp-hook dispatch above. */
 static int runops_interruptible(pTHX) {
     OP *op = PL_op;
-    while ((PL_op = op = op->op_ppaddr(aTHX))) {
+    while ((PL_op = op = goperl_exec_op(aTHX_ op))) {
         if (g_interrupt) {
             g_interrupt = 0;
             Perl_croak(aTHX_ "Perl execution interrupted");
@@ -1047,14 +1119,36 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case 5: return (uint64_t)(uintptr_t)&PL_sv_no;
         case 6: return (uint64_t)(uintptr_t)PL_curcop;
         case 7: return (uint64_t)(uintptr_t)PL_op;
+        case 8: return (uint64_t)(int64_t)PL_perldb;
+        case 9: return (uint64_t)(uintptr_t)PL_DBsub;
+        case 10: return (uint64_t)(uintptr_t)PL_DBsingle;
+        case 11: return (uint64_t)(uintptr_t)(SV *)PL_endav;
+        case 12: return (uint64_t)(uintptr_t)(SV *)PL_checkav;
+        case 13: return (uint64_t)(uintptr_t)(SV *)PL_initav;
+        case 14: return (uint64_t)(uintptr_t)(SV *)PL_main_cv;
+        case 15: return (uint64_t)(uintptr_t)(SV *)PL_debstash;
+        case 16: return (uint64_t)PL_sawampersand;
+        case 17: return (uint64_t)(int64_t)PL_scopestack_ix;
+        case 18: return (uint64_t)PL_exit_flags;
+        case 19: return (uint64_t)(int64_t)PL_basetime;
+        case 20: return (uint64_t)(uintptr_t)(SV *)PL_modglobal;
+        case 21: return PL_minus_c ? 1 : 0;
+        case 22: return (uint64_t)(uintptr_t)(SV *)PL_curstash;
         }
         return 0;
     }
-    case 74: { /* PLVAR_SET (b = SV token or 0) */
+    case 74: { /* PLVAR_SET (b = SV token or raw value) */
         SV *val = (SV *)(uintptr_t)(uint32_t)b;
         switch ((int)a) {
         case 1: PL_diehook = val; return 0;
         case 2: PL_warnhook = val; return 0;
+        case 8: PL_perldb = (int)(int64_t)b; return 0;
+        case 9: PL_DBsub = (GV *)val; return 0;
+        case 10: PL_DBsingle = val; return 0;
+        case 11: PL_endav = (AV *)val; return 0;
+        case 12: PL_checkav = (AV *)val; return 0;
+        case 13: PL_initav = (AV *)val; return 0;
+        case 18: PL_exit_flags = (U8)b; return 0;
         }
         return 0;
     }
@@ -1157,6 +1251,212 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvTYPE((SV *)av) == SVt_PVAV && idx >= 0 && idx <= AvFILLp(av))
             AvARRAY(av)[idx] = (SV *)(uintptr_t)(uint32_t)b;
         return 0;
+    }
+
+    /* ---- v4: pp hooks, save-stack destructors, and the OP/COP/CV/GV/
+     * context introspection surface interpreter-hooking XS (the
+     * Devel::NYTProf class) is built on. */
+    case 98: { /* PP_HOOK_SET (a = op_type, b = enable) */
+        uint32_t t = (uint32_t)a;
+        if (t >= MAXO) return 0;
+        uint8_t on = b ? 1 : 0;
+        if (g_pp_hooked[t] != on) {
+            g_pp_hooked[t] = on;
+            if (on) g_pp_hook_count++;
+            else if (g_pp_hook_count) g_pp_hook_count--;
+        }
+        return 0;
+    }
+    case 99: { /* RUN_ORIGINAL (a = op_type): execute the real pp for the
+                * CURRENT PL_op. The guest PL_ppaddr is never patched, so
+                * the table entry is always the original. The type may
+                * differ from PL_op->op_type (pp_entersub with type 0). */
+        uint32_t t = (uint32_t)a;
+        if (t >= MAXO || !PL_op) return 0;
+        OP *next = PL_ppaddr[t](aTHX);
+        return (uint64_t)(uintptr_t)next;
+    }
+    case 100: /* SAVE_DESTRUCTOR (a = host id) */
+        save_destructor_x(goperl_dtor_thunk, (void *)(uintptr_t)(uint32_t)a);
+        return 0;
+    case 101: { /* OP_FIELDS: targ<<32 | private<<24 | flags<<16 | type */
+        OP *o = (OP *)(uintptr_t)a;
+        return ((uint64_t)(uint32_t)o->op_targ << 32) |
+               ((uint64_t)o->op_private << 24) | ((uint64_t)o->op_flags << 16) |
+               (uint64_t)o->op_type;
+    }
+    case 102: { /* OP_PTR (b: 0 op_next, 1 OpSIBLING, 2 op_first if KIDS,
+                 * 3 op_redoop if LOOP class) */
+        OP *o = (OP *)(uintptr_t)a;
+        switch ((int)b) {
+        case 0: return (uint64_t)(uintptr_t)o->op_next;
+        case 1: return (uint64_t)(uintptr_t)OpSIBLING(o);
+        case 2:
+            if (o->op_flags & OPf_KIDS)
+                return (uint64_t)(uintptr_t)cUNOPx(o)->op_first;
+            return 0;
+        case 3:
+            if ((PL_opargs[o->op_type] & OA_CLASS_MASK) == OA_LOOP)
+                return (uint64_t)(uintptr_t)cLOOPx(o)->op_redoop;
+            return 0;
+        }
+        return 0;
+    }
+    case 103: /* COP_LINE (the caller vouches that a is a COP: PL_curcop,
+               * blk_oldcop, or a type-checked nextstate/dbstate — this also
+               * covers static COPs like PL_compiling whose op_type is 0) */
+        return (uint64_t)CopLINE((COP *)(uintptr_t)a);
+    case 104: { /* COP_FILE -> (ptr<<32)|len of CopFILE */
+        const char *f = CopFILE((COP *)(uintptr_t)a);
+        if (!f) return 0;
+        return ((uint64_t)(uint32_t)(uintptr_t)f << 32) |
+               (uint32_t)strlen(f);
+    }
+    case 105: { /* COP_STASHPV -> packed pv */
+        const char *s2 = CopSTASHPV((COP *)(uintptr_t)a);
+        if (!s2) return 0;
+        return ((uint64_t)(uint32_t)(uintptr_t)s2 << 32) |
+               (uint32_t)strlen(s2);
+    }
+    case 106: { /* CV_INFO: depth<<32 | isxsub */
+        CV *cv = (CV *)(uintptr_t)a;
+        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        return ((uint64_t)(uint32_t)CvDEPTH(cv) << 32) |
+               (CvISXSUB(cv) ? 1u : 0u);
+    }
+    case 107: { /* CV_PTR (b: 0 CvSTART, 1 CvGV, 2 CvSTASH, 3 CvROOT) */
+        CV *cv = (CV *)(uintptr_t)a;
+        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        switch ((int)b) {
+        case 0: return CvISXSUB(cv) ? 0 : (uint64_t)(uintptr_t)CvSTART(cv);
+        case 1: return (uint64_t)(uintptr_t)CvGV(cv);
+        case 2: return (uint64_t)(uintptr_t)(SV *)CvSTASH(cv);
+        case 3: return CvISXSUB(cv) ? 0 : (uint64_t)(uintptr_t)CvROOT(cv);
+        }
+        return 0;
+    }
+    case 108: { /* GV_PTR (b: 0 GvSTASH, 1 GvCVu, 2 GvHV, 3 GvAV) */
+        GV *gv = (GV *)(uintptr_t)a;
+        if (!isGV_with_GP((SV *)gv)) return 0;
+        switch ((int)b) {
+        case 0: return (uint64_t)(uintptr_t)(SV *)GvSTASH(gv);
+        case 1: return (uint64_t)(uintptr_t)(SV *)GvCVu(gv);
+        case 2: return (uint64_t)(uintptr_t)(SV *)GvHV(gv);
+        case 3: return (uint64_t)(uintptr_t)(SV *)GvAV(gv);
+        case 4: return (uint64_t)(uintptr_t)(SV *)GvEGV(gv);
+        }
+        return 0;
+    }
+    case 109: { /* GV_NAME -> packed pv */
+        GV *gv = (GV *)(uintptr_t)a;
+        if (!isGV_with_GP((SV *)gv)) return 0;
+        const char *n = GvNAME(gv);
+        if (!n) return 0;
+        return ((uint64_t)(uint32_t)(uintptr_t)n << 32) |
+               (uint32_t)GvNAMELEN(gv);
+    }
+    case 110: /* SV_ISGV_GP */
+        return isGV_with_GP((SV *)(uintptr_t)a) ? 1 : 0;
+    case 111: { /* HV_NAME -> packed pv (0 for anonymous stashes) */
+        HV *hv = (HV *)(uintptr_t)a;
+        if (SvTYPE((SV *)hv) != SVt_PVHV) return 0;
+        const char *n = HvNAME(hv);
+        if (!n) return 0;
+        return ((uint64_t)(uint32_t)(uintptr_t)n << 32) |
+               (uint32_t)HvNAMELEN(hv);
+    }
+    case 112: { /* SI_GET (a = si token or 0 for PL_curstackinfo;
+                 * b: 0 self/current, 1 si_prev, 2 si_type, 3 si_cxix) */
+        PERL_SI *si = a ? (PERL_SI *)(uintptr_t)a : PL_curstackinfo;
+        if (!si) return 0;
+        switch ((int)b) {
+        case 0: return (uint64_t)(uintptr_t)si;
+        case 1: return (uint64_t)(uintptr_t)si->si_prev;
+        case 2: return (uint64_t)(int64_t)si->si_type;
+        case 3: return (uint64_t)(int64_t)si->si_cxix;
+        }
+        return 0;
+    }
+    case 113: { /* CX_FIELDS (a = si token or 0, b = ix) -> CxTYPE */
+        PERL_SI *si = a ? (PERL_SI *)(uintptr_t)a : PL_curstackinfo;
+        if (!si || (I32)(int64_t)b < 0 || (I32)(int64_t)b > si->si_cxix)
+            return (uint64_t)0xFFFFFFFFu;
+        PERL_CONTEXT *cx = &si->si_cxstack[(I32)(int64_t)b];
+        return (uint64_t)CxTYPE(cx);
+    }
+    case 114: { /* CX_PTR (a = si token or 0, b = ix<<8 | which:
+                 * 0 blk_oldcop, 1 blk_sub.cv, 2 blk_loop.my_op) */
+        PERL_SI *si = a ? (PERL_SI *)(uintptr_t)a : PL_curstackinfo;
+        I32 ix = (I32)(int64_t)(b >> 8);
+        if (!si || ix < 0 || ix > si->si_cxix) return 0;
+        PERL_CONTEXT *cx = &si->si_cxstack[ix];
+        switch ((int)(b & 0xFF)) {
+        case 0: return (uint64_t)(uintptr_t)(OP *)cx->blk_oldcop;
+        case 1:
+            if (CxTYPE(cx) == CXt_SUB || CxTYPE(cx) == CXt_FORMAT)
+                return (uint64_t)(uintptr_t)(SV *)cx->blk_sub.cv;
+            return 0;
+        case 2:
+            if (CxTYPE_is_LOOP(cx))
+                return (uint64_t)(uintptr_t)(OP *)cx->blk_loop.my_op;
+            return 0;
+        }
+        return 0;
+    }
+    case 115: { /* OP_NAME_STR -> packed pv of PL_op_name[type] */
+        uint32_t t = (uint32_t)a;
+        if (t >= MAXO) return 0;
+        const char *n = PL_op_name[t];
+        return ((uint64_t)(uint32_t)(uintptr_t)n << 32) |
+               (uint32_t)strlen(n);
+    }
+    case 116: { /* CV_FILE -> packed pv of CvFILE */
+        CV *cv = (CV *)(uintptr_t)a;
+        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        const char *f = CvFILE(cv);
+        if (!f) return 0;
+        return ((uint64_t)(uint32_t)(uintptr_t)f << 32) |
+               (uint32_t)strlen(f);
+    }
+    case 117: /* GV_FETCHFILE (s = name, b = len) */
+        return (uint64_t)(uintptr_t)gv_fetchfile_flags(s ? s : "",
+                                                       (STRLEN)b, 0);
+    case 118: /* HV_CLEAR */
+        hv_clear((HV *)(uintptr_t)a);
+        return 0;
+    case 119: { /* HV_DELETE (s = key, b = flags) */
+        SV *r = hv_delete((HV *)(uintptr_t)a, s ? s : "",
+                          (I32)strlen(s ? s : ""), (I32)(int64_t)b);
+        return (uint64_t)(uintptr_t)r;
+    }
+    case 120: /* AV_EXISTS */
+        return av_exists((AV *)(uintptr_t)a, (SSize_t)(int64_t)b) ? 1 : 0;
+    case 121: /* SV_UTF8_OFF */
+        SvUTF8_off((SV *)(uintptr_t)a);
+        return 0;
+    case 122: /* SAVE_SCALAR (a = gv) -> localized SV */
+        return (uint64_t)(uintptr_t)save_scalar((GV *)(uintptr_t)a);
+    case 123: /* SV_READONLY_ON */
+        SvREADONLY_on((SV *)(uintptr_t)a);
+        return 0;
+    case 124: { /* EVAL_PV (s = code, a = croak_on_error) */
+        SV *r = eval_pv(s ? s : "", (I32)(int64_t)a);
+        return (uint64_t)(uintptr_t)r;
+    }
+    case 125: /* AV_UNSHIFT */
+        av_unshift((AV *)(uintptr_t)a, (SSize_t)(int64_t)b);
+        return 0;
+    case 126: { /* NEW_CONSTSUB (a = stash, s = name, b = sv; takes over the
+                 * sv reference like the C API) */
+        CV *cv = newCONSTSUB((HV *)(uintptr_t)a, s ? s : "",
+                             (SV *)(uintptr_t)(uint32_t)b);
+        return (uint64_t)(uintptr_t)cv;
+    }
+    case 127: { /* SV_PVX_RAW: the raw PV buffer pointer, NO stringification
+                 * (the SvPVX lvalue-buffer idiom: sv_grow then write). */
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvTYPE(sv) < SVt_PV) return 0;
+        return (uint64_t)(uint32_t)(uintptr_t)SvPVX(sv);
     }
     }
     return 0;

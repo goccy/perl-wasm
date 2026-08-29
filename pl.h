@@ -132,7 +132,17 @@ void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
  * A second reserved method id, -2, flows the OTHER way on teardown: freeing
  * a guest SV that carries goperl anchor magic (op SV_MAGIC_ATTACH) sends
  * the u32 host magic id so the host can run the native module's svt_free
- * and drop its mirror MAGIC chain. */
+ * and drop its mirror MAGIC chain.
+ *
+ * Reserved method id -3 carries pp hooks: for op types a native module
+ * claimed (op PP_HOOK_SET), the run loop sends [u32 op][u32 op_type][u32 n]
+ * [u32 stack-top tokens] instead of executing the pp, and the host answers
+ * [1][u32 next_op] (or [0]+message to croak). The hook runs the true pp
+ * itself through op RUN_ORIGINAL — the guest PL_ppaddr is never patched.
+ *
+ * Reserved method id -4 fires save-stack destructors (op SAVE_DESTRUCTOR):
+ * the u32 host id is delivered when the guest scope holding it pops,
+ * during normal exit and die unwinding alike. */
 
 /* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
  * key for the actual native function (stored in the CV's XSANY). */
@@ -157,6 +167,11 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  *                  function on a scratch OP in list context
  *   70-72          host-side MAGIC anchor attach / id lookup / unattach
  *   73-74,80       PL_* interpreter-variable get/set and local'ised hooks
+ *   98-100         pp-hook table, RUN_ORIGINAL, save-stack destructors
+ *   101-116        OP/COP/CV/GV/stash/context-stack introspection (host
+ *                  shadow materialization for interpreter-hooking XS)
+ *   117-127        gv_fetchfile, hv_clear/hv_delete, save_scalar, eval_pv,
+ *                  newCONSTSUB, raw SvPVX, and friends
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
 
