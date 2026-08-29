@@ -225,31 +225,154 @@ XS(XS___plwasm_go_invoke) {
     XSRETURN(1);
 }
 
-/* Bridge glue, eval'd once at perl_new. JSON::PP (pure Perl, in the shipped
- * stdlib) is loaded lazily on the first bridge call so interpreters that never
- * cross the boundary don't pay for it. utf8 mode: the C boundary carries
- * bytes, so encode/decode speak UTF-8 octets and non-ASCII round-trips. */
+/* Bridge glue, eval'd once at perl_new. JSON::PP + Scalar::Util (both in the
+ * shipped stdlib / static XS) load lazily on the first bridge call so
+ * interpreters that never cross the boundary don't pay for them.
+ *
+ * Value protocol (both directions): a call's argument/return list is a JSON
+ * array of TAGGED nodes - JSON is only the carrier, the node tag is the
+ * semantics:
+ *
+ *   {"k":"u"}                       undef
+ *   {"k":"d","v":<scalar>}          plain scalar (number/string/bool) BY VALUE
+ *   {"k":"j","v":<structure>}       composite data BY VALUE (fresh refs on
+ *                                   decode - carries data, not identity)
+ *   {"k":"r","h":<id>,"t":<reftype>,"c":<class>?}   a REFERENCE by HANDLE
+ *
+ * References are never serialised: __plwasm_enc pins the actual SV in a
+ * registry (refcount held, id deduped by refaddr so the same SV always gets
+ * the same id) and only the id crosses. Decoding an "r" node returns THE SAME
+ * reference, so identity, aliasing, and blessedness survive a round trip
+ * through Go. The host releases a pin via __plwasm_release; arguments of a
+ * Perl->Go call are pinned only for the call's duration (the Go side calls
+ * __plwasm_retain to keep one). utf8 mode: the C boundary carries bytes, so
+ * encode/decode speak UTF-8 octets and non-ASCII round-trips. */
 static const char *GO_BRIDGE_GLUE =
     "sub main::__plwasm_json {"
     "  $main::__plwasm_json_obj ||= do {"
     "    require JSON::PP;"
-    "    JSON::PP->new->utf8->allow_nonref->allow_blessed->convert_blessed;"
+    "    require Scalar::Util;"
+    "    JSON::PP->new->utf8->allow_nonref;"
     "  };"
     "}"
+    /* --- reference-handle registry (identity-preserving pins) --- */
+    "sub main::__plwasm_pin {"
+    "  my ($r) = @_;"
+    "  my $addr = Scalar::Util::refaddr($r);"
+    "  my $id = $main::__plwasm_addr{$addr};"
+    "  if (!defined $id) {"
+    "    $id = ++$main::__plwasm_next_h;"
+    "    $main::__plwasm_reg{$id} = $r;"
+    "    $main::__plwasm_addr{$addr} = $id;"
+    "  }"
+    "  $main::__plwasm_pins{$id}++;"
+    "  return $id;"
+    "}"
+    "sub main::__plwasm_release {"
+    "  my ($id) = @_;"
+    "  return 0 unless exists $main::__plwasm_reg{$id};"
+    "  if (--$main::__plwasm_pins{$id} <= 0) {"
+    "    delete $main::__plwasm_addr{Scalar::Util::refaddr($main::__plwasm_reg{$id})};"
+    "    delete $main::__plwasm_reg{$id};"
+    "    delete $main::__plwasm_pins{$id};"
+    "  }"
+    "  return 1;"
+    "}"
+    "sub main::__plwasm_retain {"
+    "  my ($id) = @_;"
+    "  return 0 unless exists $main::__plwasm_reg{$id};"
+    "  $main::__plwasm_pins{$id}++;"
+    "  return 1;"
+    "}"
+    "sub main::__plwasm_handle {"
+    "  my ($id) = @_;"
+    "  my $r = $main::__plwasm_reg{$id};"
+    "  die \"stale Perl reference handle $id\\n\" unless $r;"
+    "  return $r;"
+    "}"
+    /* --- tagged value codec --- */
+    "sub main::__plwasm_enc {"
+    "  my ($v) = @_;"
+    "  return { k => 'u' } unless defined $v;"
+    "  if (ref $v) {"
+    "    return { k => 'd', v => $v }"
+    "      if Scalar::Util::blessed($v) && $v->isa('JSON::PP::Boolean');"
+    "    my $n = { k => 'r', h => __plwasm_pin($v), t => Scalar::Util::reftype($v) };"
+    "    my $c = Scalar::Util::blessed($v);"
+    "    $n->{c} = $c if defined $c;"
+    "    return $n;"
+    "  }"
+    "  return { k => 'd', v => $v };"
+    "}"
+    "sub main::__plwasm_dec {"
+    "  my ($n) = @_;"
+    "  my $k = $n->{k};"
+    "  return undef   if $k eq 'u';"
+    "  return $n->{v} if $k eq 'd' || $k eq 'j';"
+    "  return __plwasm_handle($n->{h}) if $k eq 'r';"
+    /* A host (Go) function value: materialise a closure over its id. Calling
+     * it dispatches back to the host like any bound sub, so Perl can store
+     * it, pass it around, and call it later - an ordinary code ref. */
+    "  if ($k eq 'f') {"
+    "    my $id = $n->{h};"
+    "    return sub { main::__plwasm_go_call($id, @_) };"
+    "  }"
+    "  die \"unknown bridge value kind '$k'\\n\";"
+    "}"
+    /* --- Go -> Perl dispatch (perl_call) --- */
     "sub main::__plwasm_call_dispatch {"
     "  my ($name, $args_json) = @_;"
-    "  my $args = __plwasm_json()->decode($args_json);"
+    "  my @args = map { __plwasm_dec($_) } @{ __plwasm_json()->decode($args_json) };"
     "  no strict 'refs';"
-    "  my @ret = &{$name}(@$args);"
-    "  return __plwasm_json()->encode(\\@ret);"
+    "  my @ret = &{$name}(@args);"
+    "  return __plwasm_json()->encode([ map { __plwasm_enc($_) } @ret ]);"
     "}"
+    /* --- Perl -> Go dispatch (bound subs) --- */
     "sub main::__plwasm_go_call {"
     "  my ($id, @args) = @_;"
+    "  __plwasm_json();" /* load JSON::PP + Scalar::Util before encoding */
+    "  my (@nodes, @borrowed);"
+    "  for my $a (@args) {"
+    "    my $n = __plwasm_enc($a);"
+    "    push @borrowed, $n->{h} if $n->{k} eq 'r';"
+    "    push @nodes, $n;"
+    "  }"
     "  my $resp = __plwasm_json()->decode("
-    "      main::__plwasm_go_invoke($id, __plwasm_json()->encode(\\@args)));"
+    "      main::__plwasm_go_invoke($id, __plwasm_json()->encode(\\@nodes)));"
+    "  __plwasm_release($_) for @borrowed;"
     "  die $resp->{error} unless $resp->{ok};"
-    "  my $r = $resp->{result};"
-    "  return wantarray ? @$r : $r->[0];"
+    "  my @out = map { __plwasm_dec($_) } @{$resp->{result}};"
+    "  return wantarray ? @out : $out[0];"
+    "}"
+    /* --- handle operations the host drives through perl_call --- */
+    "sub main::__plwasm_method_call {"
+    "  my ($id, $method, @args) = @_;"
+    "  return __plwasm_handle($id)->$method(@args);"
+    "}"
+    "sub main::__plwasm_invoke_code {"
+    "  my ($id, @args) = @_;"
+    "  my $code = __plwasm_handle($id);"
+    "  die \"handle $id is not a CODE reference\\n\""
+    "    unless Scalar::Util::reftype($code) eq 'CODE';"
+    "  return $code->(@args);"
+    "}"
+    "sub main::__plwasm_export {"
+    "  my ($id) = @_;"
+    /* Deep-copy the referenced structure as data. The TOP-LEVEL blessing is
+     * peeled so a hash/array-based object exports its underlying structure;
+     * NESTED blessed values convert via TO_JSON when they offer it and
+     * degrade to null otherwise (allow_blessed), as do unknowns (code/glob).
+     * Returns the JSON text; the host decodes it. */
+    "  my $r = __plwasm_handle($id);"
+    "  my $t = Scalar::Util::reftype($r) || '';"
+    "  my $plain = $t eq 'HASH'   ? { %$r }"
+    "            : $t eq 'ARRAY'  ? [ @$r ]"
+    "            : $t eq 'SCALAR' ? $$r"
+    "            : $t eq 'REF'    ? $$r"
+    "            : $r;"
+    "  my $j = JSON::PP->new->utf8->allow_nonref->allow_blessed->convert_blessed"
+    "      ->allow_unknown;"
+    "  return $j->encode($plain);"
     "}";
 
 /* The eval wrapper (run via eval_pv): redirect STDOUT/STDERR onto in-memory

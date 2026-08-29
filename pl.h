@@ -83,21 +83,27 @@ uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to tr
 
 /* ---- Go <-> Perl bridge --------------------------------------------------
  *
- * Values cross the boundary as JSON: scalars map to JSON strings/numbers,
- * array refs to arrays, hash refs to objects (encoded/decoded guest-side by
- * JSON::PP from the standard library, loaded lazily on first use). */
+ * A call's argument/return list crosses the boundary as a JSON array of
+ * TAGGED nodes; JSON is only the carrier, the tag is the semantics. Plain
+ * scalars cross BY VALUE ({"k":"d","v":...}), composite host data crosses by
+ * value as fresh Perl structures ({"k":"j","v":...}), and Perl REFERENCES -
+ * blessed objects, array/hash/code refs - are never serialised: they cross
+ * BY HANDLE ({"k":"r","h":id,"t":reftype,"c":class}), an id into a guest
+ * registry that pins the actual SV. Sending a handle back dereferences to
+ * THE SAME SV, so object identity and aliasing survive round trips. See
+ * GO_BRIDGE_GLUE in perl.cc for the codec, the registry (pin/release/retain)
+ * and the handle operations (method call, code invoke, data export). */
 
 /* Call the named Perl subroutine in list context. `sub_name` is a fully
  * qualified sub name ("main::handler", "My::App::run") or a main:: sub name;
- * `args_json` is a JSON array holding the argument list (NULL/empty means no
+ * `args_json` is a JSON array of tagged value nodes (NULL/empty means no
  * arguments). Returns
  *
- *   {"ok":<bool>,"result":<array>,"error":<string>}
+ *   {"ok":<bool>,"result":<array of tagged nodes>,"error":<string>}
  *
- * where "result" is the sub's return list re-encoded as a JSON array. On a
- * Perl-level die (including "no such sub"), "ok" is false and "error" holds
- * $@. Unlike perl_eval, STDOUT/STDERR are NOT redirected: prints go to the
- * instance's WASI fds. */
+ * On a Perl-level die (including "no such sub"), "ok" is false and "error"
+ * holds $@. Unlike perl_eval, STDOUT/STDERR are NOT redirected: prints go to
+ * the instance's WASI fds. */
 std::string perl_call(uint64_t h, const char *sub_name, const char *args_json);
 
 /* Register the Go-side dispatcher for this instance. `callback_id` is the id
