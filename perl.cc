@@ -323,10 +323,13 @@ static const char *GO_BRIDGE_GLUE =
     "  die \"unknown bridge value kind '$k'\\n\";"
     "}"
     /* --- Go -> Perl dispatch (perl_call) --- */
+    /* Symbolic sub deref (&{$name}) needs no `no strict 'refs'`: this glue
+     * compiles without `use strict`, and pulling the pragma in would load
+     * strict.pm DURING perl_new - making boot depend on a readable stdlib,
+     * which a custom-FS instance does not have yet at that point. */
     "sub main::__plwasm_call_dispatch {"
     "  my ($name, $args_json) = @_;"
     "  my @args = map { __plwasm_dec($_) } @{ __plwasm_json()->decode($args_json) };"
-    "  no strict 'refs';"
     "  my @ret = &{$name}(@args);"
     "  return __plwasm_json()->encode([ map { __plwasm_enc($_) } @ret ]);"
     "}"
@@ -528,11 +531,10 @@ static std::string call_error_json(const std::string &msg) {
     return j;
 }
 
-std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
-    if (!g_my_perl || h == 0) return call_error_json("no interpreter");
-    if (!sub_name || !*sub_name) return call_error_json("empty sub name");
-    PERL_SET_CONTEXT(g_my_perl);
-    dTHX;
+/* perl_call_body is the guarded half of perl_call: everything that runs
+ * under the JMPENV the wrapper pushes. Split out so a longjmp (a guest
+ * exit()) does not jump over this function's C++ locals. */
+static std::string perl_call_body(pTHX_ const char *sub_name, const char *args_json) {
     dSP;
 
     ENTER;
@@ -570,6 +572,52 @@ std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
     j += encoded.empty() ? "[]" : encoded;
     j += ",\"error\":\"\"}";
     return j;
+}
+
+std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
+    if (!g_my_perl || h == 0) return call_error_json("no interpreter");
+    if (!sub_name || !*sub_name) return call_error_json("empty sub name");
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+
+    /* Catch a guest exit(): my_exit unwinds with JMPENV_JUMP(2), and without
+     * a live JMPENV here it would fall through to the C exit() - a wasi
+     * proc_exit that aborts the wasm mid-call, before PerlIO ever flushes.
+     * Mirroring perl_run's own catch (perl.c), the exit unwinds cleanly back
+     * to this frame, the interpreter stays destructible (flush + END blocks
+     * run at perl_close), and the status is reported in the envelope's
+     * "exit" field for the host to turn into a process exit. */
+    dJMPENV;
+    int jmp;
+    I32 oldscope = PL_scopestack_ix;
+    std::string out;
+    JMPENV_PUSH(jmp);
+    switch (jmp) {
+    case 0:
+        out = perl_call_body(aTHX_ sub_name, args_json);
+        break;
+    case 2: { /* my_exit() */
+        while (PL_scopestack_ix > oldscope)
+            LEAVE;
+        FREETMPS;
+        /* perl.c's SET_CURSTASH is file-local; inline its body. */
+        if (PL_curstash != PL_defstash) {
+            SvREFCNT_dec(PL_curstash);
+            PL_curstash = (HV *)SvREFCNT_inc(PL_defstash);
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"ok\":false,\"result\":[],\"exit\":%d,\"error\":\"\"}",
+                      (int)STATUS_EXIT);
+        out = buf;
+        break;
+    }
+    default:
+        out = call_error_json("perl_call: unexpected longjmp");
+        break;
+    }
+    JMPENV_POP;
+    return out;
 }
 
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id) {
