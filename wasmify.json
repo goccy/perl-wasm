@@ -75,7 +75,9 @@
       "perl_close",
       "perl_interrupt_addr",
       "perl_call",
-      "perl_set_go_dispatcher"
+      "perl_set_go_dispatcher",
+      "perl_register_native_xs",
+      "perl_xs_helper"
     ]
   }
 }
