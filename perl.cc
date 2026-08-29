@@ -710,6 +710,59 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         return (uint64_t)(uintptr_t)newSVpvn(s ? s : "", (STRLEN)b);
     case 5: /* SV_MORTAL */
         return (uint64_t)(uintptr_t)sv_2mortal((SV *)(uintptr_t)a);
+    case 6: /* NEW_UV */
+        return (uint64_t)(uintptr_t)newSVuv((UV)a);
+    case 7: /* NEW_AV */
+        return (uint64_t)(uintptr_t)(SV *)newAV();
+    case 8: /* NEW_HV */
+        return (uint64_t)(uintptr_t)(SV *)newHV();
+    case 9: /* NEW_RV_INC */
+        return (uint64_t)(uintptr_t)newRV_inc((SV *)(uintptr_t)a);
+    case 10: /* AV_PUSH (steals a ref, like the C API) */
+        av_push((AV *)(uintptr_t)a, (SV *)(uintptr_t)b);
+        return 0;
+    case 11: /* AV_LEN */
+        return (uint64_t)(int64_t)av_len((AV *)(uintptr_t)a);
+    case 12: { /* AV_FETCH */
+        SV **slot = av_fetch((AV *)(uintptr_t)a, (SSize_t)(int64_t)b, FALSE);
+        return slot ? (uint64_t)(uintptr_t)*slot : 0;
+    }
+    case 13: { /* HV_STORE (steals a ref) */
+        hv_store((HV *)(uintptr_t)a, s ? s : "", (I32)strlen(s ? s : ""),
+                 (SV *)(uintptr_t)b, 0);
+        return 0;
+    }
+    case 14: { /* HV_FETCH */
+        SV **slot = hv_fetch((HV *)(uintptr_t)a, s ? s : "",
+                             (I32)strlen(s ? s : ""), FALSE);
+        return slot ? (uint64_t)(uintptr_t)*slot : 0;
+    }
+    case 15: /* SV_REFCNT_INC */
+        return (uint64_t)(uintptr_t)SvREFCNT_inc((SV *)(uintptr_t)a);
+    case 16: /* GV_STASHPV */
+        return (uint64_t)(uintptr_t)gv_stashpv(s ? s : "", (I32)(int64_t)a);
+    case 17: /* SV_BLESS */
+        return (uint64_t)(uintptr_t)sv_bless((SV *)(uintptr_t)a,
+                                             (HV *)(uintptr_t)b);
+    case 18: { /* SV_RV: SvRV token when SvROK, else 0 */
+        SV *sv = (SV *)(uintptr_t)a;
+        return SvROK(sv) ? (uint64_t)(uintptr_t)SvRV(sv) : 0;
+    }
+    case 19: { /* SV_TYPE_CLASS: 1 AV, 2 HV, 3 CV, 0 other */
+        switch (SvTYPE((SV *)(uintptr_t)a)) {
+        case SVt_PVAV: return 1;
+        case SVt_PVHV: return 2;
+        case SVt_PVCV: return 3;
+        default: return 0;
+        }
+    }
+    case 20: /* SV_ISA */
+        return sv_isa((SV *)(uintptr_t)a, s ? s : "") ? 1 : 0;
+    case 21: /* SV_DERIVED_FROM */
+        return sv_derived_from((SV *)(uintptr_t)a, s ? s : "") ? 1 : 0;
+    case 22: /* SETREF_IV: bless rv as class s pointing at IV b */
+        return (uint64_t)(uintptr_t)sv_setref_iv((SV *)(uintptr_t)a,
+                                                 s ? s : "", (IV)(int64_t)b);
     }
     return 0;
 }
