@@ -157,6 +157,13 @@ static int32_t g_go_cb = 0;
  * enclosing guest scope pops (normally or during die unwinding). */
 #define GOPERL_DTOR_METHOD_ID (-4)
 
+/* Reserved callback method id for host-side set-magic: when a guest SV whose
+ * anchor was upgraded via op SV_MAGIC_SET_HOOK has its value assigned, the
+ * guest forwards the u32 host id so the host can run the svt_set hooks of
+ * its mirror MAGIC chain (e.g. Moose's re-export flag magic, which clears
+ * itself when the glob is overwritten). */
+#define GOPERL_MG_SET_METHOD_ID (-5)
+
 /* Host->guest response protocol (native XS / pp hook): byte 0 is the status,
  * GOPERL_RESP_OK followed by the result payload, GOPERL_RESP_FAIL followed by
  * the croak message bytes. */
@@ -818,6 +825,27 @@ static const MGVTBL goperl_host_mg_vtbl = {
     NULL, NULL, NULL, NULL, goperl_host_mg_free, NULL, NULL, NULL
 };
 
+/* Set-magic variant of the anchor: assigning to the SV additionally fires
+ * the host id over GOPERL_MG_SET_METHOD_ID so mirror svt_set hooks run.
+ * Anchors start set-less (attaching set magic makes every write to the SV
+ * pay a host round trip) and are upgraded on demand via op
+ * SV_MAGIC_SET_HOOK when a mirror entry actually carries svt_set. */
+static int goperl_host_mg_set(pTHX_ SV *sv, MAGIC *mg) {
+    PERL_UNUSED_ARG(sv);
+    if (g_go_cb != 0) {
+        uint32_t id = (uint32_t)(uintptr_t)mg->mg_ptr;
+        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_SET_METHOD_ID,
+                                             &id, sizeof(id));
+        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+        if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+    }
+    return 0;
+}
+
+static const MGVTBL goperl_host_mg_vtbl_set = {
+    NULL, goperl_host_mg_set, NULL, NULL, goperl_host_mg_free, NULL, NULL, NULL
+};
+
 /* ---- perl_xs_helper protocol constants ----------------------------------
  * KEEP IN SYNC with go-perl's xsnative/sdk/include/perl.h, which mirrors
  * every value here (the GOPERL_OP_* enum, the GOPERL_PL_* ids, and the
@@ -954,7 +982,15 @@ enum goperl_xs_op {
     GOPERL_OP_EVAL_PV = 124,
     GOPERL_OP_AV_UNSHIFT = 125,
     GOPERL_OP_NEW_CONSTSUB = 126,
-    GOPERL_OP_SV_PVX_RAW = 127
+    GOPERL_OP_SV_PVX_RAW = 127,
+    /* v5: the Class::MOP/Moose surface (stash mro generation, glob
+     * initialisation, overload flags, set-magic upgrades). */
+    GOPERL_OP_HV_PKG_GEN = 128,
+    GOPERL_OP_SV_REFCNT = 129,
+    GOPERL_OP_GV_INIT = 130,
+    GOPERL_OP_GV_AMG = 131,
+    GOPERL_OP_SV_AMAGIC_SET = 132,
+    GOPERL_OP_SV_MAGIC_SET_HOOK = 133
 };
 
 /* PLVAR_GET / PLVAR_SET interpreter-variable ids (the `a` argument). */
@@ -1015,6 +1051,8 @@ enum goperl_xs_op {
 #define GOPERL_GVPTR_HV 2      /* GV_PTR: GvHV */
 #define GOPERL_GVPTR_AV 3      /* GV_PTR: GvAV */
 #define GOPERL_GVPTR_EGV 4     /* GV_PTR: GvEGV */
+#define GOPERL_GVPTR_SV 5      /* GV_PTR: GvSV */
+#define GOPERL_GVPTR_IO 6      /* GV_PTR: GvIO */
 #define GOPERL_SI_SELF 0       /* SI_GET: the stackinfo token itself */
 #define GOPERL_SI_PREV 1       /* SI_GET: si_prev */
 #define GOPERL_SI_TYPE 2       /* SI_GET: si_type */
@@ -1575,6 +1613,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_GVPTR_HV: return (uint64_t)(uintptr_t)(SV *)GvHV(gv);
         case GOPERL_GVPTR_AV: return (uint64_t)(uintptr_t)(SV *)GvAV(gv);
         case GOPERL_GVPTR_EGV: return (uint64_t)(uintptr_t)(SV *)GvEGV(gv);
+        case GOPERL_GVPTR_SV: return (uint64_t)(uintptr_t)GvSV(gv);
+        case GOPERL_GVPTR_IO: return (uint64_t)(uintptr_t)(SV *)GvIO(gv);
         }
         return 0;
     }
@@ -1689,6 +1729,55 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         SV *sv = (SV *)(uintptr_t)a;
         if (SvTYPE(sv) < SVt_PV) return 0;
         return (uint64_t)(uint32_t)(uintptr_t)SvPVX(sv);
+    }
+
+    /* ---- v5: the Class::MOP/Moose surface. */
+    case GOPERL_OP_HV_PKG_GEN: { /* mro generation of a stash ->
+                 * has_meta<<32 | pkg_gen (0 when the hash has no aux/meta).
+                 * The moral equivalent of mro::get_pkg_gen($stash), read the
+                 * same way Moose's mop.c reads it. */
+        HV *hv = (HV *)(uintptr_t)a;
+        if (SvTYPE((SV *)hv) != SVt_PVHV || !HvHasAUX(hv)) return 0;
+        struct mro_meta *m = HvAUX(hv)->xhv_mro_meta;
+        if (!m) return 0;
+        return (1ull << 32) | (uint32_t)m->pkg_gen;
+    }
+    case GOPERL_OP_SV_REFCNT:
+        return (uint64_t)SvREFCNT((SV *)(uintptr_t)a);
+    case GOPERL_OP_GV_INIT: { /* expand a stash stub into a real glob
+                 * (b = flags<<32 | stash, s = name) -> the gv token */
+        GV *gv = (GV *)(uintptr_t)a;
+        HV *stash = (HV *)(uintptr_t)(uint32_t)b;
+        gv_init_pvn(gv, stash, s ? s : "", strlen(s ? s : ""),
+                    (U32)(b >> 32));
+        return (uint64_t)(uintptr_t)gv;
+    }
+    case GOPERL_OP_GV_AMG: { /* Gv_AMG: does the stash have a (freshly
+                 * updated) overload magic table? */
+        HV *stash = (HV *)(uintptr_t)a;
+        if (SvTYPE((SV *)stash) != SVt_PVHV) return 0;
+        return Gv_AMG(stash) ? 1 : 0;
+    }
+    case GOPERL_OP_SV_AMAGIC_SET: /* b ? SvAMAGIC_on : SvAMAGIC_off (a must
+                 * be a reference, per the core macros) */
+        if (!SvROK((SV *)(uintptr_t)a)) return 0;
+        if (b) SvAMAGIC_on((SV *)(uintptr_t)a);
+        else SvAMAGIC_off((SV *)(uintptr_t)a);
+        return 1;
+    case GOPERL_OP_SV_MAGIC_SET_HOOK: { /* upgrade the anchor magic on sv to
+                 * the set-firing vtbl (idempotent); mg_magical refreshes the
+                 * SV's magic flags so assignments actually trigger it. */
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvTYPE(sv) < SVt_PVMG) return 0;
+        for (MAGIC *mg = SvMAGIC(sv); mg; mg = mg->mg_moremagic) {
+            if (mg->mg_virtual == &goperl_host_mg_vtbl ||
+                mg->mg_virtual == &goperl_host_mg_vtbl_set) {
+                mg->mg_virtual = (MGVTBL *)&goperl_host_mg_vtbl_set;
+                mg_magical(sv);
+                return 1;
+            }
+        }
+        return 0;
     }
     }
     return 0;
