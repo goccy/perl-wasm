@@ -81,4 +81,98 @@ void perl_close(uint64_t h);
  * not preempted until it returns to the run loop. */
 uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
 
+/* ---- Go <-> Perl bridge --------------------------------------------------
+ *
+ * A call's argument/return list crosses the boundary as a JSON array of
+ * TAGGED nodes; JSON is only the carrier, the tag is the semantics. Plain
+ * scalars cross BY VALUE ({"k":"d","v":...}), composite host data crosses by
+ * value as fresh Perl structures ({"k":"j","v":...}), and Perl REFERENCES -
+ * blessed objects, array/hash/code refs - are never serialised: they cross
+ * BY HANDLE ({"k":"r","h":id,"t":reftype,"c":class}), an id into a guest
+ * registry that pins the actual SV. Sending a handle back dereferences to
+ * THE SAME SV, so object identity and aliasing survive round trips. See
+ * GO_BRIDGE_GLUE in perl.cc for the codec, the registry (pin/release)
+ * and the handle operations (method call, code invoke, data export). */
+
+/* Call the named Perl subroutine in list context. `sub_name` is a fully
+ * qualified sub name ("main::handler", "My::App::run") or a main:: sub name;
+ * `args_json` is a JSON array of tagged value nodes (NULL/empty means no
+ * arguments). Returns
+ *
+ *   {"ok":<bool>,"result":<array of tagged nodes>,"error":<string>}
+ *
+ * On a Perl-level die (including "no such sub"), "ok" is false and "error"
+ * holds $@. Unlike perl_eval, STDOUT/STDERR are NOT redirected: prints go to
+ * the instance's WASI fds. */
+std::string perl_call(uint64_t h, const char *sub_name, const char *args_json);
+
+/* Register the Go-side dispatcher for this instance. `callback_id` is the id
+ * the host returned when registering its callback handler; every Perl->Go
+ * call from this interpreter is routed to it. Perl code reaches Go through
+ * main::__plwasm_go_invoke($func_id, $payload_json) — an XS installed by
+ * perl_new that forwards to the wasmify callback import — and the
+ * main::__plwasm_go_call glue that wraps it with JSON encode/decode (the
+ * host binds a named Perl sub to a Go function by eval'ing a one-line sub
+ * that calls the glue with the Go function's id). */
+void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
+
+/* ---- Native XS support ---------------------------------------------------
+ *
+ * Lets the host register XSUBs whose implementation lives OUTSIDE the wasm -
+ * in a host-native shared library the embedder dlopen'd (go-perl's native XS
+ * SDK). Perl-side each such sub is an ordinary XS backed by a generic thunk
+ * that forwards the call over the wasmify callback import with the reserved
+ * method id -1: payload [u32 fn_id][u32 cv_token][u32 items][u32
+ * sv_tokens...], response [u8 ok] then on success [u32 nret][u32
+ * sv_tokens...] or on failure the croak message. The host runs the native
+ * XSUB (real XSUBs receive their own CV, hence the cv token), using
+ * perl_xs_helper for every SV operation, and the thunk pushes the returned
+ * (mortal) SVs.
+ *
+ * A second reserved method id, -2, flows the OTHER way on teardown: freeing
+ * a guest SV that carries goperl anchor magic (op SV_MAGIC_ATTACH) sends
+ * the u32 host magic id so the host can run the native module's svt_free
+ * and drop its mirror MAGIC chain.
+ *
+ * Reserved method id -3 carries pp hooks: for op types a native module
+ * claimed (op PP_HOOK_SET), the run loop sends [u32 op][u32 op_type][u32 n]
+ * [u32 stack-top tokens] instead of executing the pp, and the host answers
+ * [1][u32 next_op] (or [0]+message to croak). The hook runs the true pp
+ * itself through op RUN_ORIGINAL — the guest PL_ppaddr is never patched.
+ *
+ * Reserved method id -4 fires save-stack destructors (op SAVE_DESTRUCTOR):
+ * the u32 host id is delivered when the guest scope holding it pops,
+ * during normal exit and die unwinding alike. */
+
+/* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
+ * key for the actual native function (stored in the CV's XSANY). */
+void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
+
+/* SV micro-operations the host-side SDK vtable is built from. The full op
+ * table lives in perl.cc (and mirrors the GOPERL_OP_* enum in the go-perl
+ * native SDK header); representative entries:
+ *   1  SV_IV       a=sv                  -> IV (as u64)
+ *   2  SV_PV       a=sv                  -> (ptr<<32)|len into linear memory
+ *   3  NEW_IV      a=iv                  -> new SV token
+ *   4  NEW_PVN     s=bytes b=len         -> new SV token
+ *   5  SV_MORTAL   a=sv                  -> sv (now mortal)
+ *   ...
+ *   23-64          sv_setsv/setiv/setnv/catsv families, NV ops, AV/HV entry
+ *                  and iterator ops, ENTER/LEAVE/SAVETMPS/FREETMPS
+ *   65 CALL_SV     a=flags<<32|sv, s+b=packed u32 arg tokens
+ *                  -> died<<63 | count<<32 | mortal-AV token of results
+ *   66 CALL_METHOD like CALL_SV but s = "name\0" + packed tokens
+ *   68 SAVE_OP     scope-save PL_op (the SAVEOP() macro)
+ *   69 RUN_PP_SCRATCH a=op_flags<<32|op_type, s+b=arg tokens: run one pp
+ *                  function on a scratch OP in list context
+ *   70-72          host-side MAGIC anchor attach / id lookup / unattach
+ *   73-74,80       PL_* interpreter-variable get/set and local'ised hooks
+ *   98-100         pp-hook table, RUN_ORIGINAL, save-stack destructors
+ *   101-116        OP/COP/CV/GV/stash/context-stack introspection (host
+ *                  shadow materialization for interpreter-hooking XS)
+ *   117-127        gv_fetchfile, hv_clear/hv_delete, save_scalar, eval_pv,
+ *                  newCONSTSUB, raw SvPVX, and friends
+ * Unknown ops return 0. */
+uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
+
 #endif /* PERLEMBED_H */

@@ -24,6 +24,31 @@
  * values (distinct from FE_TONEAREST); they are never actually selected because
  * wasi's fegetround() always returns FE_TONEAREST, so POSIX::rint et al. round
  * to nearest, which is the only mode wasm implements. */
+/* wasi's clock ids are STRUCT POINTERS (clockid_t = const struct __clockid *,
+ * CLOCK_REALTIME = &_CLOCK_REALTIME), while perl-world code moves clock ids
+ * through IVs — generated constant tables (ExtUtils::Constant's const-c.inc
+ * in Time::HiRes) assign the macros to IV, and feature probes assign them to
+ * clockid_t. The clock_* FUNCTIONS are configured off for perl
+ * (d_clock_gettime='undef' & friends in wasi-configure.sh), so nothing can
+ * ever pass these ids to wasi-libc; replace the pointer macros with the
+ * conventional integer ids so both idioms compile. CLOCK_REALTIME must be 0:
+ * feature probes assign it to clockid_t, and 0 is the one integer that is
+ * also a valid null pointer constant. */
+#include <time.h>
+#undef CLOCK_REALTIME
+#undef CLOCK_MONOTONIC
+#undef CLOCK_PROCESS_CPUTIME_ID
+#undef CLOCK_THREAD_CPUTIME_ID
+#undef CLOCK_MONOTONIC_RAW
+#undef CLOCK_REALTIME_COARSE
+#undef CLOCK_MONOTONIC_COARSE
+#undef CLOCK_BOOTTIME
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID 3
+#define CLOCK_MONOTONIC_RAW 4
+
 #include <fenv.h>
 #ifndef FE_DOWNWARD
 #define FE_DOWNWARD   0x400
@@ -58,6 +83,23 @@ struct sockaddr_un {
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
+#endif
+
+/* Socket constants wasi-libc omits but Socket.xs bakes into its constant
+ * table when defined — and pure-Perl networking code imports at compile time:
+ * IO::Socket::INET does `use Socket qw(... SOCK_RAW)` (its icmp socket type),
+ * so a missing macro kills the import of IO::Socket, IO::Socket::IP, and
+ * everything above them (Mojolicious, Plack middlewares, LWP). Standard
+ * musl/Linux values; actually OPENING a raw/seqpacket socket still fails at
+ * socket() time under the host socket layer, which is the correct place. */
+#ifndef SOCK_RAW
+#define SOCK_RAW 3
+#endif
+#ifndef SOCK_SEQPACKET
+#define SOCK_SEQPACKET 5
+#endif
+#ifndef SOMAXCONN
+#define SOMAXCONN 128
 #endif
 
 #ifdef __cplusplus

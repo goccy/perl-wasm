@@ -37,7 +37,7 @@ zlib/bzip2 sources, so no external library is required), `Digest-MD5`,
 
 ### dist/
 `Data-Dumper`, `IO`, `PathTools` (`Cwd` / `File::Spec`), `Storable`,
-`Unicode-Normalize`
+`Time-HiRes`, `Unicode-Normalize`
 
 Notes:
 - `SDBM_File` bundles its own `sdbm` implementation, so it needs no external
@@ -46,6 +46,14 @@ Notes:
   small host-capability stub under wasi; they are kept as porting targets.
 - `Socket` is included because the wasm layer enables host sockets
   (`HostSockets: true`); connection *policy* is enforced on the go-perl side.
+- `Time-HiRes` is built with its `clock_gettime`/`clock_getres`/
+  `clock_nanosleep` and interval-timer (`setitimer`/`getitimer`/`ualarm`)
+  features configured off (`d_clock_*`/`d_setitimer`/`d_ualarm` overrides in
+  `wasi-configure.sh`): wasi's `clockid_t` is a struct pointer while
+  Time::HiRes moves clock ids through Perl as integers, and the itimer
+  symbols do not exist in wasi-libc. `time`/`gettimeofday`/`tv_interval`/
+  `sleep`/`usleep`/`nanosleep` are the real implementations; the disabled
+  functions fail cleanly so feature probes fall back.
 
 ## Excluded (NOT linked) and why
 
@@ -56,7 +64,6 @@ Notes:
 | `IPC-SysV` | System V IPC (`shmget` / `semget` / `msgget`) does not exist under wasi. |
 | `PerlIO-mmap` | Relies on `mmap`, which wasi implements only partially. |
 | `Sys-Syslog` | There is no `syslog` facility under wasi. |
-| `Time-HiRes` | wasi's `clockid_t` is `const struct __clockid *` (a struct pointer; `CLOCK_REALTIME` = `&_CLOCK_REALTIME`), but Time::HiRes passes clock ids through Perl as integers, so `clock_gettime`/`clock_getres` are type-incompatible; `setitimer`/`getitimer` / interval timers also do not exist under wasi. Core `time()`/`sleep` and `POSIX`'s clock interfaces cover the common cases. |
 | `threads`, `threads-shared` | The interpreter is built without ithreads (`useithreads=undef`); the wasm target is single-threaded. |
 | `XS-APItest`, `XS-Typemap`, `Devel-PPPort` | Test-only / module-author tooling; not needed at runtime. |
 

@@ -1,7 +1,7 @@
 # Container image shipping every toolchain wasmify needs (wasi-sdk + binaryen +
 # buf + the wasmify CLI itself). Override locally to pin a SHA or to iterate on a
 # wasmify branch — e.g. `make wasm IMAGE=localhost:5001/wasmify:local`.
-IMAGE ?= ghcr.io/goccy/wasmify:v0.4.10
+IMAGE ?= ghcr.io/goccy/wasmify:v0.6.9
 
 # Resource limits for the container that runs the pipeline. CPUS bounds make's
 # parallelism; a Perl wasm build peaks well under MEMORY.
@@ -42,19 +42,29 @@ WASMIFY_PIPELINE = \
 	$(BUILD_ENV) bash scripts/wasi-configure.sh && \
 	$(BUILD_ENV) wasmify build --non-interactive && \
 	wasmify generate-build && \
-	wasmify parse-headers --header pl.h && \
+	wasmify parse-headers --header pl.h --clang $(WASI_CLANG) && \
 	wasmify gen-proto && \
 	$(BUILD_ENV) wasmify wasm-build --optimize --non-interactive && \
 	rm -rf build && \
-	buf generate && \
+	buf generate --timeout 0 && \
 	make bundle-gomod
+# `buf generate --timeout 0`: buf's default two-minute plugin timeout SIGKILLs
+# protoc-gen-wasmify-go mid-transpile on a wasm this size and reports only
+# "signal: killed".
+
+# parse-headers runs clang over pl.h with the flags the build captured, which
+# include the wasm target, --sysroot, and -mllvm -wasm-enable-sjlj. A host
+# clang (Apple clang in particular) rejects those, so point it at wasi-sdk's
+# clang — the same compiler that built the archives. Works both in the
+# container and on a bare host (wasmify ensure-tools installs the sdk there).
+WASI_CLANG = $${WASI_SDK_PATH:-$$HOME/.config/wasmify/bin/wasi-sdk}/bin/clang
 # `rm -rf build` so `buf generate` writes the wasm2go bundle into a CLEAN tree:
 # protoc-gen-wasmify-go overwrites the files it emits but never deletes stale
 # ones, and the bundle's file SET depends on the wasm's size (a sub-threshold
 # wasm yields a single-package layout; a larger one yields the base/ + pN
 # multi-package layout). Mixing two leftover sets in one package won't compile.
 
-.PHONY: all wasm wasm-clean tools bundle-gomod stdlib-zip image-pull help
+.PHONY: all wasm wasm-host wasm-clean tools bundle-gomod stdlib-zip image-pull help
 
 all: wasm
 
@@ -75,6 +85,19 @@ wasm:
 		-e WASMIFY_NON_INTERACTIVE=1 \
 		$(IMAGE) \
 		bash -c '$(WASMIFY_PIPELINE)'
+
+# Same pipeline, run directly on the host — much faster than the container on
+# an Apple Silicon machine (the image is linux/amd64 and runs emulated there).
+# Requirements, matching what the image ships:
+#   * the wasmify CLI and protoc-gen-wasmify-go on PATH, built from the SAME
+#     wasmify version as $(IMAGE):
+#       go install github.com/goccy/wasmify/cmd/wasmify@vX.Y.Z
+#       go install github.com/goccy/wasmify/protoc-plugins/protoc-gen-wasmify-go@vX.Y.Z
+#   * buf, python3, make on PATH
+#   * wasi-sdk — `make tools` (the pipeline's first step) installs it under
+#     ~/.config/wasmify/bin/wasi-sdk if missing.
+wasm-host:
+	bash -c '$(WASMIFY_PIPELINE)'
 
 # Build the embeddable stdlib zip from the ASSEMBLED perl5/lib tree. CI's
 # build.yml/release.yml run this same script when staging artifacts; this target

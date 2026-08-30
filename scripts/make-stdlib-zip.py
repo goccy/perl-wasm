@@ -51,6 +51,10 @@ def included(rel_path: str) -> bool:
         return False
     if base == ".exists":
         return False
+    # Build log with an embedded generation timestamp; not needed at runtime
+    # and the only nondeterministic byte source in the tree.
+    if rel_path == "unicore/mktables.lst":
+        return False
     for ext in (".a", ".ld", ".bs", ".pod", ".t"):
         if rel_path.endswith(ext):
             return False
@@ -78,13 +82,14 @@ def main() -> int:
         sys.stderr.write(f"not a directory: {lib_dir}\n")
         return 1
 
-    rels = collect(lib_dir)
+    sources = {rel: lib_dir for rel in collect(lib_dir)}
+    rels = sorted(sources)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in rels:
             info = zipfile.ZipInfo(filename=rel, date_time=FIXED_DATE_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16  # regular file, rw-r--r--
-            with open(os.path.join(lib_dir, rel), "rb") as fh:
+            with open(os.path.join(sources[rel], rel), "rb") as fh:
                 zf.writestr(info, fh.read())
     sys.stderr.write(f"wrote {out_path}: {len(rels)} files\n")
     return 0
