@@ -152,6 +152,7 @@ static int32_t g_go_cb = 0;
  * hook runs the ORIGINAL pp itself (perl_xs_helper op RUN_ORIGINAL) and
  * decides the next op, exactly like a real PL_ppaddr replacement. */
 #define GOPERL_PP_HOOK_METHOD_ID (-3)
+#define GOPERL_KEYWORD_METHOD_ID (-7)
 
 /* Reserved callback method id for save-stack destructors registered via
  * perl_xs_helper op SAVE_DESTRUCTOR: fires with the u32 host id when the
@@ -202,6 +203,80 @@ static volatile uint32_t g_interrupt = 0;
 static uint8_t g_pp_hooked[MAXO];
 static uint32_t g_pp_hook_count = 0;
 
+/* Per-op host dispatch: a native module wrote one op's op_ppaddr; that op
+ * (and only that op) executes through the pp-hook callback. */
+static OP *goperl_pp_hooked_op(pTHX);
+
+/* Host keyword/infix plugin forwarding (go-perl XS SDK, method -7). */
+static Perl_keyword_plugin_t g_next_keyword_plugin = NULL;
+static Perl_infix_plugin_t g_next_infix_plugin = NULL;
+
+static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
+                                 OP **op_ptr) {
+    if (g_go_cb && keyword_len > 0 && keyword_len < 256) {
+        unsigned char buf[4 + 256];
+        uint32_t kind = 0;
+        memcpy(buf, &kind, 4);
+        memcpy(buf + 4, keyword_ptr, keyword_len);
+        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
+                                             buf, 4 + (uint32_t)keyword_len);
+        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+        uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+        if (resp_ptr != 0 && resp_len >= 1) {
+            unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+            if (resp[0] == GOPERL_RESP_FAIL) {
+                char msg[512];
+                size_t ml = resp_len - 1;
+                if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
+                memcpy(msg, resp + 1, ml);
+                msg[ml] = '\0';
+                free(resp);
+                Perl_croak(aTHX_ "%s", msg);
+            }
+            if (resp_len >= 10 && resp[1]) {
+                uint32_t ret = 0, tok = 0;
+                memcpy(&ret, resp + 2, 4);
+                memcpy(&tok, resp + 6, 4);
+                free(resp);
+                *op_ptr = (OP *)(uintptr_t)tok;
+                return (int)ret;
+            }
+            free(resp);
+        }
+    }
+    return (*g_next_keyword_plugin)(aTHX_ keyword_ptr, keyword_len, op_ptr);
+}
+
+static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
+                                  struct Perl_custom_infix **def) {
+    if (g_go_cb && oplen > 0 && oplen < 256) {
+        unsigned char buf[4 + 256];
+        uint32_t kind = 1;
+        memcpy(buf, &kind, 4);
+        memcpy(buf + 4, opname, oplen);
+        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
+                                             buf, 4 + (uint32_t)oplen);
+        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+        uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+        if (resp_ptr != 0 && resp_len >= 1) {
+            unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+            if (resp[0] == GOPERL_RESP_FAIL) {
+                char msg[512];
+                size_t ml = resp_len - 1;
+                if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
+                memcpy(msg, resp + 1, ml);
+                msg[ml] = '\0';
+                free(resp);
+                Perl_croak(aTHX_ "%s", msg);
+            }
+            free(resp);
+        }
+    }
+    if (g_next_infix_plugin)
+        return (*g_next_infix_plugin)(aTHX_ opname, oplen, def);
+    return 0;
+}
+
 static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     if (g_go_cb == 0) return op->op_ppaddr(aTHX);
     /* payload: op token, op type, and a peek at the top of the perl stack
@@ -238,6 +313,10 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     if (resp_len >= 5) memcpy(&next, resp + 1, 4);
     free(resp);
     return (OP *)(uintptr_t)next;
+}
+
+static OP *goperl_pp_hooked_op(pTHX) {
+    return goperl_call_pp_hook(aTHX_ PL_op);
 }
 
 static inline OP *goperl_exec_op(pTHX_ OP *op) {
@@ -1183,7 +1262,110 @@ enum goperl_xs_op {
     GOPERL_OP_PERLIO_NEXT_GETPTR = 168,
     GOPERL_OP_PERLIO_NEXT_SETPTRCNT = 169,
     GOPERL_OP_PERLIO_NEXT_FILL = 170,
-    GOPERL_OP_PERLIO_STATE = 171
+    GOPERL_OP_PERLIO_STATE = 171,
+    /* v8: keyword plugins, lexer/parser bridging, optree construction */
+    GOPERL_OP_OPTREE_NEW = 172,
+    GOPERL_OP_OPTREE_MISC = 173,
+    GOPERL_OP_OP_SET = 174,
+    GOPERL_OP_LEX = 175,
+    GOPERL_OP_PARSE = 176,
+    GOPERL_OP_PARSER_GET = 177,
+    GOPERL_OP_PARSER_SET = 178,
+    GOPERL_OP_BLOCK = 179,
+    GOPERL_OP_PAD = 180,
+    GOPERL_OP_KEYWORD_ENABLE = 181,
+    GOPERL_OP_CHARCLASS = 182,
+    GOPERL_OP_SAVE_MISC = 183,
+    GOPERL_OP_SV_CLASSIFY = 184
+};
+
+/* v8 sub-selectors (shared with the SDK headers). */
+enum {
+    GOPERL_OPC_BASEOP = 0,
+    GOPERL_OPC_UNOP = 1,
+    GOPERL_OPC_BINOP = 2,
+    GOPERL_OPC_LISTOP = 3,
+    GOPERL_OPC_LOGOP = 4,
+    GOPERL_OPC_SVOP = 5,
+    GOPERL_OPC_PVOP = 6,
+    GOPERL_OPC_GVOP = 7,
+    GOPERL_OPC_METHOP_NAMED = 8,
+    GOPERL_OPC_STATEOP = 9,
+    GOPERL_OPC_CONDOP = 10,
+    GOPERL_OPC_SLICEOP = 11,
+    GOPERL_OPC_RAW = 12
+};
+enum {
+    GOPERL_OPM_APPEND_ELEM = 0,
+    GOPERL_OPM_APPEND_LIST = 1,
+    GOPERL_OPM_PREPEND_ELEM = 2,
+    GOPERL_OPM_CONVERT_LIST = 3,
+    GOPERL_OPM_CONTEXTUALIZE = 4,
+    GOPERL_OPM_SCOPE = 5,
+    GOPERL_OPM_LINKLIST = 6,
+    GOPERL_OPM_FREE = 7,
+    GOPERL_OPM_NULL = 8,
+    GOPERL_OPM_FORCE_LIST = 9,
+    GOPERL_OPM_SIBLING_SPLICE = 10
+};
+enum {
+    GOPERL_OPF_NEXT = 0,
+    GOPERL_OPF_SIBPARENT = 1,
+    GOPERL_OPF_FIRST = 2,
+    GOPERL_OPF_LAST = 3,
+    GOPERL_OPF_OTHER = 4,
+    GOPERL_OPF_TARG = 5,
+    GOPERL_OPF_TYPE = 6,
+    GOPERL_OPF_FLAGS = 7,
+    GOPERL_OPF_PRIVATE = 8,
+    GOPERL_OPF_PPADDR_HOOK = 9
+};
+enum {
+    GOPERL_LEX_READ_SPACE = 0,
+    GOPERL_LEX_PEEK_UNICHAR = 1,
+    GOPERL_LEX_READ_UNICHAR = 2,
+    GOPERL_LEX_READ_TO = 3,
+    GOPERL_LEX_BUFUTF8 = 4,
+    GOPERL_LEX_STUFF_PVN = 5
+};
+enum {
+    GOPERL_PARSE_BLOCK = 0,
+    GOPERL_PARSE_TERMEXPR = 1,
+    GOPERL_PARSE_LISTEXPR = 2,
+    GOPERL_PARSE_ARITHEXPR = 3,
+    GOPERL_PARSE_FULLEXPR = 4,
+    GOPERL_PARSE_FULLSTMT = 5,
+    GOPERL_PARSE_STMTSEQ = 6,
+    GOPERL_PARSE_BARESTMT = 7
+};
+enum {
+    GOPERL_PARSER_PRESENT = 0,
+    GOPERL_PARSER_LINESTR = 1,
+    GOPERL_PARSER_BUFPTR = 2,
+    GOPERL_PARSER_BUFEND = 3,
+    GOPERL_PARSER_OLDBUFPTR = 4,
+    GOPERL_PARSER_LINESTART = 5,
+    GOPERL_PARSER_ERROR_COUNT = 6,
+    GOPERL_PARSER_IN_MY = 7,
+    GOPERL_PARSER_LEX_FLAGS = 8,
+    GOPERL_PARSER_PREAMBLING = 9,
+    GOPERL_PARSER_PV = 10
+};
+enum {
+    GOPERL_PAD_ALLOC = 0,
+    GOPERL_PAD_ADD_NAME_PVN = 1,
+    GOPERL_PAD_FINDMY_PVN = 2,
+    GOPERL_PAD_INTRO_MY = 3,
+    GOPERL_PAD_SETSV = 4,
+    GOPERL_PAD_SV_FETCH = 5
+};
+enum {
+    GOPERL_CC_IDFIRST = 0,
+    GOPERL_CC_IDCONT = 1,
+    GOPERL_CC_WORDCHAR = 2,
+    GOPERL_CC_SPACE = 3,
+    GOPERL_CC_DIGIT = 4,
+    GOPERL_CC_ALPHA = 5
 };
 
 /* PLVAR_GET / PLVAR_SET interpreter-variable ids (the `a` argument). */
@@ -1212,6 +1394,9 @@ enum goperl_xs_op {
 #define GOPERL_PL_DOWARN 23
 #define GOPERL_PL_HINTS 24
 #define GOPERL_PL_SUB_GENERATION 25
+#define GOPERL_PL_DEFGV 26
+#define GOPERL_PL_HINTGV 27
+#define GOPERL_PL_COMPCV 28
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -1238,6 +1423,10 @@ enum goperl_xs_op {
 #define GOPERL_OPPTR_SIBLING 1 /* OP_PTR: OpSIBLING */
 #define GOPERL_OPPTR_FIRST 2   /* OP_PTR: op_first (OPf_KIDS only) */
 #define GOPERL_OPPTR_REDOOP 3  /* OP_PTR: op_redoop (LOOP class only) */
+#define GOPERL_OPPTR_LAST 4    /* OP_PTR: op_last (BINOP/LISTOP-shaped) */
+#define GOPERL_OPPTR_OTHER 5   /* OP_PTR: op_other (LOGOP-shaped) */
+#define GOPERL_OPPTR_MORESIB 6 /* OP_PTR: OpHAS_SIBLING */
+#define GOPERL_OPPTR_IS_HOOKED 7 /* OP_PTR: op_ppaddr is the host hook */
 #define GOPERL_CVPTR_START 0   /* CV_PTR: CvSTART */
 #define GOPERL_CVPTR_GV 1      /* CV_PTR: CvGV */
 #define GOPERL_CVPTR_STASH 2   /* CV_PTR: CvSTASH */
@@ -1605,6 +1794,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_BASETIME: return (uint64_t)(int64_t)PL_basetime;
         case GOPERL_PL_MODGLOBAL: return (uint64_t)(uintptr_t)(SV *)PL_modglobal;
         case GOPERL_PL_MINUS_C: return PL_minus_c ? 1 : 0;
+        case GOPERL_PL_DEFGV: return (uint64_t)(uintptr_t)PL_defgv;
+        case GOPERL_PL_HINTGV: return (uint64_t)(uintptr_t)PL_hintgv;
+        case GOPERL_PL_COMPCV: return (uint64_t)(uintptr_t)PL_compcv;
         case GOPERL_PL_CURSTASH: return (uint64_t)(uintptr_t)(SV *)PL_curstash;
         case GOPERL_PL_DOWARN: return (uint64_t)PL_dowarn;
         case GOPERL_PL_HINTS: return (uint64_t)PL_hints;
@@ -1624,6 +1816,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_CHECKAV: PL_checkav = (AV *)val; return 0;
         case GOPERL_PL_INITAV: PL_initav = (AV *)val; return 0;
         case GOPERL_PL_EXIT_FLAGS: PL_exit_flags = (U8)b; return 0;
+        case GOPERL_PL_HINTS: PL_hints = (U32)b; return 0;
         }
         return 0;
     }
@@ -1773,6 +1966,24 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             if ((PL_opargs[o->op_type] & OA_CLASS_MASK) == OA_LOOP)
                 return (uint64_t)(uintptr_t)cLOOPx(o)->op_redoop;
             return 0;
+        case GOPERL_OPPTR_LAST: {
+            U32 c = PL_opargs[o->op_type] & OA_CLASS_MASK;
+            if (c == OA_BINOP || c == OA_LISTOP || c == OA_PMOP ||
+                c == OA_LOOP ||
+                (o->op_type == OP_CUSTOM && (o->op_flags & OPf_KIDS)))
+                return (uint64_t)(uintptr_t)cBINOPx(o)->op_last;
+            return 0;
+        }
+        case GOPERL_OPPTR_OTHER: {
+            U32 c = PL_opargs[o->op_type] & OA_CLASS_MASK;
+            if (c == OA_LOGOP || o->op_type == OP_CUSTOM)
+                return (uint64_t)(uintptr_t)cLOGOPx(o)->op_other;
+            return 0;
+        }
+        case GOPERL_OPPTR_MORESIB:
+            return OpHAS_SIBLING(o) ? 1 : 0;
+        case GOPERL_OPPTR_IS_HOOKED:
+            return o->op_ppaddr == goperl_pp_hooked_op ? 1 : 0;
         }
         return 0;
     }
@@ -2173,6 +2384,289 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return (uint64_t)(int64_t)PerlIO_flush(f);
         }
         return 0;
+    }
+    case GOPERL_OP_OPTREE_NEW: { /* a = class<<32|type, b = flags,
+                 * s = kid tokens (u64 each; count fixed by class) */
+        int cls = (int)(a >> 32);
+        I32 type = (I32)(uint32_t)(a & 0xFFFFFFFFu);
+        I32 flags = (I32)(uint32_t)b;
+        uint64_t k1 = 0, k2 = 0, k3 = 0;
+        if (s) {
+            memcpy(&k1, s, 8);
+            memcpy(&k2, s + 8, 8);
+            if (cls == GOPERL_OPC_CONDOP) memcpy(&k3, s + 16, 8);
+        }
+        OP *first = (OP *)(uintptr_t)(uint32_t)k1;
+        OP *second = (OP *)(uintptr_t)(uint32_t)k2;
+        OP *o = NULL;
+        switch (cls) {
+        case GOPERL_OPC_BASEOP: o = newOP(type, flags); break;
+        case GOPERL_OPC_UNOP: o = newUNOP(type, flags, first); break;
+        case GOPERL_OPC_BINOP: o = newBINOP(type, flags, first, second); break;
+        case GOPERL_OPC_LISTOP: o = newLISTOP(type, flags, first, second); break;
+        case GOPERL_OPC_LOGOP: o = newLOGOP(type, flags, first, second); break;
+        case GOPERL_OPC_SVOP:
+            o = newSVOP(type, flags, (SV *)(uintptr_t)(uint32_t)k1);
+            break;
+        case GOPERL_OPC_PVOP:
+            Perl_croak(aTHX_ "goperl: newPVOP is not bridged");
+            break;
+        case GOPERL_OPC_GVOP:
+            o = newGVOP(type, flags, (GV *)(uintptr_t)(uint32_t)k1);
+            break;
+        case GOPERL_OPC_METHOP_NAMED:
+            o = newMETHOP_named(type, flags, (SV *)(uintptr_t)(uint32_t)k1);
+            break;
+        case GOPERL_OPC_STATEOP:
+            if (k1)
+                Perl_croak(aTHX_ "goperl: newSTATEOP labels are not bridged");
+            o = newSTATEOP(flags, NULL, second);
+            break;
+        case GOPERL_OPC_CONDOP:
+            o = newCONDOP(flags, first, second, (OP *)(uintptr_t)(uint32_t)k3);
+            break;
+        case GOPERL_OPC_SLICEOP: o = newSLICEOP(flags, first, second); break;
+        case GOPERL_OPC_RAW: {
+            /* backing for a module-defined op struct: LOGOP-shaped slab
+             * memory the host will type/link/hook through OP_SET */
+            o = (OP *)Perl_Slab_Alloc(aTHX_ sizeof(LOGOP));
+            o->op_type = OP_NULL;
+            o->op_ppaddr = PL_ppaddr[OP_NULL];
+            break;
+        }
+        default: Perl_croak(aTHX_ "goperl: unknown op class %d", cls);
+        }
+        return (uint64_t)(uintptr_t)o;
+    }
+    case GOPERL_OP_OPTREE_MISC: { /* a = sel<<32|aux, b = aux2,
+                 * s = op tokens (u64 each) */
+        int sel = (int)(a >> 32);
+        I32 aux = (I32)(uint32_t)(a & 0xFFFFFFFFu);
+        uint64_t k1 = 0, k2 = 0, k3 = 0;
+        if (s) {
+            memcpy(&k1, s, 8);
+            memcpy(&k2, s + 8, 8);
+            if (sel == GOPERL_OPM_SIBLING_SPLICE) memcpy(&k3, s + 16, 8);
+        }
+        OP *o1 = (OP *)(uintptr_t)(uint32_t)k1;
+        OP *o2 = (OP *)(uintptr_t)(uint32_t)k2;
+        switch (sel) {
+        case GOPERL_OPM_APPEND_ELEM:
+            return (uint64_t)(uintptr_t)op_append_elem(aux, o1, o2);
+        case GOPERL_OPM_APPEND_LIST:
+            return (uint64_t)(uintptr_t)op_append_list(aux, o1, o2);
+        case GOPERL_OPM_PREPEND_ELEM:
+            return (uint64_t)(uintptr_t)op_prepend_elem(aux, o1, o2);
+        case GOPERL_OPM_CONVERT_LIST:
+            return (uint64_t)(uintptr_t)op_convert_list(aux, (I32)(uint32_t)b,
+                                                        o1);
+        case GOPERL_OPM_CONTEXTUALIZE:
+            return (uint64_t)(uintptr_t)op_contextualize(o1, aux);
+        case GOPERL_OPM_SCOPE: return (uint64_t)(uintptr_t)op_scope(o1);
+        case GOPERL_OPM_LINKLIST:
+            if (!o1) return 0;
+            return (uint64_t)(uintptr_t)(o1->op_next ? o1->op_next
+                                                     : op_linklist(o1));
+        case GOPERL_OPM_FREE:
+            op_free(o1);
+            return 0;
+        case GOPERL_OPM_NULL:
+            op_null(o1);
+            return 0;
+        case GOPERL_OPM_SIBLING_SPLICE:
+            return (uint64_t)(uintptr_t)op_sibling_splice(
+                o1, o2, (int)aux, (OP *)(uintptr_t)(uint32_t)k3);
+        }
+        Perl_croak(aTHX_ "goperl: unknown optree helper %d", sel);
+    }
+    case GOPERL_OP_OP_SET: { /* a = op token, b = sel<<32|value */
+        OP *o = (OP *)(uintptr_t)a;
+        int sel = (int)(b >> 32);
+        uint32_t val = (uint32_t)b;
+        switch (sel & 0xFFFF) {
+        case GOPERL_OPF_NEXT: o->op_next = (OP *)(uintptr_t)val; return 0;
+        case GOPERL_OPF_SIBPARENT:
+            /* value's bit 32 rode in with sel: sel = OPF_SIBPARENT|moresib<<?
+             * — host packs moresib in val's high bit companion: the selector
+             * word carries it (sel>>16). */
+            o->op_sibparent = (OP *)(uintptr_t)val;
+            o->op_moresib = (sel >> 16) & 1;
+            return 0;
+        case GOPERL_OPF_FIRST: cUNOPx(o)->op_first = (OP *)(uintptr_t)val; return 0;
+        case GOPERL_OPF_LAST: cBINOPx(o)->op_last = (OP *)(uintptr_t)val; return 0;
+        case GOPERL_OPF_OTHER: cLOGOPx(o)->op_other = (OP *)(uintptr_t)val; return 0;
+        case GOPERL_OPF_TARG: o->op_targ = (PADOFFSET)val; return 0;
+        case GOPERL_OPF_TYPE: o->op_type = (OPCODE)val; return 0;
+        case GOPERL_OPF_FLAGS: o->op_flags = (U8)val; return 0;
+        case GOPERL_OPF_PRIVATE: o->op_private = (U8)val; return 0;
+        case GOPERL_OPF_PPADDR_HOOK: o->op_ppaddr = goperl_pp_hooked_op; return 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown op field %d", sel);
+    }
+    case GOPERL_OP_LEX: { /* a = selector, b = per-selector argument */
+        if (!PL_parser)
+            Perl_croak(aTHX_ "goperl: lexer call outside of parsing");
+        switch ((int)a) {
+        case GOPERL_LEX_READ_SPACE: lex_read_space((U32)b); return 0;
+        case GOPERL_LEX_PEEK_UNICHAR:
+            return (uint64_t)(int64_t)lex_peek_unichar((U32)b);
+        case GOPERL_LEX_READ_UNICHAR:
+            return (uint64_t)(int64_t)lex_read_unichar((U32)b);
+        case GOPERL_LEX_READ_TO:
+            lex_read_to((char *)(uintptr_t)(uint32_t)b);
+            return 0;
+        case GOPERL_LEX_BUFUTF8: return lex_bufutf8() ? 1 : 0;
+        case GOPERL_LEX_STUFF_PVN: /* b = flags<<32|len */
+            lex_stuff_pvn(s ? s : "", (STRLEN)(uint32_t)b, (U32)(b >> 32));
+            return 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown lexer call %d", (int)a);
+    }
+    case GOPERL_OP_PARSE: { /* a = selector, b = flags -> op token */
+        if (!PL_parser)
+            Perl_croak(aTHX_ "goperl: parse call outside of parsing");
+        U32 flags = (U32)b;
+        OP *o = NULL;
+        switch ((int)a) {
+        case GOPERL_PARSE_BLOCK: o = parse_block(flags); break;
+        case GOPERL_PARSE_TERMEXPR: o = parse_termexpr(flags); break;
+        case GOPERL_PARSE_LISTEXPR: o = parse_listexpr(flags); break;
+        case GOPERL_PARSE_ARITHEXPR: o = parse_arithexpr(flags); break;
+        case GOPERL_PARSE_FULLEXPR: o = parse_fullexpr(flags); break;
+        case GOPERL_PARSE_FULLSTMT: o = parse_fullstmt(flags); break;
+        case GOPERL_PARSE_STMTSEQ: o = parse_stmtseq(flags); break;
+        case GOPERL_PARSE_BARESTMT: o = parse_barestmt(flags); break;
+        default: Perl_croak(aTHX_ "goperl: unknown parse call %d", (int)a);
+        }
+        return (uint64_t)(uintptr_t)o;
+    }
+    case GOPERL_OP_PARSER_GET: { /* a = field id */
+        switch ((int)a) {
+        case GOPERL_PARSER_PRESENT: return PL_parser ? 1 : 0;
+        case GOPERL_PARSER_LINESTR:
+            return (uint64_t)(uintptr_t)PL_parser->linestr;
+        case GOPERL_PARSER_BUFPTR:
+            return (uint64_t)(uintptr_t)PL_parser->bufptr;
+        case GOPERL_PARSER_BUFEND:
+            return (uint64_t)(uintptr_t)PL_parser->bufend;
+        case GOPERL_PARSER_OLDBUFPTR:
+            return (uint64_t)(uintptr_t)PL_parser->oldbufptr;
+        case GOPERL_PARSER_LINESTART:
+            return (uint64_t)(uintptr_t)PL_parser->linestart;
+        case GOPERL_PARSER_ERROR_COUNT:
+            return (uint64_t)(uint32_t)PL_parser->error_count;
+        case GOPERL_PARSER_IN_MY: return (uint64_t)PL_parser->in_my;
+        case GOPERL_PARSER_LEX_FLAGS: return (uint64_t)PL_parser->lex_flags;
+        case GOPERL_PARSER_PREAMBLING:
+            return (uint64_t)PL_parser->preambling;
+        case GOPERL_PARSER_PV:
+            return (uint64_t)(uintptr_t)SvPVX(PL_parser->linestr);
+        }
+        return 0;
+    }
+    case GOPERL_OP_PARSER_SET: { /* a = field id, b = value */
+        if (!PL_parser) return 0;
+        switch ((int)a) {
+        case GOPERL_PARSER_BUFPTR:
+            PL_parser->bufptr = (char *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case GOPERL_PARSER_ERROR_COUNT:
+            PL_parser->error_count = (I32)(int32_t)(uint32_t)b;
+            return 0;
+        case GOPERL_PARSER_IN_MY:
+            PL_parser->in_my = (U16)b;
+            return 0;
+        }
+        return 0;
+    }
+    case GOPERL_OP_BLOCK: { /* a: 0 = block_start(b=full) -> floor,
+                 * 1 = block_end(b=floor, s=[u64 seq]) -> op token */
+        if ((int)a == 0) return (uint64_t)(uint32_t)block_start((int)b);
+        uint64_t k1 = 0;
+        if (s) memcpy(&k1, s, 8);
+        return (uint64_t)(uintptr_t)block_end((I32)(uint32_t)b,
+                                              (OP *)(uintptr_t)(uint32_t)k1);
+    }
+    case GOPERL_OP_PAD: { /* a = selector */
+        switch ((int)a) {
+        case GOPERL_PAD_ALLOC:
+            return (uint64_t)pad_alloc((I32)(uint32_t)(b >> 32),
+                                       (U32)(uint32_t)b);
+        case GOPERL_PAD_ADD_NAME_PVN: /* b = flags<<32|len, s = name */
+            return (uint64_t)pad_add_name_pvn(s ? s : "", (STRLEN)(uint32_t)b,
+                                              (U32)(b >> 32), NULL, NULL);
+        case GOPERL_PAD_FINDMY_PVN: /* b = flags<<32|len, s = name */
+            return (uint64_t)pad_findmy_pvn(s ? s : "", (STRLEN)(uint32_t)b,
+                                            (U32)(b >> 32));
+        case GOPERL_PAD_INTRO_MY: return (uint64_t)intro_my();
+        case GOPERL_PAD_SETSV: { /* b = sv token<<32 | pad index */
+            PADOFFSET ix = (PADOFFSET)(uint32_t)b;
+            SV *sv = (SV *)(uintptr_t)(uint32_t)(b >> 32);
+            PAD_SETSV(ix, sv);
+            return 0;
+        }
+        case GOPERL_PAD_SV_FETCH: /* b = pad index (the RUNNING sub's pad) */
+            return (uint64_t)(uintptr_t)PAD_SV((PADOFFSET)b);
+        }
+        Perl_croak(aTHX_ "goperl: unknown pad call %d", (int)a);
+    }
+    case GOPERL_OP_KEYWORD_ENABLE: { /* a: 0 = keyword chain, 1 = infix */
+        if ((int)a == 0) {
+            if (PL_keyword_plugin != goperl_keyword_plugin) {
+                g_next_keyword_plugin = PL_keyword_plugin;
+                PL_keyword_plugin = goperl_keyword_plugin;
+            }
+        } else {
+            if (PL_infix_plugin != goperl_infix_plugin) {
+                g_next_infix_plugin = PL_infix_plugin;
+                PL_infix_plugin = goperl_infix_plugin;
+            }
+        }
+        return 0;
+    }
+    case GOPERL_OP_CHARCLASS: { /* a = class id, b = code point */
+        UV cp = (UV)b;
+        switch ((int)a) {
+        case GOPERL_CC_IDFIRST: return isIDFIRST_uni(cp) ? 1 : 0;
+        case GOPERL_CC_IDCONT: return isIDCONT_uni(cp) ? 1 : 0;
+        case GOPERL_CC_WORDCHAR: return isWORDCHAR_uni(cp) ? 1 : 0;
+        case GOPERL_CC_SPACE: return isSPACE_uni(cp) ? 1 : 0;
+        case GOPERL_CC_DIGIT: return isDIGIT_uni(cp) ? 1 : 0;
+        case GOPERL_CC_ALPHA: return isALPHA_uni(cp) ? 1 : 0;
+        }
+        return 0;
+    }
+    case GOPERL_OP_SAVE_MISC: { /* a: 0 = save_freesv(b = sv token) */
+        if ((int)a == 0) {
+            save_freesv((SV *)(uintptr_t)(uint32_t)b);
+            return 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown save call %d", (int)a);
+    }
+    case GOPERL_OP_SV_CLASSIFY: { /* a = sv token; b = len<<32|flags<<8|mode;
+                 * s = name bytes (mode 0) or an 8-byte sv token */
+        SV *sv = (SV *)(uintptr_t)a;
+        int mode = (int)(b & 0xFF);
+        U32 flags = (U32)((b >> 8) & 0xFFFFFF);
+        STRLEN len = (STRLEN)(uint32_t)(b >> 32);
+        uint64_t k1 = 0;
+        if (mode == 1 || mode == 2 || mode == 5 || mode == 6) {
+            if (s) memcpy(&k1, s, 8);
+        }
+        SV *other = (SV *)(uintptr_t)(uint32_t)k1;
+        switch (mode) {
+        case 0: return sv_derived_from_pvn(sv, s ? s : "", len, flags) ? 1 : 0;
+        case 1: return sv_derived_from_sv(sv, other, flags) ? 1 : 0;
+        case 2: return sv_isa_sv(sv, other) ? 1 : 0;
+        case 3: {
+            HV *hv = (HV *)sv;
+            return (uint64_t)(uint32_t)HvNAMELEN_get(hv);
+        }
+        case 4: return HvNAMEUTF8((HV *)sv) ? 1 : 0;
+        case 5: return sv_numeq_flags(sv, other, flags) ? 1 : 0;
+        case 6: return sv_streq_flags(sv, other, flags) ? 1 : 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown sv classify mode %d", mode);
     }
     case GOPERL_OP_SV_MAGIC_STD: { /* real sv_magic: BEHAVIORAL core magic
                  * (ties and friends) must live guest-side to take effect
