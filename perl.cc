@@ -990,7 +990,38 @@ enum goperl_xs_op {
     GOPERL_OP_GV_INIT = 130,
     GOPERL_OP_GV_AMG = 131,
     GOPERL_OP_SV_AMAGIC_SET = 132,
-    GOPERL_OP_SV_MAGIC_SET_HOOK = 133
+    GOPERL_OP_SV_MAGIC_SET_HOOK = 133,
+    GOPERL_OP_GV_FETCHMETHOD = 134,
+    GOPERL_OP_SV_READONLY_OFF = 135,
+    GOPERL_OP_SV_PV_FORCE = 136,
+    GOPERL_OP_SV_CHOP = 137,
+    GOPERL_OP_SV_INSERT = 138,
+    GOPERL_OP_SV_UTF8_DECODE = 139,
+    GOPERL_OP_SV_UTF8_DOWNGRADE = 140,
+    GOPERL_OP_MG_SET = 141,
+    GOPERL_OP_GIMME_V = 142,
+    GOPERL_OP_CKWARN = 143,
+    GOPERL_OP_SV_LEN_BUF = 144,
+    GOPERL_OP_HV_STORE_KLEN = 145,
+    GOPERL_OP_HV_FETCH_KLEN = 146,
+    GOPERL_OP_HV_DELETE_ENT = 147,
+    GOPERL_OP_AV_POP = 148,
+    GOPERL_OP_COP_HINTS = 149,
+    GOPERL_OP_SV_IS_BOOL = 150,
+    GOPERL_OP_SV_POK_ONLY = 151,
+    GOPERL_OP_EVAL_SV = 152,
+    /* the DBI surface */
+    GOPERL_OP_AV_SHIFT = 153,
+    GOPERL_OP_SV_2IO = 154,
+    GOPERL_OP_SV_FORCE_NORMAL = 155,
+    GOPERL_OP_PERLIO_OPEN = 156,
+    GOPERL_OP_PERLIO_CLOSE = 157,
+    GOPERL_OP_PERLIO_PUTS = 158,
+    GOPERL_OP_PERLIO_FLUSH = 159,
+    GOPERL_OP_PERLIO_WRITE = 160,
+    GOPERL_OP_IO_OFP = 161,
+    GOPERL_OP_SV_CUR = 162,
+    GOPERL_OP_SV_MAGIC_STD = 163
 };
 
 /* PLVAR_GET / PLVAR_SET interpreter-variable ids (the `a` argument). */
@@ -1016,6 +1047,9 @@ enum goperl_xs_op {
 #define GOPERL_PL_MODGLOBAL 20
 #define GOPERL_PL_MINUS_C 21
 #define GOPERL_PL_CURSTASH 22
+#define GOPERL_PL_DOWARN 23
+#define GOPERL_PL_HINTS 24
+#define GOPERL_PL_SUB_GENERATION 25
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -1204,6 +1238,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvIOK(sv) && SvIsUV(sv)) f |= GOPERL_INFO_ISUV;
         if (SvRMAGICAL(sv)) f |= GOPERL_INFO_RMAGICAL;
         if (SvOBJECT(sv)) f |= GOPERL_INFO_OBJECT;
+        if (SvAMAGIC(sv)) f |= 65536;           /* GOPERL_INFO_AMAGIC */
+        if (SvIOKp(sv)) f |= 131072;            /* GOPERL_INFO_IOKp */
+        if (SvNOKp(sv)) f |= 262144;            /* GOPERL_INFO_NOKp */
         return f;
     }
     case GOPERL_OP_SV_CUR_SET:
@@ -1253,10 +1290,13 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                               (b >> 32) ? TRUE : FALSE, 0U);
         return (uint64_t)(uintptr_t)he;
     }
-    case GOPERL_OP_HV_STORE_ENT: { /* b = keysv<<32 | sv; takes value ownership */
-        hv_store_ent((HV *)(uintptr_t)a, (SV *)(uintptr_t)(uint32_t)(b >> 32),
-                     (SV *)(uintptr_t)(uint32_t)b, 0U);
-        return 0;
+    case GOPERL_OP_HV_STORE_ENT: { /* b = keysv<<32 | sv; takes value
+                 * ownership -> the HE token (callers treat NULL as failure
+                 * and roll their reference back) */
+        HE *he = hv_store_ent((HV *)(uintptr_t)a,
+                              (SV *)(uintptr_t)(uint32_t)(b >> 32),
+                              (SV *)(uintptr_t)(uint32_t)b, 0U);
+        return (uint64_t)(uintptr_t)he;
     }
     case GOPERL_OP_HV_EXISTS_ENT: /* b = keysv */
         return hv_exists_ent((HV *)(uintptr_t)a, (SV *)(uintptr_t)b, 0U) ? 1 : 0;
@@ -1404,6 +1444,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_MODGLOBAL: return (uint64_t)(uintptr_t)(SV *)PL_modglobal;
         case GOPERL_PL_MINUS_C: return PL_minus_c ? 1 : 0;
         case GOPERL_PL_CURSTASH: return (uint64_t)(uintptr_t)(SV *)PL_curstash;
+        case GOPERL_PL_DOWARN: return (uint64_t)PL_dowarn;
+        case GOPERL_PL_HINTS: return (uint64_t)PL_hints;
+        case GOPERL_PL_SUB_GENERATION: return (uint64_t)PL_sub_generation;
         }
         return 0;
     }
@@ -1764,6 +1807,152 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (b) SvAMAGIC_on((SV *)(uintptr_t)a);
         else SvAMAGIC_off((SV *)(uintptr_t)a);
         return 1;
+    case GOPERL_OP_GV_FETCHMETHOD: { /* method resolution with ISA walk
+                 * (a = stash, b = autoload flag, s = name) -> GV token */
+        HV *stash = (HV *)(uintptr_t)a;
+        if (SvTYPE((SV *)stash) != SVt_PVHV) return 0;
+        GV *gv = gv_fetchmethod_autoload(stash, s ? s : "", b ? TRUE : FALSE);
+        return (uint64_t)(uintptr_t)gv;
+    }
+    case GOPERL_OP_SV_READONLY_OFF:
+        SvREADONLY_off((SV *)(uintptr_t)a);
+        return 0;
+    case GOPERL_OP_SV_PV_FORCE: { /* -> (ptr<<32)|len of the writable PV */
+        STRLEN len = 0;
+        char *p = SvPV_force((SV *)(uintptr_t)a, len);
+        return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+    }
+    case GOPERL_OP_SV_CHOP: { /* b = byte offset from SvPVX to chop to */
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvTYPE(sv) < SVt_PV || !SvPOK(sv)) return 0;
+        sv_chop(sv, SvPVX(sv) + (STRLEN)b);
+        return 0;
+    }
+    case GOPERL_OP_SV_INSERT: /* b = off<<32 | replace_len, s = little */
+        sv_insert((SV *)(uintptr_t)a, (STRLEN)(b >> 32),
+                  (STRLEN)(uint32_t)b, s ? s : "", strlen(s ? s : ""));
+        return 0;
+    case GOPERL_OP_SV_UTF8_DECODE:
+        return sv_utf8_decode((SV *)(uintptr_t)a) ? 1 : 0;
+    case GOPERL_OP_SV_UTF8_DOWNGRADE: /* b = fail_ok */
+        return sv_utf8_downgrade((SV *)(uintptr_t)a, b ? TRUE : FALSE) ? 1 : 0;
+    case GOPERL_OP_MG_SET: { /* SvSETMAGIC semantics: only a set-magical
+                 * SV has a magic chain to run (SvMAGIC on smaller bodies
+                 * reads past the struct). */
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvSMAGICAL(sv)) mg_set(sv);
+        return 0;
+    }
+    case GOPERL_OP_GIMME_V: /* caller context of the innermost block */
+        return (uint64_t)(int64_t)block_gimme();
+    case GOPERL_OP_CKWARN: /* a = warning category; b = ckWARN_d variant */
+        return (b ? ckWARN_d((U32)a) : ckWARN((U32)a)) ? 1 : 0;
+    case GOPERL_OP_SV_LEN_BUF: /* SvLEN: the ALLOCATED buffer size */
+        return (SvTYPE((SV *)(uintptr_t)a) < SVt_PV)
+                   ? 0
+                   : (uint64_t)SvLEN((SV *)(uintptr_t)a);
+    case GOPERL_OP_HV_STORE_KLEN: { /* b = utf8<<32 | value token, s+len =
+                 * key bytes; takes over the value ref -> stored SV token.
+                 * hv_common with JUST_SV returns the SLOT (SV**). */
+        SV *val = (SV *)(uintptr_t)(uint32_t)b;
+        SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
+                                    strlen(s ? s : ""),
+                                    (b >> 32) ? HVhek_UTF8 : 0,
+                                    HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val,
+                                    0);
+        return svp ? (uint64_t)(uintptr_t)*svp : 0;
+    }
+    case GOPERL_OP_HV_FETCH_KLEN: { /* b = utf8<<32 | lval, s+len = key */
+        SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
+                                    strlen(s ? s : ""),
+                                    (b >> 32) ? HVhek_UTF8 : 0,
+                                    HV_FETCH_JUST_SV |
+                                        ((uint32_t)b ? HV_FETCH_LVALUE : 0),
+                                    NULL, 0);
+        return svp ? (uint64_t)(uintptr_t)*svp : 0;
+    }
+    case GOPERL_OP_HV_DELETE_ENT: { /* b = flags<<32 | keysv */
+        SV *r = hv_delete_ent((HV *)(uintptr_t)a,
+                              (SV *)(uintptr_t)(uint32_t)b,
+                              (I32)(int64_t)(b >> 32), 0);
+        return (uint64_t)(uintptr_t)r;
+    }
+    case GOPERL_OP_AV_POP:
+        return (uint64_t)(uintptr_t)av_pop((AV *)(uintptr_t)a);
+    case GOPERL_OP_COP_HINTS: /* CopHINTS of a caller-vouched COP */
+        return (uint64_t)CopHINTS_get((COP *)(uintptr_t)a);
+    case GOPERL_OP_SV_IS_BOOL:
+        return SvIsBOOL((SV *)(uintptr_t)a) ? 1 : 0;
+    case GOPERL_OP_SV_POK_ONLY:
+        SvPOK_only((SV *)(uintptr_t)a);
+        return 0;
+    case GOPERL_OP_EVAL_SV: { /* a = flags<<32 | sv; results like CALL_SV:
+                 * died<<63 | count<<32 | mortal-AV token */
+        I32 flags = (I32)(int64_t)(a >> 32);
+        dSP;
+        I32 count = eval_sv((SV *)(uintptr_t)(uint32_t)a, flags);
+        SPAGAIN;
+        AV *res = newAV();
+        av_extend(res, count > 0 ? count - 1 : 0);
+        for (I32 i = count - 1; i >= 0; i--)
+            av_store(res, i, SvREFCNT_inc(POPs));
+        PUTBACK;
+        sv_2mortal((SV *)res);
+        uint64_t died = SvTRUE(ERRSV) ? 1u : 0u;
+        return (died << 63) | ((uint64_t)(uint32_t)count << 32) |
+               (uint32_t)(uintptr_t)res;
+    }
+    case GOPERL_OP_AV_SHIFT:
+        return (uint64_t)(uintptr_t)av_shift((AV *)(uintptr_t)a);
+    case GOPERL_OP_SV_2IO: /* the IO sv behind a handle-ish sv (croaks the
+                 * way the real one does on non-handles; b = no_croak) */
+        if (b) {
+            IO *io = NULL;
+            dJMPENV;
+            int jmp;
+            JMPENV_PUSH(jmp);
+            if (jmp == 0) io = sv_2io((SV *)(uintptr_t)a);
+            JMPENV_POP;
+            return (uint64_t)(uintptr_t)(SV *)io;
+        }
+        return (uint64_t)(uintptr_t)(SV *)sv_2io((SV *)(uintptr_t)a);
+    case GOPERL_OP_SV_FORCE_NORMAL:
+        sv_force_normal((SV *)(uintptr_t)a);
+        return 0;
+    case GOPERL_OP_PERLIO_OPEN: { /* s = "mode\0path" -> PerlIO token */
+        const char *mode = s ? s : "r";
+        const char *path = mode + strlen(mode) + 1;
+        PerlIO *io = PerlIO_open(path, mode);
+        return (uint64_t)(uintptr_t)io;
+    }
+    case GOPERL_OP_PERLIO_CLOSE:
+        return (uint64_t)(int64_t)PerlIO_close((PerlIO *)(uintptr_t)a);
+    case GOPERL_OP_PERLIO_PUTS: /* s+b = bytes */
+        return (uint64_t)(int64_t)PerlIO_write((PerlIO *)(uintptr_t)a,
+                                               s ? s : "", (Size_t)b);
+    case GOPERL_OP_PERLIO_FLUSH:
+        return (uint64_t)(int64_t)PerlIO_flush((PerlIO *)(uintptr_t)a);
+    case GOPERL_OP_PERLIO_WRITE:
+        return (uint64_t)(int64_t)PerlIO_write((PerlIO *)(uintptr_t)a,
+                                               s ? s : "", (Size_t)b);
+    case GOPERL_OP_IO_OFP: { /* output PerlIO of an IO sv (IoOFP) */
+        IO *io = (IO *)(uintptr_t)a;
+        if (SvTYPE((SV *)io) != SVt_PVIO) return 0;
+        return (uint64_t)(uintptr_t)IoOFP(io);
+    }
+    case GOPERL_OP_SV_CUR: /* raw SvCUR — NO stringification/get-magic
+                 * (SvPV on an undef buffer warns; SvCUR must not) */
+        return (SvTYPE((SV *)(uintptr_t)a) < SVt_PV)
+                   ? 0
+                   : (uint64_t)SvCUR((SV *)(uintptr_t)a);
+    case GOPERL_OP_SV_MAGIC_STD: { /* real sv_magic: BEHAVIORAL core magic
+                 * (ties and friends) must live guest-side to take effect
+                 * (b = how<<32 | obj token, s+len = name or empty) */
+        sv_magic((SV *)(uintptr_t)a, (SV *)(uintptr_t)(uint32_t)b,
+                 (int)(int64_t)(b >> 32), s && *s ? s : NULL,
+                 s ? (I32)strlen(s) : 0);
+        return 0;
+    }
     case GOPERL_OP_SV_MAGIC_SET_HOOK: { /* upgrade the anchor magic on sv to
                  * the set-firing vtbl (idempotent); mg_magical refreshes the
                  * SV's magic flags so assignments actually trigger it. */
