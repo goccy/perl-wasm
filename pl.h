@@ -142,7 +142,13 @@ void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
  *
  * Reserved method id -4 fires save-stack destructors (op SAVE_DESTRUCTOR):
  * the u32 host id is delivered when the guest scope holding it pops,
- * during normal exit and die unwinding alike. */
+ * during normal exit and die unwinding alike.
+ *
+ * Reserved method id -5 fires host-side set-magic: when a guest SV whose
+ * anchor magic was upgraded via op SV_MAGIC_SET_HOOK is assigned to, the
+ * u32 host magic id is delivered so the host can run the svt_set hooks of
+ * its mirror MAGIC chain. Anchors start set-less; the host upgrades one
+ * only when a mirror entry actually carries svt_set. */
 
 /* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
  * key for the actual native function (stored in the CV's XSANY). */
@@ -172,6 +178,17 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  *                  shadow materialization for interpreter-hooking XS)
  *   117-127        gv_fetchfile, hv_clear/hv_delete, save_scalar, eval_pv,
  *                  newCONSTSUB, raw SvPVX, and friends
+ *   128-133        the Class::MOP/Moose surface: stash mro pkg_gen, raw
+ *                  refcount, gv_init, Gv_AMG / SvAMAGIC on-off, set-magic
+ *                  anchor upgrade
+ *   134-163        the CPAN-web surface (Cpanel::JSON::XS, HTML::Parser,
+ *                  Time::Moment, DBI/DBD): method resolution, klen-true
+ *                  hv store/fetch, eval_sv, SvPV_force/sv_chop/sv_insert,
+ *                  utf8 decode/downgrade, guarded set-magic, caller
+ *                  context, ckWARN, buffer sizes (SvLEN/SvCUR raw),
+ *                  hv_delete_ent, av pop/shift, sv_2io + PerlIO handle
+ *                  I/O, sv_force_normal, cop hints, real sv_magic for
+ *                  behavioral (tie) magic
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
 
