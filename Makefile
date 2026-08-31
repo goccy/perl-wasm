@@ -1,7 +1,7 @@
 # Container image shipping every toolchain wasmify needs (wasi-sdk + binaryen +
 # buf + the wasmify CLI itself). Override locally to pin a SHA or to iterate on a
 # wasmify branch — e.g. `make wasm IMAGE=localhost:5001/wasmify:local`.
-IMAGE ?= ghcr.io/goccy/wasmify:v0.6.9
+IMAGE ?= ghcr.io/goccy/wasmify:v0.6.10
 
 # Resource limits for the container that runs the pipeline. CPUS bounds make's
 # parallelism; a Perl wasm build peaks well under MEMORY.
