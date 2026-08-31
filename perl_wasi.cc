@@ -353,20 +353,6 @@ extern "C" int do_aspawn(void *vreally, void **mark, void **sp) {
     return r == -1 ? -1 : status;
 }
 
-/* system(3) over spawn: any C caller lands here. NULL asks "is a shell
- * available" — yes. */
-extern "C" int system(const char *cmd) {
-    if (!cmd) return 1;
-    pid_t pid = wasi_spawn_shell(cmd, -1, -1);
-    if (pid < 0) return -1;
-    int status = 0;
-    pid_t r;
-    do {
-        r = waitpid(pid, &status, 0);
-    } while (r == -1 && errno == EINTR);
-    return r == -1 ? -1 : status;
-}
-
 /* ---- 4-arg select for pp_sselect (PERL_WASI_SELECT) ----------------------
  * Perl's pp_sselect hands its bit vectors (fd n = bit n%8 of byte n/8)
  * straight to select() as fd_set, which is only correct where fd_set IS

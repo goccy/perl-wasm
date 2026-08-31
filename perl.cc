@@ -25,7 +25,6 @@ extern "C" {
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 
 /* ---- static extension bootstraps ----------------------------------------
