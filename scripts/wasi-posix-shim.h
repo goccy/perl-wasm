@@ -226,12 +226,3 @@ int do_spawn(char *cmd);
 int do_aspawn(void *really, void **mark, void **sp);
 #endif
 
-/* wasi-libc's chdir stores the given path verbatim in its cwd bookkeeping,
- * ".." included; after `chdir "b"; chdir ".."` the cwd is ".../b/..", and
- * deleting b then breaks every cwd-relative operation (File::Path's rmtree
- * does exactly this dance). The bridge normalizes the path lexically first
- * — wasi-libc's own resolution is lexical, so nothing is lost. This
- * header is force-included ahead of the libc headers, and the
- * function-like macro only rewrites calls (and compatible declarations). */
-int __goperl_chdir_normalized(const char *path);
-#define chdir(p) __goperl_chdir_normalized(p)

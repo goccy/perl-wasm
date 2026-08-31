@@ -3,7 +3,7 @@
   "upstream": {
     "path": "./perl5",
     "commit": "b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed",
-    "branch": "v5.42.2"
+    "branch": "HEAD"
   },
   "project": {
     "name": "perl",
@@ -54,7 +54,7 @@
   ],
   "build_commands": {
     "configure": "bash scripts/wasi-configure.sh",
-    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
+    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) \u0026\u0026 make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
   },
   "user_selection": {
     "target_name": "libperl",
@@ -62,12 +62,14 @@
   },
   "bridge": {
     "CustomBridgeSources": [
-      "perl.cc"
+      "perl.cc",
+      "perl_wasi.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl;perl",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
     "HostSockets": true,
     "HostSubprocess": true,
+    "HostFS": true,
     "StackSize": 8388608,
     "ExportFunctions": [
       "perl_new",
@@ -79,5 +81,24 @@
       "perl_register_native_xs",
       "perl_xs_helper"
     ]
+  },
+  "phases": {
+    "gen-proto": {
+      "completed_at": "2026-08-31T02:20:45Z",
+      "upstream_commit": "b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed",
+      "output_files": [
+        "proto/perl.proto",
+        "proto/wasmify/options.proto",
+        "bridge/api_bridge.cc",
+        "bridge/api_bridge.h"
+      ]
+    },
+    "parse-headers": {
+      "completed_at": "2026-08-31T02:20:45Z",
+      "upstream_commit": "b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed",
+      "output_files": [
+        "api-spec.json"
+      ]
+    }
   }
 }
