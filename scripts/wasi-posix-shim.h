@@ -210,3 +210,28 @@ void endgrent(void);
 #endif
 
 #endif /* PERLWASM_WASI_POSIX_SHIM_H */
+
+/* ---- fork-free piped opens (PERL_WASI_SPAWN) -----------------------------
+ * WASI has no fork: the runtime's subprocess support is posix_spawn-shaped
+ * (wasmify HostSubprocess: posix_spawn + waitpid + pipe over host imports).
+ * The perl build defines PERL_WASI_SPAWN and routes my_popen/my_popen_list
+ * into these spawn-based implementations (perl.cc); my_pclose keeps perl's
+ * own implementation, which only needs waitpid. */
+#ifdef PERL_WASI_SPAWN
+/* pp_system's non-fork branch calls do_spawn/do_aspawn, which embed.h maps
+ * to the Perl_ names below; the bridge (perl.cc) implements them over
+ * posix_spawn. Opaque pointer types here (callers pass SV pointers and
+ * stack slots). */
+int do_spawn(char *cmd);
+int do_aspawn(void *really, void **mark, void **sp);
+#endif
+
+/* wasi-libc's chdir stores the given path verbatim in its cwd bookkeeping,
+ * ".." included; after `chdir "b"; chdir ".."` the cwd is ".../b/..", and
+ * deleting b then breaks every cwd-relative operation (File::Path's rmtree
+ * does exactly this dance). The bridge normalizes the path lexically first
+ * — wasi-libc's own resolution is lexical, so nothing is lost. This
+ * header is force-included ahead of the libc headers, and the
+ * function-like macro only rewrites calls (and compatible declarations). */
+int __goperl_chdir_normalized(const char *path);
+#define chdir(p) __goperl_chdir_normalized(p)
