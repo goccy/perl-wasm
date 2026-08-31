@@ -81,7 +81,7 @@ tools:
 # .github/workflows/build.yml does. Outputs:
 #   .wasmify/wasm-build/output/perl.wasm
 #   build/wasm2go/                                <- wasm2go bridge + bundle
-#   build/wasm2go/internal/wasm2go/go.mod         <- bundle module manifest
+#   build/wasm2go/internal/internal/wasm2go/go.mod <- bundle module manifest
 wasm:
 	docker run --rm $(PLATFORM_FLAG) \
 		-v $(CURDIR):/work -w /work \
