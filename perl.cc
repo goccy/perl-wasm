@@ -591,24 +591,16 @@ static void encode_list(pTHX_ SV **items, I32 count, std::string &out) {
     for (I32 i = 0; i < count; i++) encode_sv(aTHX_ items[i], out);
 }
 
-/* make_go_closure materialises a Perl closure over a host function id:
- * calling it dispatches back to the host like any bound sub, so Perl can
- * store it, pass it around, and call it later — an ordinary code ref. */
+/* XS_goperl_go_thunk (defined with the Perl->Go dispatch below) backs every
+ * host function value: an ANONYMOUS XS CV whose XSANY carries the host
+ * function id — an ordinary code ref Perl can store, pass around, and call
+ * later, with no Perl-source closure involved. */
+XS(XS_goperl_go_thunk);
+
 static SV *make_go_closure(pTHX_ uint32_t id) {
-    dSP;
-    ENTER;
-    SAVETMPS;
-    PUSHMARK(SP);
-    mXPUSHs(newSVuv(id));
-    PUTBACK;
-    int count = call_pv("__plwasm_make_go_closure", G_SCALAR);
-    SPAGAIN;
-    SV *cv = count > 0 ? POPs : &PL_sv_undef;
-    SV *keep = newSVsv(cv);
-    PUTBACK;
-    FREETMPS;
-    LEAVE;
-    return sv_2mortal(keep);
+    CV *cv = newXS(NULL, XS_goperl_go_thunk, __FILE__);
+    CvXSUBANY(cv).any_i32 = static_cast<int32_t>(id);
+    return sv_2mortal(newRV_noinc((SV *)cv));
 }
 
 /* decode_node turns one wire node into a mortal SV. NODE_FLATTEN is handled
@@ -662,26 +654,23 @@ static SV *decode_node(pTHX_ NodeReader &r, std::string &err) {
     }
 }
 
-/* XS trampoline: main::__plwasm_go_call($func_id, @args) -> @results.
- * The Perl->Go half of the function bridge: encodes @_ as a node list,
- * dispatches to the host function bound under $func_id over the wasmify
- * callback import, and decodes the response envelope — pushing the result
- * list on success, croaking with the reported message on failure. Reference
+/* goperl_go_dispatch is the Perl->Go half of the function bridge: encodes
+ * args as a node list, dispatches to the host function bound under func_id
+ * over the wasmify callback import, and decodes the response envelope into
+ * mortal result SVs — croaking with the reported message on failure (the
+ * caller is an XSUB, so the croak is an ordinary Perl die). Reference
  * arguments are pinned by encode_sv and OWNED by the host side (its wrapper
  * releases each pin), so a handler may keep a reference beyond the call. */
-XS(XS___plwasm_go_call);
-XS(XS___plwasm_go_call) {
-    dXSARGS;
-    if (items < 1) Perl_croak(aTHX_ "usage: __plwasm_go_call(func_id, args...)");
+static void goperl_go_dispatch(pTHX_ int32_t func_id, SV **args, I32 nargs,
+                               std::vector<SV *> &out) {
     if (g_go_cb == 0)
         Perl_croak(aTHX_ "no Go dispatcher registered for this instance");
-    IV func_id = SvIV(ST(0));
 
     std::string req;
-    put_u32(req, static_cast<uint32_t>(items - 1));
-    for (I32 i = 1; i < items; i++) encode_sv(aTHX_ ST(i), req);
+    put_u32(req, static_cast<uint32_t>(nargs));
+    for (I32 i = 0; i < nargs; i++) encode_sv(aTHX_ args[i], req);
 
-    int64_t rc = wasmify_callback_invoke(g_go_cb, static_cast<int32_t>(func_id),
+    int64_t rc = wasmify_callback_invoke(g_go_cb, func_id,
                                          const_cast<char *>(req.data()), req.size());
     uint32_t resp_ptr = static_cast<uint32_t>(static_cast<uint64_t>(rc) >> 32);
     uint32_t resp_len = static_cast<uint32_t>(static_cast<uint64_t>(rc) & 0xFFFFFFFFu);
@@ -703,7 +692,6 @@ XS(XS___plwasm_go_call) {
         Perl_croak(aTHX_ "%s", n ? msg : "Go function dispatch failed");
     }
     uint32_t count = r.get_u32();
-    std::vector<SV *> out;
     out.reserve(count);
     std::string derr;
     for (uint32_t i = 0; i < count && !r.fail; i++) {
@@ -716,16 +704,45 @@ XS(XS___plwasm_go_call) {
         Perl_croak(aTHX_ "Go function dispatch: %s",
                    derr.empty() ? "truncated response" : derr.c_str());
     }
-    /* Scalar context historically receives the FIRST result. */
-    if (GIMME_V == G_SCALAR) {
-        XSprePUSH;
-        ST(0) = out.empty() ? &PL_sv_undef : out[0];
-        XSRETURN(1);
-    }
-    XSprePUSH;
-    EXTEND(SP, (SSize_t)out.size());
-    for (size_t k = 0; k < out.size(); k++) ST(k) = out[k];
-    XSRETURN(out.size());
+}
+
+/* Push the dispatch results as an XSUB's return list; scalar context
+ * historically receives the FIRST result. Returns the item count. */
+#define GOPERL_GO_RETURN(out)                                   \
+    do {                                                        \
+        if (GIMME_V == G_SCALAR) {                              \
+            XSprePUSH;                                          \
+            ST(0) = (out).empty() ? &PL_sv_undef : (out)[0];    \
+            XSRETURN(1);                                        \
+        }                                                       \
+        XSprePUSH;                                              \
+        EXTEND(SP, (SSize_t)(out).size());                      \
+        for (size_t k_ = 0; k_ < (out).size(); k_++)            \
+            ST(k_) = (out)[k_];                                 \
+        XSRETURN((out).size());                                 \
+    } while (0)
+
+/* main::__plwasm_go_call($func_id, @args): the named entry the host's Bind
+ * points its generated subs at. */
+XS(XS___plwasm_go_call);
+XS(XS___plwasm_go_call) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "usage: __plwasm_go_call(func_id, args...)");
+    IV func_id = SvIV(ST(0));
+    std::vector<SV *> out;
+    goperl_go_dispatch(aTHX_ static_cast<int32_t>(func_id), &ST(1), items - 1, out);
+    GOPERL_GO_RETURN(out);
+}
+
+/* The anonymous host-function thunk: the id lives in XSANY (see
+ * make_go_closure), the whole argument list is the host call's argument
+ * list. */
+XS(XS_goperl_go_thunk) {
+    dXSARGS;
+    int32_t func_id = XSANY.any_i32;
+    std::vector<SV *> out;
+    goperl_go_dispatch(aTHX_ func_id, items > 0 ? &ST(0) : nullptr, items, out);
+    GOPERL_GO_RETURN(out);
 }
 
 /* Generic thunk backing every host-native XSUB (see pl.h "Native XS
@@ -785,41 +802,218 @@ XS(XS_goperl_native_thunk) {
     XSRETURN(nret);
 }
 
-/* Bridge glue, eval'd once at perl_new. The value codec and the handle
- * registry live in C (encode_sv / decode_node / reg_* above) — no module
- * loads, nothing rides JSON. What remains in Perl are the OPERATIONS the
- * host drives: one-line subs that receive already-decoded SVs on the stack
- * and run ordinary Perl code, so ties, overloads, and method resolution all
- * behave exactly as in a plain perl, and any die is caught by the G_EVAL
- * frame the C driver (run_glue) puts around the call.
- *
- * Symbolic sub deref (&{$name}) needs no `no strict 'refs'`: this glue
- * compiles without `use strict`, and pulling the pragma in would load
- * strict.pm DURING perl_new — making boot depend on a readable stdlib,
- * which a custom-FS instance does not have yet at that point. */
-static const char *GO_BRIDGE_GLUE =
-    "sub main::__plwasm_v_call   { my $name = shift; &{$name}(@_) }"
-    "sub main::__plwasm_v_invoke { my $c = shift; $c->(@_) }"
-    "sub main::__plwasm_v_method { my ($obj, $m, @a) = @_; $obj->$m(@a) }"
-    "sub main::__plwasm_v_deref  { my ($r) = @_; $$r }"
-    "sub main::__plwasm_v_alen   { scalar @{$_[0]} }"
-    "sub main::__plwasm_v_aget   { $_[0][$_[1]] }"
-    "sub main::__plwasm_v_aset   { $_[0][$_[1]] = $_[2]; () }"
-    "sub main::__plwasm_v_apush  { my $a = shift; push @$a, @_; () }"
-    "sub main::__plwasm_v_avals  { @{$_[0]} }"
-    "sub main::__plwasm_v_hget   { my ($h,$k) = @_; exists $h->{$k} ? (1, $h->{$k}) : (0) }"
-    "sub main::__plwasm_v_hset   { my ($h,$k,$v) = @_; $h->{$k} = $v; () }"
-    "sub main::__plwasm_v_hdel   { my ($h,$k) = @_; delete $h->{$k}; () }"
-    "sub main::__plwasm_v_hkeys  { keys %{$_[0]} }"
-    "sub main::__plwasm_v_newa   { [@_] }"
-    "sub main::__plwasm_v_newh   { +{@_} }"
-    /* A host (Go) function value: a closure over its id. Calling it
-     * dispatches back to the host like any bound sub, so Perl can store it,
-     * pass it around, and call it later — an ordinary code ref. */
-    "sub main::__plwasm_make_go_closure {"
-    "  my ($id) = @_;"
-    "  return sub { main::__plwasm_go_call($id, @_) };"
-    "}";
+/* ---- value-operation XSUBs -----------------------------------------------
+ * The bridge operations are ANONYMOUS C XSUBS — no Perl-source glue: each
+ * receives already-decoded SVs on the stack and drives the perl API
+ * directly (the lvalue-fetch + sv_setsv_mg / iterator patterns the pp_*
+ * functions themselves use), so ties and overloads behave exactly as in
+ * plain Perl. run_glue calls them through call_sv under G_EVAL, so a die —
+ * a tied FETCH, a wrong reference type — is caught like Perl's own. The
+ * CVs live in g_op_cv (created once at perl_new, invisible from Perl
+ * space); clones inherit them with the copied memory. */
+
+static AV *op_want_av(pTHX_ SV *sv) {
+    if (!SvROK(sv) || SvTYPE(SvRV(sv)) != SVt_PVAV)
+        Perl_croak(aTHX_ "Not an ARRAY reference");
+    return (AV *)SvRV(sv);
+}
+
+static HV *op_want_hv(pTHX_ SV *sv) {
+    if (!SvROK(sv) || SvTYPE(SvRV(sv)) != SVt_PVHV)
+        Perl_croak(aTHX_ "Not a HASH reference");
+    return (HV *)SvRV(sv);
+}
+
+/* $$ref (scalar dereference; a $$ on an aggregate ref dies like Perl's). */
+XS(XS_goperl_op_deref);
+XS(XS_goperl_op_deref) {
+    dXSARGS;
+    if (items < 1 || !SvROK(ST(0)))
+        Perl_croak(aTHX_ "Not a SCALAR reference");
+    SV *t = SvRV(ST(0));
+    switch (SvTYPE(t)) {
+    case SVt_PVAV: case SVt_PVHV: case SVt_PVCV: case SVt_PVFM:
+        Perl_croak(aTHX_ "Not a SCALAR reference");
+    default:
+        break;
+    }
+    ST(0) = sv_mortalcopy(t); /* runs get-magic inside the eval frame */
+    XSRETURN(1);
+}
+
+/* scalar @$av */
+XS(XS_goperl_op_alen);
+XS(XS_goperl_op_alen) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    SSize_t n = av_top_index(av) + 1; /* FETCHSIZE runs for tied arrays */
+    XSprePUSH;
+    mXPUSHs(newSViv((IV)n));
+    XSRETURN(1);
+}
+
+/* $av->[$idx] */
+XS(XS_goperl_op_aget);
+XS(XS_goperl_op_aget) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    IV idx = SvIV(ST(1));
+    SV **svp = av_fetch(av, idx, 0);
+    SV *out = sv_mortalcopy(svp ? *svp : &PL_sv_undef);
+    XSprePUSH;
+    PUSHs(out);
+    XSRETURN(1);
+}
+
+/* $av->[$idx] = $val */
+XS(XS_goperl_op_aset);
+XS(XS_goperl_op_aset) {
+    dXSARGS;
+    if (items < 3) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    IV idx = SvIV(ST(1));
+    SV **slot = av_fetch(av, idx, TRUE); /* lvalue fetch, like pp_aelem */
+    if (!slot) Perl_croak(aTHX_ "Modification of non-creatable array value attempted");
+    sv_setsv_mg(*slot, ST(2)); /* set-magic drives a tied STORE */
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* push @$av, LIST */
+XS(XS_goperl_op_apush);
+XS(XS_goperl_op_apush) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    for (I32 i = 1; i < items; i++)
+        av_push(av, newSVsv(ST(i))); /* av_push runs PUSH magic for ties */
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* @$av */
+XS(XS_goperl_op_avals);
+XS(XS_goperl_op_avals) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    SSize_t n = av_top_index(av) + 1;
+    XSprePUSH;
+    EXTEND(SP, n);
+    for (SSize_t i = 0; i < n; i++) {
+        SV **svp = av_fetch(av, i, 0);
+        PUSHs(sv_mortalcopy(svp ? *svp : &PL_sv_undef));
+    }
+    XSRETURN(n);
+}
+
+/* exists $hv->{$k} ? (1, $hv->{$k}) : (0) */
+XS(XS_goperl_op_hget);
+XS(XS_goperl_op_hget) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    SV *key = ST(1);
+    bool exists = hv_exists_ent(hv, key, 0);
+    XSprePUSH;
+    EXTEND(SP, 2);
+    PUSHs(boolSV(exists));
+    if (exists) {
+        HE *he = hv_fetch_ent(hv, key, 0, 0);
+        PUSHs(sv_mortalcopy(he ? HeVAL(he) : &PL_sv_undef));
+        XSRETURN(2);
+    }
+    XSRETURN(1);
+}
+
+/* $hv->{$k} = $val */
+XS(XS_goperl_op_hset);
+XS(XS_goperl_op_hset) {
+    dXSARGS;
+    if (items < 3) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    HE *he = hv_fetch_ent(hv, ST(1), 1, 0); /* lvalue fetch, like pp_helem */
+    if (!he) Perl_croak(aTHX_ "Modification of non-creatable hash value attempted");
+    sv_setsv_mg(HeVAL(he), ST(2));
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* delete $hv->{$k} */
+XS(XS_goperl_op_hdel);
+XS(XS_goperl_op_hdel) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    (void)hv_delete_ent(hv, ST(1), G_DISCARD, 0);
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* keys %$hv (FIRSTKEY/NEXTKEY run for tied hashes) */
+XS(XS_goperl_op_hkeys);
+XS(XS_goperl_op_hkeys) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    hv_iterinit(hv);
+    XSprePUSH;
+    HE *he;
+    SSize_t n = 0;
+    while ((he = hv_iternext(hv)) != nullptr) {
+        XPUSHs(hv_iterkeysv(he)); /* already mortal */
+        n++;
+    }
+    XSRETURN(n);
+}
+
+/* [@_] */
+XS(XS_goperl_op_newa);
+XS(XS_goperl_op_newa) {
+    dXSARGS;
+    AV *av = newAV();
+    for (I32 i = 0; i < items; i++) av_push(av, newSVsv(ST(i)));
+    XSprePUSH;
+    mXPUSHs(newRV_noinc((SV *)av));
+    XSRETURN(1);
+}
+
+/* +{@_} (an odd trailing key gets undef, like list assignment to a hash) */
+XS(XS_goperl_op_newh);
+XS(XS_goperl_op_newh) {
+    dXSARGS;
+    HV *hv = newHV();
+    for (I32 i = 0; i < items; i += 2) {
+        SV *val = (i + 1 < items) ? newSVsv(ST(i + 1)) : newSV(0);
+        if (!hv_store_ent(hv, ST(i), val, 0)) SvREFCNT_dec(val);
+    }
+    XSprePUSH;
+    mXPUSHs(newRV_noinc((SV *)hv));
+    XSRETURN(1);
+}
+
+/* The op CV table run_glue dispatches through. */
+enum {
+    GOP_DEREF = 0, GOP_ALEN, GOP_AGET, GOP_ASET, GOP_APUSH, GOP_AVALS,
+    GOP_HGET, GOP_HSET, GOP_HDEL, GOP_HKEYS, GOP_NEWA, GOP_NEWH,
+    GOP_COUNT,
+};
+static CV *g_op_cv[GOP_COUNT];
+
+static void install_op_cvs(pTHX) {
+    static const struct { int idx; XSUBADDR_t body; } ops[] = {
+        {GOP_DEREF, XS_goperl_op_deref}, {GOP_ALEN, XS_goperl_op_alen},
+        {GOP_AGET, XS_goperl_op_aget},   {GOP_ASET, XS_goperl_op_aset},
+        {GOP_APUSH, XS_goperl_op_apush}, {GOP_AVALS, XS_goperl_op_avals},
+        {GOP_HGET, XS_goperl_op_hget},   {GOP_HSET, XS_goperl_op_hset},
+        {GOP_HDEL, XS_goperl_op_hdel},   {GOP_HKEYS, XS_goperl_op_hkeys},
+        {GOP_NEWA, XS_goperl_op_newa},   {GOP_NEWH, XS_goperl_op_newh},
+    };
+    for (const auto &op : ops)
+        g_op_cv[op.idx] = newXS(NULL, op.body, __FILE__);
+}
 
 /* The eval wrapper (run via eval_pv): redirect STDOUT/STDERR onto in-memory
  * scalars (the built-in PerlIO scalar layer), string-eval the user source, and
@@ -890,13 +1084,14 @@ uint64_t perl_new(const char *lib_dir) {
     PL_runops = runops_interruptible;
     g_interrupt = 0;
 
-    /* Install the Go bridge: the XS dispatcher plus the Perl-side operation
-     * glue (see GO_BRIDGE_GLUE). Cheap — no module loads. */
+    /* Install the Go bridge: the named Perl->Go dispatcher (Bind's generated
+     * subs call it) and the anonymous value-operation XSUBs. All C — no
+     * Perl-source glue and no module loads. */
     {
         PERL_SET_CONTEXT(g_my_perl);
         dTHX;
         newXS("main::__plwasm_go_call", XS___plwasm_go_call, __FILE__);
-        eval_pv(GO_BRIDGE_GLUE, TRUE);
+        install_op_cvs(aTHX);
     }
     g_go_cb = 0;
 
@@ -971,12 +1166,15 @@ uint32_t perl_interrupt_addr(uint64_t h) {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
 }
 
-/* ---- protected glue driver -----------------------------------------------
+/* ---- protected operation driver ------------------------------------------
  * Every value operation runs the same way: resolve handles to their SVs,
- * push the arguments on the Perl stack, call the one-line glue sub under
- * G_EVAL (a die lands in ERRSV, not a longjmp past our locals), shape the
- * returned list into the operation's ok payload, all under a JMPENV that
- * catches a guest exit() the way perl_run itself does. */
+ * push the arguments on the Perl stack, run the target under G_EVAL (a die
+ * lands in ERRSV, not a longjmp past our locals), shape the returned list
+ * into the operation's ok payload, all under a JMPENV that catches a guest
+ * exit() the way perl_run itself does. Targets are a named sub (call_pv —
+ * stub + AUTOLOAD semantics), the CODE reference behind a handle (call_sv),
+ * a method dispatched by Perl's own resolution (call_method), or one of the
+ * anonymous operation XSUBs above. */
 
 /* How run_glue shapes the glue sub's return list into the ok payload. */
 enum GlueShape {
@@ -987,18 +1185,27 @@ enum GlueShape {
     SHAPE_EXISTS_NODE, /* u8 flag (first value) + node (second, or undef) */
 };
 
+/* What run_glue calls. */
+enum GlueTarget {
+    TARGET_NAMED,  /* call_pv(name): the handle (if any) is an argument */
+    TARGET_CODE,   /* call_sv(handle's RV): the handle is the CALLEE */
+    TARGET_METHOD, /* call_method(name): the handle is the invocant */
+    TARGET_OP,     /* call_sv(g_op_cv[op]): the handle is the first argument */
+};
+
 /* GlueCall describes one operation. Lead arguments are DESCRIPTORS, not
  * SVs: run_glue_body materialises them inside its own SAVETMPS scope so
  * every mortal it creates is reclaimed by its own FREETMPS (an SV made
  * outside that scope would sit on the tmps stack forever — the bridge entry
- * points have no surrounding FREETMPS). Push order: handles, string,
- * integer, key node, then the trailing node list. */
+ * points have no surrounding FREETMPS). Push order: handle, integer, key
+ * node, then the trailing node list. */
 struct GlueCall {
-    const char *glue;      /* glue sub name */
+    GlueTarget target;
+    const char *name;      /* TARGET_NAMED: sub name; TARGET_METHOD: method */
+    int op;                /* TARGET_OP: g_op_cv index */
     I32 gimme;             /* G_LIST or G_SCALAR for the target call */
-    uint64_t harg;         /* registry handle, pushed first (has_harg) */
+    uint64_t harg;         /* registry handle (role depends on target) */
     bool has_harg;
-    const char *sarg;      /* sub/method name, pushed next (may be NULL) */
     bool has_iarg;         /* integer argument (array index) */
     int64_t iarg;
     const char *karg;      /* one key node (may be NULL) */
@@ -1025,8 +1232,8 @@ static std::string run_glue_body(pTHX_ const GlueCall &gc) {
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
-    if (hsv) XPUSHs(hsv);
-    if (gc.sarg) mXPUSHs(newSVpv(gc.sarg, 0));
+    /* TARGET_CODE's handle is the callee, not an argument. */
+    if (hsv && gc.target != TARGET_CODE) XPUSHs(hsv);
     if (gc.has_iarg) mXPUSHs(newSViv(static_cast<IV>(gc.iarg)));
     if (gc.karg) {
         NodeReader kr(gc.karg, gc.karg_len);
@@ -1089,7 +1296,21 @@ static std::string run_glue_body(pTHX_ const GlueCall &gc) {
     }
     PUTBACK;
 
-    int count = call_pv(gc.glue, gc.gimme | G_EVAL);
+    int count;
+    switch (gc.target) {
+    case TARGET_NAMED:
+        count = call_pv(gc.name, gc.gimme | G_EVAL);
+        break;
+    case TARGET_CODE:
+        count = call_sv(hsv, gc.gimme | G_EVAL);
+        break;
+    case TARGET_METHOD:
+        count = call_method(gc.name, gc.gimme | G_EVAL);
+        break;
+    default: /* TARGET_OP */
+        count = call_sv((SV *)g_op_cv[gc.op], gc.gimme | G_EVAL);
+        break;
+    }
     SPAGAIN;
 
     std::string out;
@@ -1184,9 +1405,9 @@ std::string perl_call(uint64_t h, const char *sub_name,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_call";
+    gc.target = TARGET_NAMED;
+    gc.name = sub_name;
     gc.gimme = G_LIST;
-    gc.sarg = sub_name;
     gc.nodes = args;
     gc.nodes_len = args_len;
     gc.shape = SHAPE_LIST;
@@ -1200,7 +1421,7 @@ std::string perl_invoke(uint64_t h, uint64_t code, uint32_t want_scalar,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_invoke";
+    gc.target = TARGET_CODE;
     gc.gimme = want_scalar ? G_SCALAR : G_LIST;
     gc.harg = code;
     gc.has_harg = true;
@@ -1218,11 +1439,11 @@ std::string perl_method_call(uint64_t h, uint64_t obj, const char *method,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_method";
+    gc.target = TARGET_METHOD;
+    gc.name = method;
     gc.gimme = G_LIST;
     gc.harg = obj;
     gc.has_harg = true;
-    gc.sarg = method;
     gc.nodes = args;
     gc.nodes_len = args_len;
     gc.shape = SHAPE_LIST;
@@ -1235,7 +1456,8 @@ std::string perl_deref(uint64_t h, uint64_t ref) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_deref";
+    gc.target = TARGET_OP;
+    gc.op = GOP_DEREF;
     gc.gimme = G_SCALAR;
     gc.harg = ref;
     gc.has_harg = true;
@@ -1249,7 +1471,8 @@ std::string perl_array_len(uint64_t h, uint64_t av) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_alen";
+    gc.target = TARGET_OP;
+    gc.op = GOP_ALEN;
     gc.gimme = G_SCALAR;
     gc.harg = av;
     gc.has_harg = true;
@@ -1263,7 +1486,8 @@ std::string perl_array_get(uint64_t h, uint64_t av, int64_t idx) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_aget";
+    gc.target = TARGET_OP;
+    gc.op = GOP_AGET;
     gc.gimme = G_SCALAR;
     gc.harg = av;
     gc.has_harg = true;
@@ -1284,7 +1508,8 @@ std::string perl_array_set(uint64_t h, uint64_t av, int64_t idx,
     put_u32(one, 1);
     one.append(val ? val : "", val_len);
     GlueCall gc{};
-    gc.glue = "__plwasm_v_aset";
+    gc.target = TARGET_OP;
+    gc.op = GOP_ASET;
     gc.gimme = G_LIST;
     gc.harg = av;
     gc.has_harg = true;
@@ -1303,7 +1528,8 @@ std::string perl_array_push(uint64_t h, uint64_t av,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_apush";
+    gc.target = TARGET_OP;
+    gc.op = GOP_APUSH;
     gc.gimme = G_LIST;
     gc.harg = av;
     gc.has_harg = true;
@@ -1319,7 +1545,8 @@ std::string perl_array_values(uint64_t h, uint64_t av) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_avals";
+    gc.target = TARGET_OP;
+    gc.op = GOP_AVALS;
     gc.gimme = G_LIST;
     gc.harg = av;
     gc.has_harg = true;
@@ -1334,7 +1561,8 @@ std::string perl_hash_get(uint64_t h, uint64_t hv,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_hget";
+    gc.target = TARGET_OP;
+    gc.op = GOP_HGET;
     gc.gimme = G_LIST;
     gc.harg = hv;
     gc.has_harg = true;
@@ -1355,7 +1583,8 @@ std::string perl_hash_set(uint64_t h, uint64_t hv,
     put_u32(one, 1);
     one.append(val ? val : "", val_len);
     GlueCall gc{};
-    gc.glue = "__plwasm_v_hset";
+    gc.target = TARGET_OP;
+    gc.op = GOP_HSET;
     gc.gimme = G_LIST;
     gc.harg = hv;
     gc.has_harg = true;
@@ -1374,7 +1603,8 @@ std::string perl_hash_delete(uint64_t h, uint64_t hv,
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_hdel";
+    gc.target = TARGET_OP;
+    gc.op = GOP_HDEL;
     gc.gimme = G_LIST;
     gc.harg = hv;
     gc.has_harg = true;
@@ -1390,7 +1620,8 @@ std::string perl_hash_keys(uint64_t h, uint64_t hv) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_hkeys";
+    gc.target = TARGET_OP;
+    gc.op = GOP_HKEYS;
     gc.gimme = G_LIST;
     gc.harg = hv;
     gc.has_harg = true;
@@ -1404,7 +1635,8 @@ std::string perl_new_array(uint64_t h, const char *vals, uint32_t vals_len) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_newa";
+    gc.target = TARGET_OP;
+    gc.op = GOP_NEWA;
     gc.gimme = G_SCALAR;
     gc.nodes = vals;
     gc.nodes_len = vals_len;
@@ -1418,7 +1650,8 @@ std::string perl_new_hash(uint64_t h, const char *pairs, uint32_t pairs_len) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     GlueCall gc{};
-    gc.glue = "__plwasm_v_newh";
+    gc.target = TARGET_OP;
+    gc.op = GOP_NEWH;
     gc.gimme = G_SCALAR;
     gc.nodes = pairs;
     gc.nodes_len = pairs_len;
