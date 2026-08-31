@@ -40,7 +40,7 @@ WT="$HERE/build/host-build"
 HOSTPERL="$OUT/miniperl"
 HOSTGEN="$OUT/generate_uudmap"
 NATIVECFG="$OUT/native-config.sh"
-WANT_VER="5.042002"   # $] for Perl 5.42.2
+WANT_VER="5.044000"   # $] for Perl 5.44.0
 
 [ -f "$SRC/Configure" ] || { echo "!! perl5 not checked out: git submodule update --init perl5" >&2; exit 1; }
 

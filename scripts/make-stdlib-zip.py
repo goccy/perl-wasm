@@ -8,7 +8,7 @@ assembled `perl5/lib/` tree that an embedding application (go-perl) unpacks at
 runtime and passes to perl_new(lib_dir) as the @INC search path. It is published
 as a release asset alongside perl.wasm and the wasm2go bundle and attested, so
 consumers verify it the same way — and it is locked to the exact Perl version
-perl.wasm was built from (the submodule is pinned at v5.42.2).
+perl.wasm was built from (the submodule is pinned at v5.44.0).
 
 IMPORTANT: run this AGAINST THE ASSEMBLED lib/, i.e. AFTER `make` has run the
 nonxs pm_to_blib step. A pristine checkout's lib/ holds only the ~73 core .pm;
