@@ -19,7 +19,11 @@ PLATFORM_FLAG := $(if $(DOCKER_PLATFORM),--platform=$(DOCKER_PLATFORM),)
 # declaring the import path its own `import` / `//go:linkname` sites embed.
 # wasmify writes that path into wasmify.json's bridge.Wasm2GoImportPath, which
 # the codegen reads back; derive it from the JSON so the two never drift.
-WASM2GO_BUNDLE_DIR    := build/wasm2go/internal/wasm2go
+# The generated tree nests under the GoPackage's package directory
+# ("internal", from bridge.GoPackage = github.com/goccy/go-perl/internal):
+# build/wasm2go/internal/perl.go is the service binding for go-perl, and the
+# self-contained wasm2go bundle module sits one level below it.
+WASM2GO_BUNDLE_DIR    := build/wasm2go/internal/internal/wasm2go
 WASM2GO_BUNDLE_GO_VER := 1.25.0
 
 # Exported into every pipeline phase. Perl is NOT wasi-native: it wants the

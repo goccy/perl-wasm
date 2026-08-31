@@ -54,7 +54,7 @@
   ],
   "build_commands": {
     "configure": "bash scripts/wasi-configure.sh",
-    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
+    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) \u0026\u0026 make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
   },
   "user_selection": {
     "target_name": "libperl",
@@ -65,7 +65,7 @@
       "perl.cc",
       "perl_wasi.cc"
     ],
-    "GoPackage": "github.com/goccy/go-perl;perl",
+    "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
     "HostSockets": true,
     "HostSubprocess": true,
@@ -77,6 +77,21 @@
       "perl_close",
       "perl_interrupt_addr",
       "perl_call",
+      "perl_invoke",
+      "perl_method_call",
+      "perl_deref",
+      "perl_array_len",
+      "perl_array_get",
+      "perl_array_set",
+      "perl_array_push",
+      "perl_array_values",
+      "perl_hash_get",
+      "perl_hash_set",
+      "perl_hash_delete",
+      "perl_hash_keys",
+      "perl_new_array",
+      "perl_new_hash",
+      "perl_release",
       "perl_set_go_dispatcher",
       "perl_register_native_xs",
       "perl_xs_helper"
@@ -84,7 +99,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-08-31T03:39:38Z",
+      "completed_at": "2026-08-31T10:52:19Z",
       "upstream_commit": "e634cc838fb1785dfafb5d13b52807ea16b5c52c",
       "output_files": [
         "proto/perl.proto",
@@ -94,7 +109,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-08-31T03:39:38Z",
+      "completed_at": "2026-08-31T10:52:19Z",
       "upstream_commit": "e634cc838fb1785dfafb5d13b52807ea16b5c52c",
       "output_files": [
         "api-spec.json"
