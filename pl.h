@@ -6,12 +6,14 @@
  *
  * This is the ONLY surface wasmify exports from libperl. Perl's full C API
  * (the perlapi / XS surface) stays internal; Go callers see just these
- * functions. Pinned against Perl v5.42.2.
+ * functions. Pinned against Perl v5.44.0.
  *
  * It is a C++ header (compiled into the wasmify bridge as C++): string OUTPUTS
- * use `std::string*`, matching the bridge generator's string-output handling,
- * and string INPUTS use `const char*` (the bridge passes `.c_str()`). The
- * interpreter handle is an opaque integer token (uint64), which keeps the
+ * use `std::string`, matching the bridge generator's string-output handling,
+ * and string/byte INPUTS use `const char*` (the bridge passes `.c_str()`,
+ * which points at the FULL decoded buffer — embedded NUL bytes survive — so
+ * every binary input parameter travels with an explicit length parameter).
+ * The interpreter handle is an opaque integer token (uint64), which keeps the
  * generator unambiguous (a pointer-to-opaque-struct parameter is otherwise
  * misread as an output param) and is the conventional FFI handle idiom.
  *
@@ -19,6 +21,48 @@
  * Multiple interpreters == multiple wasm2go module instances, each with its
  * own linear memory. Perl is built -Dusemultiplicity (implicit interpreter
  * context, pTHX) but WITHOUT ithreads — the wasm target is single-threaded.
+ *
+ * ---- Typed value protocol ------------------------------------------------
+ *
+ * Every value crossing the boundary is a TYPED BINARY NODE (little-endian,
+ * packed). Nothing is stringified and nothing rides JSON: scalars cross by
+ * value with their kind, references cross by handle.
+ *
+ *   node   := tag:u8 payload
+ *     0 undef      —
+ *     1 bool       u8 (0/1)
+ *     2 int        i64
+ *     3 float      f64 (IEEE 754 bits)
+ *     4 string     u8 utf8_flag, u32 len, len bytes (the raw PV; utf8_flag
+ *                  mirrors SvUTF8 so the encoding round-trips)
+ *     5 ref        u64 handle, u8 refkind, u16 class_len, class bytes
+ *                  (class only when blessed; refkind: 0 SCALAR, 1 ARRAY,
+ *                  2 HASH, 3 CODE, 4 GLOB, 5 IO, 6 FORMAT, 7 REGEXP,
+ *                  8 OTHER)
+ *     6 hostfunc   u32 id — host->guest only; decodes to a Perl closure
+ *                  dispatching back to the host function bound under id
+ *     7 flatten    u64 handle — host->guest only, argument lists only: the
+ *                  handle's ARRAY/HASH dereferences and its CONTENTS are
+ *                  pushed onto the argument list (Perl's own list-flattening
+ *                  calling convention)
+ *
+ *   list   := count:u32 node*
+ *
+ * References are never serialised: the guest pins the actual referent in a
+ * per-interpreter registry (refcount held, id deduplicated by referent
+ * address so the same reference always gets the same id) and only the id
+ * crosses. Sending a handle back dereferences to THE SAME SV, so identity,
+ * aliasing, and blessedness survive round trips. Each ref node handed to the
+ * host carries one pin the HOST owns; it releases pins via perl_release.
+ *
+ * Every operation below that returns std::string returns a RESULT ENVELOPE:
+ *
+ *   envelope := status:u8 payload
+ *     0 ok    payload is the operation's result (see each function)
+ *     1 die   u32 len, len bytes of $@'s text
+ *     2 exit  i32 exit status (a guest exit() caught cleanly; the
+ *             interpreter unwound back to the call frame and stays
+ *             flushable/destructible)
  */
 #ifndef PERLEMBED_H
 #define PERLEMBED_H
@@ -37,21 +81,13 @@
  * to run with only the built-in @INC. */
 uint64_t perl_new(const char *lib_dir);
 
-/* Evaluate `src` in the interpreter and return the result as a JSON string:
+/* Evaluate `src` (a string eval in scalar context, REPL-like state
+ * persistence). ok payload:
  *
- *   {"ok":<bool>,"result":<string>,"stdout":<string>,"stderr":<string>,
- *    "error":<string>}
+ *   result:node stdout:(u32 len + bytes) stderr:(u32 len + bytes)
  *
- * `src` is run via eval_pv (a string eval in scalar context). "result" holds
- * the stringification of the returned scalar. "stdout"/"stderr" hold anything
- * printed to STDOUT/STDERR during the eval (captured by reopening them onto
- * in-memory scalars around the call). On a Perl-level die (or a host interrupt,
- * see below), "ok" is false and "error" holds $@ (the contents of ERRSV).
- * Package/lexical-our state persists across calls on the same handle (REPL-like).
- *
- * A single JSON string return is used because the bridge generator surfaces
- * only one response value to Go; bundling the outputs keeps one round-trip and
- * one atomic result. The Go wrapper unmarshals it. */
+ * A die envelope (status 1) is followed by the same stdout/stderr pair —
+ * what the eval printed before dying is still delivered. */
 std::string perl_eval(uint64_t h, const char *src);
 
 /* Destroy the interpreter (perl_destruct + perl_free). PERL_SYS_TERM runs at
@@ -67,8 +103,8 @@ void perl_close(uint64_t h);
  * eval-breaker: the run loop is pluggable (PL_runops). perl_new installs a
  * custom loop that, on every opcode, tests a host-writable flag word and, when
  * set, calls Perl_croak("Perl execution interrupted"). The croak longjmps to
- * the eval_pv trap, so perl_eval returns cleanly with ok=false and the message
- * in "error" — exactly like a Perl-level die.
+ * the eval trap, so the eval returns cleanly with a die envelope — exactly
+ * like a Perl-level die.
  *
  * To interrupt, the host performs a single plain 32-bit store into linear
  * memory (no call into the instance):
@@ -81,39 +117,72 @@ void perl_close(uint64_t h);
  * not preempted until it returns to the run loop. */
 uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
 
-/* ---- Go <-> Perl bridge --------------------------------------------------
- *
- * A call's argument/return list crosses the boundary as a JSON array of
- * TAGGED nodes; JSON is only the carrier, the tag is the semantics. Plain
- * scalars cross BY VALUE ({"k":"d","v":...}), composite host data crosses by
- * value as fresh Perl structures ({"k":"j","v":...}), and Perl REFERENCES -
- * blessed objects, array/hash/code refs - are never serialised: they cross
- * BY HANDLE ({"k":"r","h":id,"t":reftype,"c":class}), an id into a guest
- * registry that pins the actual SV. Sending a handle back dereferences to
- * THE SAME SV, so object identity and aliasing survive round trips. See
- * GO_BRIDGE_GLUE in perl.cc for the codec, the registry (pin/release)
- * and the handle operations (method call, code invoke, data export). */
-
 /* Call the named Perl subroutine in list context. `sub_name` is a fully
  * qualified sub name ("main::handler", "My::App::run") or a main:: sub name;
- * `args_json` is a JSON array of tagged value nodes (NULL/empty means no
- * arguments). Returns
- *
- *   {"ok":<bool>,"result":<array of tagged nodes>,"error":<string>}
- *
- * On a Perl-level die (including "no such sub"), "ok" is false and "error"
- * holds $@. Unlike perl_eval, STDOUT/STDERR are NOT redirected: prints go to
- * the instance's WASI fds. */
-std::string perl_call(uint64_t h, const char *sub_name, const char *args_json);
+ * `args`/`args_len` is a node list (empty means no arguments). ok payload:
+ * the return list as a node list. Unlike perl_eval, STDOUT/STDERR are NOT
+ * redirected: prints go to the instance's WASI fds. */
+std::string perl_call(uint64_t h, const char *sub_name,
+                      const char *args, uint32_t args_len);
+
+/* Call the CODE reference behind `code` (a ref handle). want_scalar selects
+ * the calling context: 0 = list context (ok payload: node list), 1 = scalar
+ * context (ok payload: node list holding the single result). */
+std::string perl_invoke(uint64_t h, uint64_t code, uint32_t want_scalar,
+                        const char *args, uint32_t args_len);
+
+/* Invoke $obj->method(args...) in list context on the reference behind
+ * `obj`, dispatched by Perl's own method resolution (inheritance, AUTOLOAD).
+ * ok payload: the return list as a node list. */
+std::string perl_method_call(uint64_t h, uint64_t obj, const char *method,
+                             const char *args, uint32_t args_len);
+
+/* Dereference the SCALAR (or REF) reference behind `ref`: $$ref. ok payload:
+ * one node (a ref-to-ref yields a fresh ref node). ARRAY/HASH/CODE handles
+ * need no guest call to view — their operations below take the ref handle
+ * directly. */
+std::string perl_deref(uint64_t h, uint64_t ref);
+
+/* Array operations. Every `av` parameter is a ref handle whose referent is
+ * an ARRAY; ties and overloads run like ordinary Perl code, and a die
+ * surfaces as a die envelope. */
+std::string perl_array_len(uint64_t h, uint64_t av);            /* ok: i64 */
+std::string perl_array_get(uint64_t h, uint64_t av, int64_t idx);  /* ok: node */
+std::string perl_array_set(uint64_t h, uint64_t av, int64_t idx,
+                           const char *val, uint32_t val_len);  /* val: one node; ok: empty */
+std::string perl_array_push(uint64_t h, uint64_t av,
+                            const char *vals, uint32_t vals_len); /* vals: node list; ok: empty */
+std::string perl_array_values(uint64_t h, uint64_t av);         /* ok: node list */
+
+/* Hash operations. Every `hv` parameter is a ref handle whose referent is a
+ * HASH. Keys travel as ONE string node (tag 4), so byte keys and utf8 keys
+ * both round-trip exactly. */
+std::string perl_hash_get(uint64_t h, uint64_t hv,
+                          const char *key, uint32_t key_len);   /* ok: u8 exists + node */
+std::string perl_hash_set(uint64_t h, uint64_t hv,
+                          const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len);   /* ok: empty */
+std::string perl_hash_delete(uint64_t h, uint64_t hv,
+                             const char *key, uint32_t key_len); /* ok: empty */
+std::string perl_hash_keys(uint64_t h, uint64_t hv);            /* ok: node list of strings */
+
+/* Materialise a fresh array/hash in the guest from a node list and return a
+ * ref node to it (ok payload: one node). perl_new_hash's list alternates
+ * key nodes and value nodes. */
+std::string perl_new_array(uint64_t h, const char *vals, uint32_t vals_len);
+std::string perl_new_hash(uint64_t h, const char *pairs, uint32_t pairs_len);
+
+/* Release registry pins: `ids` is a packed array of u64 handle ids (host
+ * finalizer queue drains through one call). ok payload: empty. */
+std::string perl_release(uint64_t h, const char *ids, uint32_t ids_len);
 
 /* Register the Go-side dispatcher for this instance. `callback_id` is the id
  * the host returned when registering its callback handler; every Perl->Go
  * call from this interpreter is routed to it. Perl code reaches Go through
- * main::__plwasm_go_invoke($func_id, $payload_json) — an XS installed by
- * perl_new that forwards to the wasmify callback import — and the
- * main::__plwasm_go_call glue that wraps it with JSON encode/decode (the
- * host binds a named Perl sub to a Go function by eval'ing a one-line sub
- * that calls the glue with the Go function's id). */
+ * closures over main::__plwasm_go_call (an XS installed by perl_new that
+ * speaks the node protocol over the wasmify callback import); the host binds
+ * a named Perl sub to a Go function by eval'ing a one-line sub that calls
+ * the glue with the Go function's id. */
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
 
 /* ---- Native XS support ---------------------------------------------------

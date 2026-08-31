@@ -180,9 +180,9 @@ jobs:
         run: |
           mkdir -p release
           cp .wasmify/wasm-build/output/perl.wasm release/perl.wasm
-          cp build/wasm2go/perl.go release/perl_wasm2go.go
-          tar -czf release/perl_wasm2go.tar.gz -C build/wasm2go/internal/wasm2go .
-          ( cd build/wasm2go/internal/wasm2go && find . -type f -print0 | sort -z \
+          cp build/wasm2go/internal/perl.go release/perl_wasm2go.go
+          tar -czf release/perl_wasm2go.tar.gz -C build/wasm2go/internal/internal/wasm2go .
+          ( cd build/wasm2go/internal/internal/wasm2go && find . -type f -print0 | sort -z \
               | xargs -0 sha256sum ) > release/perl_wasm2go.sha256
           python3 scripts/make-stdlib-zip.py perl5/lib release/perl_stdlib.zip
           # Config_heavy.pl is written to lib/ by the build (configpm); a pristine

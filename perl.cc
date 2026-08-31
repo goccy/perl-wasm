@@ -16,16 +16,22 @@
  */
 #include "pl.h"
 
+/* The C++ standard headers MUST come before Perl's: perl.h defines
+ * short-name macros (do_open, do_close, ...) that break any libc++ header
+ * textually included after it. */
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 extern "C" {
 #include <EXTERN.h>
 #include <perl.h>
 #include <XSUB.h>
 #include <perliol.h>
 }
-
-#include <cstdint>
-#include <cstdio>
-#include <string>
 
 /* ---- static extension bootstraps ----------------------------------------
  * Mirrors the xs_init generated into perlmain.c by ExtUtils::Miniperl from the
@@ -361,66 +367,382 @@ static std::string sv_to_std(pTHX_ SV *sv) {
     return std::string(p, static_cast<size_t>(len));
 }
 
-static void json_escape(const std::string &in, std::string &out) {
-    for (unsigned char c : in) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        case '\b': out += "\\b";  break;
-        case '\f': out += "\\f";  break;
-        default:
-            if (c < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                out += buf;
-            } else {
-                out += static_cast<char>(c);
-            }
-        }
+/* ---- typed value codec ---------------------------------------------------
+ * The node/envelope wire format documented in pl.h. Little-endian, packed;
+ * every value crosses with its kind, references cross by handle. */
+
+enum : uint8_t {
+    NODE_UNDEF    = 0,
+    NODE_BOOL     = 1,
+    NODE_INT      = 2,
+    NODE_FLOAT    = 3,
+    NODE_STRING   = 4,
+    NODE_REF      = 5,
+    NODE_HOSTFUNC = 6,
+    NODE_FLATTEN  = 7,
+};
+
+enum : uint8_t {
+    REFK_SCALAR = 0,
+    REFK_ARRAY  = 1,
+    REFK_HASH   = 2,
+    REFK_CODE   = 3,
+    REFK_GLOB   = 4,
+    REFK_IO     = 5,
+    REFK_FORMAT = 6,
+    REFK_REGEXP = 7,
+    REFK_OTHER  = 8,
+};
+
+enum : uint8_t { ENV_OK = 0, ENV_DIE = 1, ENV_EXIT = 2 };
+
+static void put_u8(std::string &b, uint8_t v) { b.push_back(static_cast<char>(v)); }
+static void put_u16(std::string &b, uint16_t v) {
+    for (int i = 0; i < 2; i++) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
+static void put_u32(std::string &b, uint32_t v) {
+    for (int i = 0; i < 4; i++) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
+static void put_u64(std::string &b, uint64_t v) {
+    for (int i = 0; i < 8; i++) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
+static void put_i64(std::string &b, int64_t v) { put_u64(b, static_cast<uint64_t>(v)); }
+static void put_f64(std::string &b, double v) {
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    put_u64(b, bits);
+}
+static void put_bytes(std::string &b, const char *p, uint32_t len) {
+    put_u32(b, len);
+    if (len) b.append(p, len);
+}
+
+/* NodeReader walks a node buffer with bounds checking; any overrun flips
+ * fail and every later read yields zero, so decoding is total. */
+struct NodeReader {
+    const unsigned char *p;
+    const unsigned char *end;
+    bool fail;
+    NodeReader(const char *data, uint32_t len)
+        : p(reinterpret_cast<const unsigned char *>(data)), end(p + len), fail(false) {}
+    bool need(size_t n) {
+        if (fail || static_cast<size_t>(end - p) < n) { fail = true; return false; }
+        return true;
+    }
+    uint8_t get_u8() { if (!need(1)) return 0; return *p++; }
+    uint16_t get_u16() {
+        if (!need(2)) return 0;
+        uint16_t v = static_cast<uint16_t>(p[0]) | static_cast<uint16_t>(p[1]) << 8;
+        p += 2;
+        return v;
+    }
+    uint32_t get_u32() {
+        if (!need(4)) return 0;
+        uint32_t v = 0;
+        for (int i = 0; i < 4; i++) v |= static_cast<uint32_t>(p[i]) << (8 * i);
+        p += 4;
+        return v;
+    }
+    uint64_t get_u64() {
+        if (!need(8)) return 0;
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v |= static_cast<uint64_t>(p[i]) << (8 * i);
+        p += 8;
+        return v;
+    }
+    int64_t get_i64() { return static_cast<int64_t>(get_u64()); }
+    double get_f64() {
+        uint64_t bits = get_u64();
+        double v;
+        memcpy(&v, &bits, 8);
+        return v;
+    }
+    const char *get_bytes(uint32_t len) {
+        if (!need(len)) return nullptr;
+        const char *q = reinterpret_cast<const char *>(p);
+        p += len;
+        return q;
+    }
+};
+
+static std::string env_die(const std::string &msg) {
+    std::string out;
+    put_u8(out, ENV_DIE);
+    put_bytes(out, msg.data(), static_cast<uint32_t>(msg.size()));
+    return out;
+}
+
+/* ---- reference-handle registry (identity-preserving pins) ----------------
+ * Pins the actual referent: the registry owns one reference (an RV it holds
+ * a refcount through), ids are deduplicated by referent address so the same
+ * Perl reference always crosses under the same id, and pin counts align the
+ * guest refcount with host-side wrapper liveness (the host releases pins via
+ * perl_release). Lives in plain C++ maps — copy-on-write instance snapshots
+ * copy them along with the rest of linear memory. */
+static std::unordered_map<uint64_t, SV *> g_reg_by_id;
+static std::unordered_map<UV, uint64_t> g_reg_by_addr;
+static std::unordered_map<uint64_t, uint64_t> g_reg_pins;
+static uint64_t g_reg_next = 0;
+
+static uint64_t reg_pin(pTHX_ SV *rv) {
+    SV *ref = SvRV(rv);
+    UV addr = PTR2UV(ref);
+    uint64_t id;
+    auto it = g_reg_by_addr.find(addr);
+    if (it == g_reg_by_addr.end()) {
+        id = ++g_reg_next;
+        g_reg_by_id[id] = newRV_inc(ref);
+        g_reg_by_addr[addr] = id;
+    } else {
+        id = it->second;
+    }
+    g_reg_pins[id]++;
+    return id;
+}
+
+static SV *reg_lookup(uint64_t id) {
+    auto it = g_reg_by_id.find(id);
+    return it == g_reg_by_id.end() ? nullptr : it->second;
+}
+
+static void reg_release(pTHX_ uint64_t id) {
+    auto it = g_reg_by_id.find(id);
+    if (it == g_reg_by_id.end()) return;
+    if (--g_reg_pins[id] > 0) return;
+    SV *rv = it->second;
+    g_reg_by_addr.erase(PTR2UV(SvRV(rv)));
+    g_reg_by_id.erase(it);
+    g_reg_pins.erase(id);
+    SvREFCNT_dec(rv);
+}
+
+static void reg_clear(pTHX) {
+    for (auto &e : g_reg_by_id) SvREFCNT_dec(e.second);
+    g_reg_by_id.clear();
+    g_reg_by_addr.clear();
+    g_reg_pins.clear();
+    g_reg_next = 0;
+}
+
+static uint8_t refkind_of(pTHX_ SV *ref) {
+    switch (SvTYPE(ref)) {
+    case SVt_PVAV: return REFK_ARRAY;
+    case SVt_PVHV: return REFK_HASH;
+    case SVt_PVCV: return REFK_CODE;
+    case SVt_PVFM: return REFK_FORMAT;
+    case SVt_PVIO: return REFK_IO;
+    case SVt_REGEXP: return REFK_REGEXP;
+    case SVt_PVGV: return isGV_with_GP(ref) ? REFK_GLOB : REFK_SCALAR;
+    default: return REFK_SCALAR;
     }
 }
 
-static std::string json_field(const char *key, const std::string &val, bool comma) {
-    std::string s = "\"";
-    s += key;
-    s += "\":\"";
-    json_escape(val, s);
-    s += "\"";
-    if (comma) s += ",";
-    return s;
+/* encode_sv appends one node for sv. References are pinned (the host owns
+ * the new pin); everything else crosses by value with its kind. Get-magic
+ * runs here, so a tied FETCH executes like ordinary Perl code — a die from
+ * it outside an eval frame follows Perl's own fatal-die semantics. */
+static void encode_sv(pTHX_ SV *sv, std::string &out) {
+    if (sv) SvGETMAGIC(sv);
+    if (!sv || !SvOK(sv)) {
+        put_u8(out, NODE_UNDEF);
+        return;
+    }
+    if (SvROK(sv)) {
+        SV *ref = SvRV(sv);
+        uint64_t id = reg_pin(aTHX_ sv);
+        put_u8(out, NODE_REF);
+        put_u64(out, id);
+        put_u8(out, refkind_of(aTHX_ ref));
+        const char *cls = nullptr;
+        if (SvOBJECT(ref)) {
+            HV *stash = SvSTASH(ref);
+            if (stash) cls = HvNAME(stash);
+        }
+        size_t clen = cls ? strlen(cls) : 0;
+        if (clen > 0xFFFF) clen = 0xFFFF;
+        put_u16(out, static_cast<uint16_t>(clen));
+        if (clen) out.append(cls, clen);
+        return;
+    }
+    if (SvIsBOOL(sv)) {
+        put_u8(out, NODE_BOOL);
+        put_u8(out, SvTRUE(sv) ? 1 : 0);
+        return;
+    }
+    if (SvIOK(sv)) {
+        put_u8(out, NODE_INT);
+        put_i64(out, static_cast<int64_t>(SvIV(sv)));
+        return;
+    }
+    if (SvNOK(sv)) {
+        put_u8(out, NODE_FLOAT);
+        put_f64(out, static_cast<double>(SvNV(sv)));
+        return;
+    }
+    STRLEN len = 0;
+    const char *pv = SvPV(sv, len); /* POK, or stringify anything else */
+    put_u8(out, NODE_STRING);
+    put_u8(out, SvUTF8(sv) ? 1 : 0);
+    put_bytes(out, pv, static_cast<uint32_t>(len));
 }
 
-/* XS trampoline: main::__plwasm_go_invoke($func_id, $payload) -> $response.
- * Forwards the payload bytes to the host through wasmify_callback_invoke and
- * returns the response bytes as a Perl string. The JSON encode/decode around
- * it lives in Perl (GO_BRIDGE_GLUE below); this function only moves bytes. */
-XS(XS___plwasm_go_invoke);
-XS(XS___plwasm_go_invoke) {
-    dXSARGS;
-    if (items != 2) Perl_croak(aTHX_ "usage: __plwasm_go_invoke(func_id, payload)");
+static void encode_list(pTHX_ SV **items, I32 count, std::string &out) {
+    put_u32(out, static_cast<uint32_t>(count));
+    for (I32 i = 0; i < count; i++) encode_sv(aTHX_ items[i], out);
+}
+
+/* XS_goperl_go_thunk (defined with the Perl->Go dispatch below) backs every
+ * host function value: an ANONYMOUS XS CV whose XSANY carries the host
+ * function id — an ordinary code ref Perl can store, pass around, and call
+ * later, with no Perl-source closure involved. */
+XS(XS_goperl_go_thunk);
+
+static SV *make_go_closure(pTHX_ uint32_t id) {
+    CV *cv = newXS(NULL, XS_goperl_go_thunk, __FILE__);
+    CvXSUBANY(cv).any_i32 = static_cast<int32_t>(id);
+    return sv_2mortal(newRV_noinc((SV *)cv));
+}
+
+/* decode_node turns one wire node into a mortal SV. NODE_FLATTEN is handled
+ * by the argument-push loops (it expands to many stack entries), never here.
+ * On malformed input or a stale handle, sets err and returns NULL. */
+static SV *decode_node(pTHX_ NodeReader &r, std::string &err) {
+    uint8_t tag = r.get_u8();
+    if (r.fail) { err = "malformed value node"; return nullptr; }
+    switch (tag) {
+    case NODE_UNDEF:
+        return &PL_sv_undef;
+    case NODE_BOOL:
+        return boolSV(r.get_u8() != 0);
+    case NODE_INT:
+        return sv_2mortal(newSViv(static_cast<IV>(r.get_i64())));
+    case NODE_FLOAT:
+        return sv_2mortal(newSVnv(static_cast<NV>(r.get_f64())));
+    case NODE_STRING: {
+        uint8_t utf8 = r.get_u8();
+        uint32_t len = r.get_u32();
+        const char *p = r.get_bytes(len);
+        if (r.fail) { err = "malformed string node"; return nullptr; }
+        SV *sv = newSVpvn(p ? p : "", len);
+        if (utf8) SvUTF8_on(sv);
+        return sv_2mortal(sv);
+    }
+    case NODE_REF: {
+        uint64_t id = r.get_u64();
+        (void)r.get_u8();                 /* refkind: advisory on decode */
+        uint16_t clen = r.get_u16();
+        (void)r.get_bytes(clen);          /* class: advisory on decode */
+        if (r.fail) { err = "malformed ref node"; return nullptr; }
+        SV *rv = reg_lookup(id);
+        if (!rv) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "stale Perl reference handle %llu",
+                     static_cast<unsigned long long>(id));
+            err = buf;
+            return nullptr;
+        }
+        return sv_2mortal(newRV_inc(SvRV(rv)));
+    }
+    case NODE_HOSTFUNC: {
+        uint32_t id = r.get_u32();
+        if (r.fail) { err = "malformed hostfunc node"; return nullptr; }
+        return make_go_closure(aTHX_ id);
+    }
+    default:
+        err = "unknown value node tag";
+        return nullptr;
+    }
+}
+
+/* goperl_go_dispatch is the Perl->Go half of the function bridge: encodes
+ * args as a node list, dispatches to the host function bound under func_id
+ * over the wasmify callback import, and decodes the response envelope into
+ * mortal result SVs — croaking with the reported message on failure (the
+ * caller is an XSUB, so the croak is an ordinary Perl die). Reference
+ * arguments are pinned by encode_sv and OWNED by the host side (its wrapper
+ * releases each pin), so a handler may keep a reference beyond the call. */
+static void goperl_go_dispatch(pTHX_ int32_t func_id, SV **args, I32 nargs,
+                               std::vector<SV *> &out) {
     if (g_go_cb == 0)
         Perl_croak(aTHX_ "no Go dispatcher registered for this instance");
-    IV func_id = SvIV(ST(0));
-    STRLEN len = 0;
-    const char *payload = SvPV(ST(1), len);
-    int64_t rc = wasmify_callback_invoke(g_go_cb, static_cast<int32_t>(func_id),
-                                         const_cast<char *>(payload),
-                                         static_cast<size_t>(len));
+
+    std::string req;
+    put_u32(req, static_cast<uint32_t>(nargs));
+    for (I32 i = 0; i < nargs; i++) encode_sv(aTHX_ args[i], req);
+
+    int64_t rc = wasmify_callback_invoke(g_go_cb, func_id,
+                                         const_cast<char *>(req.data()), req.size());
     uint32_t resp_ptr = static_cast<uint32_t>(static_cast<uint64_t>(rc) >> 32);
     uint32_t resp_len = static_cast<uint32_t>(static_cast<uint64_t>(rc) & 0xFFFFFFFFu);
-    SV *out;
-    if (resp_ptr != 0 && resp_len != 0) {
-        out = newSVpvn(reinterpret_cast<const char *>(static_cast<uintptr_t>(resp_ptr)),
-                       static_cast<STRLEN>(resp_len));
-        free(reinterpret_cast<void *>(static_cast<uintptr_t>(resp_ptr)));
-    } else {
-        out = newSVpvn("", 0);
+    if (resp_ptr == 0 || resp_len < 1)
+        Perl_croak(aTHX_ "Go function dispatch: empty response");
+    char *resp = reinterpret_cast<char *>(static_cast<uintptr_t>(resp_ptr));
+
+    NodeReader r(resp, resp_len);
+    uint8_t status = r.get_u8();
+    if (status != ENV_OK) {
+        uint32_t elen = r.get_u32();
+        const char *ep = r.get_bytes(elen);
+        char msg[512];
+        size_t n = (ep && !r.fail) ? elen : 0;
+        if (n > sizeof(msg) - 1) n = sizeof(msg) - 1;
+        memcpy(msg, ep ? ep : "", n);
+        msg[n] = '\0';
+        free(resp);
+        Perl_croak(aTHX_ "%s", n ? msg : "Go function dispatch failed");
     }
-    ST(0) = sv_2mortal(out);
-    XSRETURN(1);
+    uint32_t count = r.get_u32();
+    out.reserve(count);
+    std::string derr;
+    for (uint32_t i = 0; i < count && !r.fail; i++) {
+        SV *sv = decode_node(aTHX_ r, derr);
+        if (!sv) break;
+        out.push_back(sv);
+    }
+    free(resp);
+    if (out.size() != count) {
+        Perl_croak(aTHX_ "Go function dispatch: %s",
+                   derr.empty() ? "truncated response" : derr.c_str());
+    }
+}
+
+/* Push the dispatch results as an XSUB's return list; scalar context
+ * historically receives the FIRST result. Returns the item count. */
+#define GOPERL_GO_RETURN(out)                                   \
+    do {                                                        \
+        if (GIMME_V == G_SCALAR) {                              \
+            XSprePUSH;                                          \
+            ST(0) = (out).empty() ? &PL_sv_undef : (out)[0];    \
+            XSRETURN(1);                                        \
+        }                                                       \
+        XSprePUSH;                                              \
+        EXTEND(SP, (SSize_t)(out).size());                      \
+        for (size_t k_ = 0; k_ < (out).size(); k_++)            \
+            ST(k_) = (out)[k_];                                 \
+        XSRETURN((out).size());                                 \
+    } while (0)
+
+/* main::__plwasm_go_call($func_id, @args): the named entry the host's Bind
+ * points its generated subs at. */
+XS(XS___plwasm_go_call);
+XS(XS___plwasm_go_call) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "usage: __plwasm_go_call(func_id, args...)");
+    IV func_id = SvIV(ST(0));
+    std::vector<SV *> out;
+    goperl_go_dispatch(aTHX_ static_cast<int32_t>(func_id), &ST(1), items - 1, out);
+    GOPERL_GO_RETURN(out);
+}
+
+/* The anonymous host-function thunk: the id lives in XSANY (see
+ * make_go_closure), the whole argument list is the host call's argument
+ * list. */
+XS(XS_goperl_go_thunk) {
+    dXSARGS;
+    int32_t func_id = XSANY.any_i32;
+    std::vector<SV *> out;
+    goperl_go_dispatch(aTHX_ func_id, items > 0 ? &ST(0) : nullptr, items, out);
+    GOPERL_GO_RETURN(out);
 }
 
 /* Generic thunk backing every host-native XSUB (see pl.h "Native XS
@@ -480,158 +802,218 @@ XS(XS_goperl_native_thunk) {
     XSRETURN(nret);
 }
 
-/* Bridge glue, eval'd once at perl_new. JSON::PP + Scalar::Util (both in the
- * shipped stdlib / static XS) load lazily on the first bridge call so
- * interpreters that never cross the boundary don't pay for them.
- *
- * Value protocol (both directions): a call's argument/return list is a JSON
- * array of TAGGED nodes - JSON is only the carrier, the node tag is the
- * semantics:
- *
- *   {"k":"u"}                       undef
- *   {"k":"d","v":<scalar>}          plain scalar (number/string/bool) BY VALUE
- *   {"k":"j","v":<structure>}       composite data BY VALUE (fresh refs on
- *                                   decode - carries data, not identity)
- *   {"k":"r","h":<id>,"t":<reftype>,"c":<class>?}   a REFERENCE by HANDLE
- *
- * References are never serialised: __plwasm_enc pins the actual SV in a
- * registry (refcount held, id deduped by refaddr so the same SV always gets
- * the same id) and only the id crosses. Decoding an "r" node returns THE SAME
- * reference, so identity, aliasing, and blessedness survive a round trip
- * through Go. Every "r" node handed to the host carries one pin the HOST
- * owns — its wrapper's finalizer/Free releases it via __plwasm_release (or
- * batched, __plwasm_release_all) — so host-side liveness and the guest
- * refcount stay aligned in both directions: the registry keeps the SV alive
- * while the host can still reach it, and Perl's own refcounting resumes when
- * the last pin drops. utf8 mode: the C boundary carries bytes, so
- * encode/decode speak UTF-8 octets and non-ASCII round-trips. */
-static const char *GO_BRIDGE_GLUE =
-    "sub main::__plwasm_json {"
-    "  $main::__plwasm_json_obj ||= do {"
-    "    require JSON::PP;"
-    "    require Scalar::Util;"
-    "    JSON::PP->new->utf8->allow_nonref;"
-    "  };"
-    "}"
-    /* --- reference-handle registry (identity-preserving pins) --- */
-    "sub main::__plwasm_pin {"
-    "  my ($r) = @_;"
-    "  my $addr = Scalar::Util::refaddr($r);"
-    "  my $id = $main::__plwasm_addr{$addr};"
-    "  if (!defined $id) {"
-    "    $id = ++$main::__plwasm_next_h;"
-    "    $main::__plwasm_reg{$id} = $r;"
-    "    $main::__plwasm_addr{$addr} = $id;"
-    "  }"
-    "  $main::__plwasm_pins{$id}++;"
-    "  return $id;"
-    "}"
-    "sub main::__plwasm_release {"
-    "  my ($id) = @_;"
-    "  return 0 unless exists $main::__plwasm_reg{$id};"
-    "  if (--$main::__plwasm_pins{$id} <= 0) {"
-    "    delete $main::__plwasm_addr{Scalar::Util::refaddr($main::__plwasm_reg{$id})};"
-    "    delete $main::__plwasm_reg{$id};"
-    "    delete $main::__plwasm_pins{$id};"
-    "  }"
-    "  return 1;"
-    "}"
-    /* Batched release: the host's finalizer queue drains through one call.
-     * Returns the number of still-live handles (test observability). */
-    "sub main::__plwasm_release_all {"
-    "  __plwasm_release($_) for @_;"
-    "  return 0 + keys %main::__plwasm_reg;"
-    "}"
-    "sub main::__plwasm_handle {"
-    "  my ($id) = @_;"
-    "  my $r = $main::__plwasm_reg{$id};"
-    "  die \"stale Perl reference handle $id\\n\" unless $r;"
-    "  return $r;"
-    "}"
-    /* --- tagged value codec --- */
-    "sub main::__plwasm_enc {"
-    "  my ($v) = @_;"
-    "  return { k => 'u' } unless defined $v;"
-    "  if (ref $v) {"
-    "    return { k => 'd', v => $v }"
-    "      if Scalar::Util::blessed($v) && $v->isa('JSON::PP::Boolean');"
-    "    my $n = { k => 'r', h => __plwasm_pin($v), t => Scalar::Util::reftype($v) };"
-    "    my $c = Scalar::Util::blessed($v);"
-    "    $n->{c} = $c if defined $c;"
-    "    return $n;"
-    "  }"
-    "  return { k => 'd', v => $v };"
-    "}"
-    "sub main::__plwasm_dec {"
-    "  my ($n) = @_;"
-    "  my $k = $n->{k};"
-    "  return undef   if $k eq 'u';"
-    "  return $n->{v} if $k eq 'd' || $k eq 'j';"
-    "  return __plwasm_handle($n->{h}) if $k eq 'r';"
-    /* A host (Go) function value: materialise a closure over its id. Calling
-     * it dispatches back to the host like any bound sub, so Perl can store
-     * it, pass it around, and call it later - an ordinary code ref. */
-    "  if ($k eq 'f') {"
-    "    my $id = $n->{h};"
-    "    return sub { main::__plwasm_go_call($id, @_) };"
-    "  }"
-    "  die \"unknown bridge value kind '$k'\\n\";"
-    "}"
-    /* --- Go -> Perl dispatch (perl_call) --- */
-    /* Symbolic sub deref (&{$name}) needs no `no strict 'refs'`: this glue
-     * compiles without `use strict`, and pulling the pragma in would load
-     * strict.pm DURING perl_new - making boot depend on a readable stdlib,
-     * which a custom-FS instance does not have yet at that point. */
-    "sub main::__plwasm_call_dispatch {"
-    "  my ($name, $args_json) = @_;"
-    "  my @args = map { __plwasm_dec($_) } @{ __plwasm_json()->decode($args_json) };"
-    "  my @ret = &{$name}(@args);"
-    "  return __plwasm_json()->encode([ map { __plwasm_enc($_) } @ret ]);"
-    "}"
-    /* --- Perl -> Go dispatch (bound subs) ---
-     * Reference arguments are pinned by __plwasm_enc and OWNED by the host
-     * side: its wrapper attaches a finalizer/Free that releases each pin, so
-     * a handler may simply keep a reference beyond the call. */
-    "sub main::__plwasm_go_call {"
-    "  my ($id, @args) = @_;"
-    "  __plwasm_json();" /* load JSON::PP + Scalar::Util before encoding */
-    "  my @nodes = map { __plwasm_enc($_) } @args;"
-    "  my $resp = __plwasm_json()->decode("
-    "      main::__plwasm_go_invoke($id, __plwasm_json()->encode(\\@nodes)));"
-    "  die $resp->{error} unless $resp->{ok};"
-    "  my @out = map { __plwasm_dec($_) } @{$resp->{result}};"
-    "  return wantarray ? @out : $out[0];"
-    "}"
-    /* --- handle operations the host drives through perl_call --- */
-    "sub main::__plwasm_method_call {"
-    "  my ($id, $method, @args) = @_;"
-    "  return __plwasm_handle($id)->$method(@args);"
-    "}"
-    "sub main::__plwasm_invoke_code {"
-    "  my ($id, @args) = @_;"
-    "  my $code = __plwasm_handle($id);"
-    "  die \"handle $id is not a CODE reference\\n\""
-    "    unless Scalar::Util::reftype($code) eq 'CODE';"
-    "  return $code->(@args);"
-    "}"
-    "sub main::__plwasm_export {"
-    "  my ($id) = @_;"
-    /* Deep-copy the referenced structure as data. The TOP-LEVEL blessing is
-     * peeled so a hash/array-based object exports its underlying structure;
-     * NESTED blessed values convert via TO_JSON when they offer it and
-     * degrade to null otherwise (allow_blessed), as do unknowns (code/glob).
-     * Returns the JSON text; the host decodes it. */
-    "  my $r = __plwasm_handle($id);"
-    "  my $t = Scalar::Util::reftype($r) || '';"
-    "  my $plain = $t eq 'HASH'   ? { %$r }"
-    "            : $t eq 'ARRAY'  ? [ @$r ]"
-    "            : $t eq 'SCALAR' ? $$r"
-    "            : $t eq 'REF'    ? $$r"
-    "            : $r;"
-    "  my $j = JSON::PP->new->utf8->allow_nonref->allow_blessed->convert_blessed"
-    "      ->allow_unknown;"
-    "  return $j->encode($plain);"
-    "}";
+/* ---- value-operation XSUBs -----------------------------------------------
+ * The bridge operations are ANONYMOUS C XSUBS — no Perl-source glue: each
+ * receives already-decoded SVs on the stack and drives the perl API
+ * directly (the lvalue-fetch + sv_setsv_mg / iterator patterns the pp_*
+ * functions themselves use), so ties and overloads behave exactly as in
+ * plain Perl. run_glue calls them through call_sv under G_EVAL, so a die —
+ * a tied FETCH, a wrong reference type — is caught like Perl's own. The
+ * CVs live in g_op_cv (created once at perl_new, invisible from Perl
+ * space); clones inherit them with the copied memory. */
+
+static AV *op_want_av(pTHX_ SV *sv) {
+    if (!SvROK(sv) || SvTYPE(SvRV(sv)) != SVt_PVAV)
+        Perl_croak(aTHX_ "Not an ARRAY reference");
+    return (AV *)SvRV(sv);
+}
+
+static HV *op_want_hv(pTHX_ SV *sv) {
+    if (!SvROK(sv) || SvTYPE(SvRV(sv)) != SVt_PVHV)
+        Perl_croak(aTHX_ "Not a HASH reference");
+    return (HV *)SvRV(sv);
+}
+
+/* $$ref (scalar dereference; a $$ on an aggregate ref dies like Perl's). */
+XS(XS_goperl_op_deref);
+XS(XS_goperl_op_deref) {
+    dXSARGS;
+    if (items < 1 || !SvROK(ST(0)))
+        Perl_croak(aTHX_ "Not a SCALAR reference");
+    SV *t = SvRV(ST(0));
+    switch (SvTYPE(t)) {
+    case SVt_PVAV: case SVt_PVHV: case SVt_PVCV: case SVt_PVFM:
+        Perl_croak(aTHX_ "Not a SCALAR reference");
+    default:
+        break;
+    }
+    ST(0) = sv_mortalcopy(t); /* runs get-magic inside the eval frame */
+    XSRETURN(1);
+}
+
+/* scalar @$av */
+XS(XS_goperl_op_alen);
+XS(XS_goperl_op_alen) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    SSize_t n = av_top_index(av) + 1; /* FETCHSIZE runs for tied arrays */
+    XSprePUSH;
+    mXPUSHs(newSViv((IV)n));
+    XSRETURN(1);
+}
+
+/* $av->[$idx] */
+XS(XS_goperl_op_aget);
+XS(XS_goperl_op_aget) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    IV idx = SvIV(ST(1));
+    SV **svp = av_fetch(av, idx, 0);
+    SV *out = sv_mortalcopy(svp ? *svp : &PL_sv_undef);
+    XSprePUSH;
+    PUSHs(out);
+    XSRETURN(1);
+}
+
+/* $av->[$idx] = $val */
+XS(XS_goperl_op_aset);
+XS(XS_goperl_op_aset) {
+    dXSARGS;
+    if (items < 3) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    IV idx = SvIV(ST(1));
+    SV **slot = av_fetch(av, idx, TRUE); /* lvalue fetch, like pp_aelem */
+    if (!slot) Perl_croak(aTHX_ "Modification of non-creatable array value attempted");
+    sv_setsv_mg(*slot, ST(2)); /* set-magic drives a tied STORE */
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* push @$av, LIST */
+XS(XS_goperl_op_apush);
+XS(XS_goperl_op_apush) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    for (I32 i = 1; i < items; i++)
+        av_push(av, newSVsv(ST(i))); /* av_push runs PUSH magic for ties */
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* @$av */
+XS(XS_goperl_op_avals);
+XS(XS_goperl_op_avals) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not an ARRAY reference");
+    AV *av = op_want_av(aTHX_ ST(0));
+    SSize_t n = av_top_index(av) + 1;
+    XSprePUSH;
+    EXTEND(SP, n);
+    for (SSize_t i = 0; i < n; i++) {
+        SV **svp = av_fetch(av, i, 0);
+        PUSHs(sv_mortalcopy(svp ? *svp : &PL_sv_undef));
+    }
+    XSRETURN(n);
+}
+
+/* exists $hv->{$k} ? (1, $hv->{$k}) : (0) */
+XS(XS_goperl_op_hget);
+XS(XS_goperl_op_hget) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    SV *key = ST(1);
+    bool exists = hv_exists_ent(hv, key, 0);
+    XSprePUSH;
+    EXTEND(SP, 2);
+    PUSHs(boolSV(exists));
+    if (exists) {
+        HE *he = hv_fetch_ent(hv, key, 0, 0);
+        PUSHs(sv_mortalcopy(he ? HeVAL(he) : &PL_sv_undef));
+        XSRETURN(2);
+    }
+    XSRETURN(1);
+}
+
+/* $hv->{$k} = $val */
+XS(XS_goperl_op_hset);
+XS(XS_goperl_op_hset) {
+    dXSARGS;
+    if (items < 3) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    HE *he = hv_fetch_ent(hv, ST(1), 1, 0); /* lvalue fetch, like pp_helem */
+    if (!he) Perl_croak(aTHX_ "Modification of non-creatable hash value attempted");
+    sv_setsv_mg(HeVAL(he), ST(2));
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* delete $hv->{$k} */
+XS(XS_goperl_op_hdel);
+XS(XS_goperl_op_hdel) {
+    dXSARGS;
+    if (items < 2) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    (void)hv_delete_ent(hv, ST(1), G_DISCARD, 0);
+    XSprePUSH;
+    XSRETURN(0);
+}
+
+/* keys %$hv (FIRSTKEY/NEXTKEY run for tied hashes) */
+XS(XS_goperl_op_hkeys);
+XS(XS_goperl_op_hkeys) {
+    dXSARGS;
+    if (items < 1) Perl_croak(aTHX_ "Not a HASH reference");
+    HV *hv = op_want_hv(aTHX_ ST(0));
+    hv_iterinit(hv);
+    XSprePUSH;
+    HE *he;
+    SSize_t n = 0;
+    while ((he = hv_iternext(hv)) != nullptr) {
+        XPUSHs(hv_iterkeysv(he)); /* already mortal */
+        n++;
+    }
+    XSRETURN(n);
+}
+
+/* [@_] */
+XS(XS_goperl_op_newa);
+XS(XS_goperl_op_newa) {
+    dXSARGS;
+    AV *av = newAV();
+    for (I32 i = 0; i < items; i++) av_push(av, newSVsv(ST(i)));
+    XSprePUSH;
+    mXPUSHs(newRV_noinc((SV *)av));
+    XSRETURN(1);
+}
+
+/* +{@_} (an odd trailing key gets undef, like list assignment to a hash) */
+XS(XS_goperl_op_newh);
+XS(XS_goperl_op_newh) {
+    dXSARGS;
+    HV *hv = newHV();
+    for (I32 i = 0; i < items; i += 2) {
+        SV *val = (i + 1 < items) ? newSVsv(ST(i + 1)) : newSV(0);
+        if (!hv_store_ent(hv, ST(i), val, 0)) SvREFCNT_dec(val);
+    }
+    XSprePUSH;
+    mXPUSHs(newRV_noinc((SV *)hv));
+    XSRETURN(1);
+}
+
+/* The op CV table run_glue dispatches through. */
+enum {
+    GOP_DEREF = 0, GOP_ALEN, GOP_AGET, GOP_ASET, GOP_APUSH, GOP_AVALS,
+    GOP_HGET, GOP_HSET, GOP_HDEL, GOP_HKEYS, GOP_NEWA, GOP_NEWH,
+    GOP_COUNT,
+};
+static CV *g_op_cv[GOP_COUNT];
+
+static void install_op_cvs(pTHX) {
+    static const struct { int idx; XSUBADDR_t body; } ops[] = {
+        {GOP_DEREF, XS_goperl_op_deref}, {GOP_ALEN, XS_goperl_op_alen},
+        {GOP_AGET, XS_goperl_op_aget},   {GOP_ASET, XS_goperl_op_aset},
+        {GOP_APUSH, XS_goperl_op_apush}, {GOP_AVALS, XS_goperl_op_avals},
+        {GOP_HGET, XS_goperl_op_hget},   {GOP_HSET, XS_goperl_op_hset},
+        {GOP_HDEL, XS_goperl_op_hdel},   {GOP_HKEYS, XS_goperl_op_hkeys},
+        {GOP_NEWA, XS_goperl_op_newa},   {GOP_NEWH, XS_goperl_op_newh},
+    };
+    for (const auto &op : ops)
+        g_op_cv[op.idx] = newXS(NULL, op.body, __FILE__);
+}
 
 /* The eval wrapper (run via eval_pv): redirect STDOUT/STDERR onto in-memory
  * scalars (the built-in PerlIO scalar layer), string-eval the user source, and
@@ -702,13 +1084,14 @@ uint64_t perl_new(const char *lib_dir) {
     PL_runops = runops_interruptible;
     g_interrupt = 0;
 
-    /* Install the Go bridge: the XS byte-mover plus the Perl-side JSON glue
-     * (see GO_BRIDGE_GLUE). Cheap - JSON::PP itself loads lazily. */
+    /* Install the Go bridge: the named Perl->Go dispatcher (Bind's generated
+     * subs call it) and the anonymous value-operation XSUBs. All C — no
+     * Perl-source glue and no module loads. */
     {
         PERL_SET_CONTEXT(g_my_perl);
         dTHX;
-        newXS("main::__plwasm_go_invoke", XS___plwasm_go_invoke, __FILE__);
-        eval_pv(GO_BRIDGE_GLUE, TRUE);
+        newXS("main::__plwasm_go_call", XS___plwasm_go_call, __FILE__);
+        install_op_cvs(aTHX);
     }
     g_go_cb = 0;
 
@@ -717,8 +1100,10 @@ uint64_t perl_new(const char *lib_dir) {
 
 std::string perl_eval(uint64_t h, const char *src) {
     if (!g_my_perl || h == 0) {
-        return std::string("{\"ok\":false,\"result\":\"\",\"stdout\":\"\","
-                           "\"stderr\":\"\",\"error\":\"no interpreter\"}");
+        std::string out = env_die("no interpreter");
+        put_u32(out, 0); /* empty stdout */
+        put_u32(out, 0); /* empty stderr */
+        return out;
     }
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
@@ -745,25 +1130,29 @@ std::string perl_eval(uint64_t h, const char *src) {
         errsv_sv = ERRSV;
     }
 
-    std::string result_s = ok ? sv_to_std(aTHX_ res_sv) : std::string();
-    std::string out_s    = sv_to_std(aTHX_ out_sv);
-    std::string err_s    = sv_to_std(aTHX_ err_sv);
-    std::string error_s  = ok ? std::string() : sv_to_std(aTHX_ errsv_sv);
-
-    std::string j = "{\"ok\":";
-    j += ok ? "true" : "false";
-    j += ",";
-    j += json_field("result", result_s, true);
-    j += json_field("stdout", out_s, true);
-    j += json_field("stderr", err_s, true);
-    j += json_field("error", error_s, false);
-    j += "}";
-    return j;
+    std::string out;
+    if (ok) {
+        put_u8(out, ENV_OK);
+        encode_sv(aTHX_ res_sv, out); /* the result node; refs are pinned */
+    } else {
+        std::string msg = sv_to_std(aTHX_ errsv_sv);
+        put_u8(out, ENV_DIE);
+        put_bytes(out, msg.data(), static_cast<uint32_t>(msg.size()));
+    }
+    std::string out_s = sv_to_std(aTHX_ out_sv);
+    std::string err_s = sv_to_std(aTHX_ err_sv);
+    put_bytes(out, out_s.data(), static_cast<uint32_t>(out_s.size()));
+    put_bytes(out, err_s.data(), static_cast<uint32_t>(err_s.size()));
+    return out;
 }
 
 void perl_close(uint64_t h) {
     if (!g_my_perl || h == 0) return;
     PERL_SET_CONTEXT(g_my_perl);
+    {
+        dTHX;
+        reg_clear(aTHX); /* drop registry pins so destruct sees true counts */
+    }
     PL_perl_destruct_level = 2;
     perl_destruct(g_my_perl);
     perl_free(g_my_perl);
@@ -777,71 +1166,199 @@ uint32_t perl_interrupt_addr(uint64_t h) {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
 }
 
-/* Build the perl_call error envelope. "result" is always a valid (empty)
- * array so the caller can decode the document with one shape. */
-static std::string call_error_json(const std::string &msg) {
-    std::string j = "{\"ok\":false,\"result\":[],";
-    j += json_field("error", msg, false);
-    j += "}";
-    return j;
-}
+/* ---- protected operation driver ------------------------------------------
+ * Every value operation runs the same way: resolve handles to their SVs,
+ * push the arguments on the Perl stack, run the target under G_EVAL (a die
+ * lands in ERRSV, not a longjmp past our locals), shape the returned list
+ * into the operation's ok payload, all under a JMPENV that catches a guest
+ * exit() the way perl_run itself does. Targets are a named sub (call_pv —
+ * stub + AUTOLOAD semantics), the CODE reference behind a handle (call_sv),
+ * a method dispatched by Perl's own resolution (call_method), or one of the
+ * anonymous operation XSUBs above. */
 
-/* perl_call_body is the guarded half of perl_call: everything that runs
- * under the JMPENV the wrapper pushes. Split out so a longjmp (a guest
- * exit()) does not jump over this function's C++ locals. */
-static std::string perl_call_body(pTHX_ const char *sub_name, const char *args_json) {
+/* How run_glue shapes the glue sub's return list into the ok payload. */
+enum GlueShape {
+    SHAPE_LIST,        /* node list of every returned value */
+    SHAPE_NODE,        /* one node (undef node when the list is empty) */
+    SHAPE_I64,         /* i64 of the first returned value */
+    SHAPE_EMPTY,       /* nothing */
+    SHAPE_EXISTS_NODE, /* u8 flag (first value) + node (second, or undef) */
+};
+
+/* What run_glue calls. */
+enum GlueTarget {
+    TARGET_NAMED,  /* call_pv(name): the handle (if any) is an argument */
+    TARGET_CODE,   /* call_sv(handle's RV): the handle is the CALLEE */
+    TARGET_METHOD, /* call_method(name): the handle is the invocant */
+    TARGET_OP,     /* call_sv(g_op_cv[op]): the handle is the first argument */
+};
+
+/* GlueCall describes one operation. Lead arguments are DESCRIPTORS, not
+ * SVs: run_glue_body materialises them inside its own SAVETMPS scope so
+ * every mortal it creates is reclaimed by its own FREETMPS (an SV made
+ * outside that scope would sit on the tmps stack forever — the bridge entry
+ * points have no surrounding FREETMPS). Push order: handle, integer, key
+ * node, then the trailing node list. */
+struct GlueCall {
+    GlueTarget target;
+    const char *name;      /* TARGET_NAMED: sub name; TARGET_METHOD: method */
+    int op;                /* TARGET_OP: g_op_cv index */
+    I32 gimme;             /* G_LIST or G_SCALAR for the target call */
+    uint64_t harg;         /* registry handle (role depends on target) */
+    bool has_harg;
+    bool has_iarg;         /* integer argument (array index) */
+    int64_t iarg;
+    const char *karg;      /* one key node (may be NULL) */
+    uint32_t karg_len;
+    const char *nodes;     /* trailing node-list buffer ([u32 count] nodes) */
+    uint32_t nodes_len;    /* 0 = no trailing arguments */
+    GlueShape shape;
+};
+
+/* run_glue_body: the half that runs under the JMPENV (its C++ locals leak
+ * only on the exit longjmp, which tears the call down anyway). */
+static std::string run_glue_body(pTHX_ const GlueCall &gc) {
+    SV *hsv = nullptr;
+    if (gc.has_harg) {
+        hsv = reg_lookup(gc.harg);
+        if (!hsv) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "stale Perl reference handle %llu",
+                     static_cast<unsigned long long>(gc.harg));
+            return env_die(buf);
+        }
+    }
     dSP;
-
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
-    EXTEND(SP, 2);
-    mPUSHs(newSVpv(sub_name, 0));
-    mPUSHs(newSVpv(args_json && *args_json ? args_json : "[]", 0));
+    /* TARGET_CODE's handle is the callee, not an argument. */
+    if (hsv && gc.target != TARGET_CODE) XPUSHs(hsv);
+    if (gc.has_iarg) mXPUSHs(newSViv(static_cast<IV>(gc.iarg)));
+    if (gc.karg) {
+        NodeReader kr(gc.karg, gc.karg_len);
+        std::string kerr;
+        SV *ksv = decode_node(aTHX_ kr, kerr);
+        if (!ksv) {
+            PUTBACK;
+            FREETMPS;
+            LEAVE;
+            return env_die(kerr.empty() ? "malformed key node" : kerr);
+        }
+        XPUSHs(ksv);
+    }
+    if (gc.nodes_len) {
+        NodeReader r(gc.nodes, gc.nodes_len);
+        uint32_t count = r.get_u32();
+        std::string derr;
+        for (uint32_t i = 0; i < count; i++) {
+            if (r.fail) break;
+            /* NODE_FLATTEN expands to the aggregate's contents — Perl's own
+             * list-flattening calling convention for @array / %hash args. */
+            if (r.p < r.end && *r.p == NODE_FLATTEN) {
+                r.get_u8();
+                uint64_t id = r.get_u64();
+                SV *rv = r.fail ? nullptr : reg_lookup(id);
+                if (!rv) { r.fail = true; derr = "stale Perl reference handle"; break; }
+                SV *ref = SvRV(rv);
+                if (SvTYPE(ref) == SVt_PVAV) {
+                    AV *av = (AV *)ref;
+                    SSize_t n = av_top_index(av) + 1;
+                    for (SSize_t k = 0; k < n; k++) {
+                        SV **elt = av_fetch(av, k, 0);
+                        XPUSHs(elt ? *elt : &PL_sv_undef);
+                    }
+                } else if (SvTYPE(ref) == SVt_PVHV) {
+                    HV *hv = (HV *)ref;
+                    hv_iterinit(hv);
+                    HE *he;
+                    while ((he = hv_iternext(hv)) != nullptr) {
+                        XPUSHs(hv_iterkeysv(he));
+                        XPUSHs(HeVAL(he));
+                    }
+                } else {
+                    r.fail = true;
+                    derr = "flatten argument is not an ARRAY or HASH reference";
+                    break;
+                }
+                continue;
+            }
+            SV *sv = decode_node(aTHX_ r, derr);
+            if (!sv) { r.fail = true; break; }
+            XPUSHs(sv);
+        }
+        if (r.fail) {
+            PUTBACK;
+            FREETMPS;
+            LEAVE;
+            return env_die(derr.empty() ? "malformed argument buffer" : derr);
+        }
+    }
     PUTBACK;
 
-    /* G_EVAL: a die inside the sub (or the JSON decode) lands in ERRSV instead
-     * of longjmp'ing past us. The dispatcher runs the target sub in list
-     * context internally and returns ONE scalar (the encoded result array). */
-    int count = call_pv("__plwasm_call_dispatch", G_SCALAR | G_EVAL);
+    int count;
+    switch (gc.target) {
+    case TARGET_NAMED:
+        count = call_pv(gc.name, gc.gimme | G_EVAL);
+        break;
+    case TARGET_CODE:
+        count = call_sv(hsv, gc.gimme | G_EVAL);
+        break;
+    case TARGET_METHOD:
+        count = call_method(gc.name, gc.gimme | G_EVAL);
+        break;
+    default: /* TARGET_OP */
+        count = call_sv((SV *)g_op_cv[gc.op], gc.gimme | G_EVAL);
+        break;
+    }
     SPAGAIN;
 
-    std::string encoded;
-    bool ok = true;
-    std::string err;
+    std::string out;
     if (SvTRUE(ERRSV)) {
-        ok = false;
-        err = sv_to_std(aTHX_ ERRSV);
-        if (count > 0) (void)POPs; /* discard the undef the failed call left */
-    } else if (count > 0) {
-        SV *sv = POPs;
-        encoded = sv_to_std(aTHX_ sv);
+        out = env_die(sv_to_std(aTHX_ ERRSV));
+        SP -= count; /* discard whatever the failed call left */
+    } else {
+        SV **items = SP - count + 1;
+        put_u8(out, ENV_OK);
+        switch (gc.shape) {
+        case SHAPE_LIST:
+            encode_list(aTHX_ items, count, out);
+            break;
+        case SHAPE_NODE:
+            if (count > 0) encode_sv(aTHX_ items[0], out);
+            else put_u8(out, NODE_UNDEF);
+            break;
+        case SHAPE_I64: {
+            int64_t v = count > 0 ? static_cast<int64_t>(SvIV(items[0])) : 0;
+            put_i64(out, v);
+            break;
+        }
+        case SHAPE_EMPTY:
+            break;
+        case SHAPE_EXISTS_NODE: {
+            bool exists = count > 0 && SvTRUE(items[0]);
+            put_u8(out, exists ? 1 : 0);
+            if (exists && count > 1) encode_sv(aTHX_ items[1], out);
+            else put_u8(out, NODE_UNDEF);
+            break;
+        }
+        }
+        SP -= count;
     }
     PUTBACK;
     FREETMPS;
     LEAVE;
-
-    if (!ok) return call_error_json(err);
-    std::string j = "{\"ok\":true,\"result\":";
-    /* `encoded` is already JSON (the dispatcher's encode(\@ret)); embed raw. */
-    j += encoded.empty() ? "[]" : encoded;
-    j += ",\"error\":\"\"}";
-    return j;
+    return out;
 }
 
-std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
-    if (!g_my_perl || h == 0) return call_error_json("no interpreter");
-    if (!sub_name || !*sub_name) return call_error_json("empty sub name");
-    PERL_SET_CONTEXT(g_my_perl);
-    dTHX;
-
+static std::string run_glue(pTHX_ const GlueCall &gc) {
     /* Catch a guest exit(): my_exit unwinds with JMPENV_JUMP(2), and without
-     * a live JMPENV here it would fall through to the C exit() - a wasi
+     * a live JMPENV here it would fall through to the C exit() — a wasi
      * proc_exit that aborts the wasm mid-call, before PerlIO ever flushes.
      * Mirroring perl_run's own catch (perl.c), the exit unwinds cleanly back
      * to this frame, the interpreter stays destructible (flush + END blocks
-     * run at perl_close), and the status is reported in the envelope's
-     * "exit" field for the host to turn into a process exit. */
+     * run at perl_close), and the status is reported in the exit envelope
+     * for the host to turn into a process exit. */
     dJMPENV;
     int jmp;
     I32 oldscope = PL_scopestack_ix;
@@ -849,7 +1366,7 @@ std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
     JMPENV_PUSH(jmp);
     switch (jmp) {
     case 0:
-        out = perl_call_body(aTHX_ sub_name, args_json);
+        out = run_glue_body(aTHX_ gc);
         break;
     case 2: { /* my_exit() */
         while (PL_scopestack_ix > oldscope)
@@ -860,18 +1377,299 @@ std::string perl_call(uint64_t h, const char *sub_name, const char *args_json) {
             SvREFCNT_dec(PL_curstash);
             PL_curstash = (HV *)SvREFCNT_inc(PL_defstash);
         }
-        char buf[64];
-        std::snprintf(buf, sizeof(buf),
-                      "{\"ok\":false,\"result\":[],\"exit\":%d,\"error\":\"\"}",
-                      (int)STATUS_EXIT);
-        out = buf;
+        out.clear();
+        put_u8(out, ENV_EXIT);
+        put_u32(out, static_cast<uint32_t>(static_cast<int32_t>(STATUS_EXIT)));
         break;
     }
     default:
-        out = call_error_json("perl_call: unexpected longjmp");
+        out = env_die("unexpected longjmp");
         break;
     }
     JMPENV_POP;
+    return out;
+}
+
+/* ready() guards every entry point below. */
+static bool ready(uint64_t h, std::string *err_out) {
+    if (g_my_perl && h != 0) return true;
+    *err_out = env_die("no interpreter");
+    return false;
+}
+
+std::string perl_call(uint64_t h, const char *sub_name,
+                      const char *args, uint32_t args_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    if (!sub_name || !*sub_name) return env_die("empty sub name");
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_NAMED;
+    gc.name = sub_name;
+    gc.gimme = G_LIST;
+    gc.nodes = args;
+    gc.nodes_len = args_len;
+    gc.shape = SHAPE_LIST;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_invoke(uint64_t h, uint64_t code, uint32_t want_scalar,
+                        const char *args, uint32_t args_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_CODE;
+    gc.gimme = want_scalar ? G_SCALAR : G_LIST;
+    gc.harg = code;
+    gc.has_harg = true;
+    gc.nodes = args;
+    gc.nodes_len = args_len;
+    gc.shape = SHAPE_LIST;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_method_call(uint64_t h, uint64_t obj, const char *method,
+                             const char *args, uint32_t args_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    if (!method || !*method) return env_die("empty method name");
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_METHOD;
+    gc.name = method;
+    gc.gimme = G_LIST;
+    gc.harg = obj;
+    gc.has_harg = true;
+    gc.nodes = args;
+    gc.nodes_len = args_len;
+    gc.shape = SHAPE_LIST;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_deref(uint64_t h, uint64_t ref) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_DEREF;
+    gc.gimme = G_SCALAR;
+    gc.harg = ref;
+    gc.has_harg = true;
+    gc.shape = SHAPE_NODE;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_array_len(uint64_t h, uint64_t av) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_ALEN;
+    gc.gimme = G_SCALAR;
+    gc.harg = av;
+    gc.has_harg = true;
+    gc.shape = SHAPE_I64;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_array_get(uint64_t h, uint64_t av, int64_t idx) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_AGET;
+    gc.gimme = G_SCALAR;
+    gc.harg = av;
+    gc.has_harg = true;
+    gc.has_iarg = true;
+    gc.iarg = idx;
+    gc.shape = SHAPE_NODE;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_array_set(uint64_t h, uint64_t av, int64_t idx,
+                           const char *val, uint32_t val_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    /* Wrap the single value node as a one-element list for the driver. */
+    std::string one;
+    put_u32(one, 1);
+    one.append(val ? val : "", val_len);
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_ASET;
+    gc.gimme = G_LIST;
+    gc.harg = av;
+    gc.has_harg = true;
+    gc.has_iarg = true;
+    gc.iarg = idx;
+    gc.nodes = one.data();
+    gc.nodes_len = static_cast<uint32_t>(one.size());
+    gc.shape = SHAPE_EMPTY;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_array_push(uint64_t h, uint64_t av,
+                            const char *vals, uint32_t vals_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_APUSH;
+    gc.gimme = G_LIST;
+    gc.harg = av;
+    gc.has_harg = true;
+    gc.nodes = vals;
+    gc.nodes_len = vals_len;
+    gc.shape = SHAPE_EMPTY;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_array_values(uint64_t h, uint64_t av) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_AVALS;
+    gc.gimme = G_LIST;
+    gc.harg = av;
+    gc.has_harg = true;
+    gc.shape = SHAPE_LIST;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_hash_get(uint64_t h, uint64_t hv,
+                          const char *key, uint32_t key_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_HGET;
+    gc.gimme = G_LIST;
+    gc.harg = hv;
+    gc.has_harg = true;
+    gc.karg = key;
+    gc.karg_len = key_len;
+    gc.shape = SHAPE_EXISTS_NODE;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_hash_set(uint64_t h, uint64_t hv,
+                          const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    std::string one;
+    put_u32(one, 1);
+    one.append(val ? val : "", val_len);
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_HSET;
+    gc.gimme = G_LIST;
+    gc.harg = hv;
+    gc.has_harg = true;
+    gc.karg = key;
+    gc.karg_len = key_len;
+    gc.nodes = one.data();
+    gc.nodes_len = static_cast<uint32_t>(one.size());
+    gc.shape = SHAPE_EMPTY;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_hash_delete(uint64_t h, uint64_t hv,
+                             const char *key, uint32_t key_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_HDEL;
+    gc.gimme = G_LIST;
+    gc.harg = hv;
+    gc.has_harg = true;
+    gc.karg = key;
+    gc.karg_len = key_len;
+    gc.shape = SHAPE_EMPTY;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_hash_keys(uint64_t h, uint64_t hv) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_HKEYS;
+    gc.gimme = G_LIST;
+    gc.harg = hv;
+    gc.has_harg = true;
+    gc.shape = SHAPE_LIST;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_new_array(uint64_t h, const char *vals, uint32_t vals_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_NEWA;
+    gc.gimme = G_SCALAR;
+    gc.nodes = vals;
+    gc.nodes_len = vals_len;
+    gc.shape = SHAPE_NODE;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_new_hash(uint64_t h, const char *pairs, uint32_t pairs_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    GlueCall gc{};
+    gc.target = TARGET_OP;
+    gc.op = GOP_NEWH;
+    gc.gimme = G_SCALAR;
+    gc.nodes = pairs;
+    gc.nodes_len = pairs_len;
+    gc.shape = SHAPE_NODE;
+    return run_glue(aTHX_ gc);
+}
+
+std::string perl_release(uint64_t h, const char *ids, uint32_t ids_len) {
+    std::string err;
+    if (!ready(h, &err)) return err;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    /* Dropping the last pin can run DESTROY; die semantics there follow
+     * plain Perl (fatal outside eval), like refcount drops anywhere else. */
+    NodeReader r(ids, ids_len);
+    while (r.p + 8 <= r.end) reg_release(aTHX_ r.get_u64());
+    std::string out;
+    put_u8(out, ENV_OK);
     return out;
 }
 
