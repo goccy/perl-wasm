@@ -2,8 +2,8 @@
   "version": "1.0",
   "upstream": {
     "path": "./perl5",
-    "commit": "b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed",
-    "branch": "v5.42.2"
+    "commit": "e634cc838fb1785dfafb5d13b52807ea16b5c52c",
+    "branch": "v5.44.0"
   },
   "project": {
     "name": "perl",
@@ -62,12 +62,14 @@
   },
   "bridge": {
     "CustomBridgeSources": [
-      "perl.cc"
+      "perl.cc",
+      "perl_wasi.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl;perl",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
     "HostSockets": true,
     "HostSubprocess": true,
+    "HostFS": true,
     "StackSize": 8388608,
     "ExportFunctions": [
       "perl_new",
@@ -79,5 +81,24 @@
       "perl_register_native_xs",
       "perl_xs_helper"
     ]
+  },
+  "phases": {
+    "gen-proto": {
+      "completed_at": "2026-08-31T03:39:38Z",
+      "upstream_commit": "e634cc838fb1785dfafb5d13b52807ea16b5c52c",
+      "output_files": [
+        "proto/perl.proto",
+        "proto/wasmify/options.proto",
+        "bridge/api_bridge.cc",
+        "bridge/api_bridge.h"
+      ]
+    },
+    "parse-headers": {
+      "completed_at": "2026-08-31T03:39:38Z",
+      "upstream_commit": "e634cc838fb1785dfafb5d13b52807ea16b5c52c",
+      "output_files": [
+        "api-spec.json"
+      ]
+    }
   }
 }

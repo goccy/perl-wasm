@@ -33,7 +33,7 @@ PERL="$HERE/perl5"
 : "${WASI_SDK_PATH:=$HOME/.config/wasmify/bin/wasi-sdk}"
 SYSROOT="$WASI_SDK_PATH/share/wasi-sysroot"
 # wasi-sdk emulation opt-in defines (paired with -lwasi-emulated-* at link).
-WASI_EMU='-D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID'
+WASI_EMU='-D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID -DPERL_WASI_SPAWN -DPERL_WASI_SELECT'
 # Force-include prototypes for POSIX functions wasi-libc guards out but Perl's
 # core references (dup/exec/kill/... — see the header). Absolute path, baked
 # into config.sh (regenerated per host, so CI-portable).
@@ -292,6 +292,16 @@ d_pthreads_created_joinable='undef'
 #
 # Only what NEITHER wasi NOR wasmify provides is disabled below.
 
+# The base config predates getaddrinfo, but wasmify's host-sockets shim
+# implements getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo (names
+# resolved by the host). Socket.xs only calls the real resolver under
+# HAS_GETADDRINFO — its fallback emulates it over gethostbyname, which has
+# no wasm implementation — so DNS (and with it HTTP::Tiny, cpanm's index
+# lookups, ...) needs these on.
+d_getaddrinfo='define'
+d_getnameinfo='define'
+d_gai_strerror='define'
+
 # vfork / raw syscall / wait4: no wasmify stub. Perl falls back (fork; no
 # syscall; waitpid instead of wait4).
 d_vfork='undef'
@@ -413,6 +423,82 @@ echo "== canonicalised $CONFIG (deduped to last-wins per key)"
 # existing config.sh: it writes config.h, Makefile, and the other generated
 # build files, and does NOT re-probe the (unrunnable) target.
 cd "$PERL"
+
+# ---- fork-free subprocess routing (PERL_WASI_SPAWN) -------------------------
+# WASI cannot fork. The runtime provides posix_spawn/waitpid/pipe, so:
+#   - Perl_my_popen / Perl_my_popen_list return the spawn-based versions
+#     implemented in the bridge (wasi_spawn_popen*); my_pclose stays stock
+#     (it only waitpids the pid recorded in PL_fdpid).
+#   - pp_system takes its non-fork branch, whose system(3) the bridge
+#     implements over posix_spawn.
+# Applied at configure time; idempotent (a marker guards each file), so a
+# re-run over an already-patched tree is a no-op.
+python3 - <<'PYPATCH'
+def patch(path, edits):
+    t = open(path).read()
+    if "PERL_WASI_SPAWN" in t or "PERL_WASI_SELECT" in t:
+        print(f"wasi-spawn routing already present in {path}")
+        return
+    for anchor, replacement, expect in edits:
+        n = t.count(anchor)
+        assert n >= expect, (path, anchor[:60], n)
+        t = t.replace(anchor, replacement)
+    open(path, "w").write(t)
+
+a = "PerlIO *\nPerl_my_popen_list(pTHX_ const char *mode, int n, SV **args)\n{\n"
+b = "PerlIO *\nPerl_my_popen(pTHX_ const char *cmd, const char *mode)\n{\n"
+patch("util.c", [
+    (a, a + "#ifdef PERL_WASI_SPAWN\n    extern PerlIO *wasi_spawn_popen_list(pTHX_ const char *mode, int n, SV **args);\n    return wasi_spawn_popen_list(aTHX_ mode, n, args);\n#endif\n", 1),
+    # the fork version plus platform-alternative bodies
+    (b, b + "#ifdef PERL_WASI_SPAWN\n    extern PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode);\n    return wasi_spawn_popen(aTHX_ cmd, mode);\n#endif\n", 1),
+])
+c = "#if (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defined(OS2)"
+# pp_sselect passes Perl's select bit vectors directly as fd_set, which is
+# only correct where fd_set is that bitmask; wasi-libc's fd_set is a
+# {count, fd array} struct. Route the call through the bridge's converter.
+d = "#ifdef PERL_IRIX5_SELECT_TIMEVAL_VOID_CAST"
+# The fork-pipe (open FH, "-|") emulation resumes the open statement when
+# the child branch execs or exits; the hooks live in the bridge
+# (wasi_vfork_* in perl.cc) and return NULL outside a child phase.
+e = "PP_wrapped(pp_exec, 0, 1)\n{\n    dSP; dMARK; dORIGMARK; dTARGET;\n    I32 value;\n"
+g = "PP_wrapped(pp_fork, 0, 0)\n{\n#ifdef HAS_FORK\n    dSP; dTARGET;\n    Pid_t childpid;\n"
+patch("pp_sys.c", [
+    (g, g + "#ifdef PERL_WASI_SPAWN\n"
+        "    {\n"
+        "        extern OP *wasi_vfork_fork(pTHX);\n"
+        "        OP *o = wasi_vfork_fork(aTHX);\n"
+        "        if (o) return o;\n"
+        "    }\n"
+        "#endif\n", 1),
+    (c, "#if (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defined(OS2) && !defined(PERL_WASI_SPAWN)", 1),
+    (d, "#ifdef PERL_WASI_SELECT\n"
+        "    {\n"
+        "        extern int wasi_bitvec_select(int nbits, char *rbits, char *wbits, char *ebits, struct timeval *tbuf);\n"
+        "        nfound = wasi_bitvec_select(maxlen * 8, fd_sets[1], fd_sets[2], fd_sets[3], tbuf);\n"
+        "    }\n"
+        "#elif defined(PERL_IRIX5_SELECT_TIMEVAL_VOID_CAST)", 1),
+    (e, e + "#ifdef PERL_WASI_SPAWN\n"
+        "    {\n"
+        "        extern OP *wasi_vfork_exec(pTHX_ SV **mark, SV **sp, int stacked);\n"
+        "        OP *o = wasi_vfork_exec(aTHX_ MARK, SP, (PL_op->op_flags & OPf_STACKED) != 0);\n"
+        "        if (o) return o;\n"
+        "    }\n"
+        "#endif\n", 1),
+])
+f = "    PL_exit_flags |= PERL_EXIT_EXPECTED;\n    my_exit(anum);\n"
+patch("pp_ctl.c", [
+    (f, "    PL_exit_flags |= PERL_EXIT_EXPECTED;\n"
+        "#ifdef PERL_WASI_SPAWN\n"
+        "    {\n"
+        "        extern OP *wasi_vfork_exit(pTHX_ int status);\n"
+        "        OP *o = wasi_vfork_exit(aTHX_ (int)anum);\n"
+        "        if (o) return o;\n"
+        "    }\n"
+        "#endif\n"
+        "    my_exit(anum);\n", 1),
+])
+print("wasi-spawn source routing applied")
+PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of
 # the core *.o files, so a flag change alone would leave stale objects that
