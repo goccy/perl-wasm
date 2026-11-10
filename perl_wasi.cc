@@ -281,16 +281,12 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     return 0;
 }
 
-/* Set when the process ran exec: the command's exit is this process's
- * exit, and a replaced process image runs neither END blocks nor
- * destructors. perl_close consults it. */
-static bool wasi_exec_ran = false;
-extern "C" int wasi_exited_through_exec(void) { return wasi_exec_ran ? 1 : 0; }
-
 /* pp_exec (configure patch). A process image cannot be replaced, so exec
  * runs the command with this process's current fds and environment, waits
- * for it, and exits with its status. Returns only when the command could
- * not be started, with errno set. */
+ * for it, and ends the process with the command's status — through _exit,
+ * because a replaced program runs neither END blocks nor destructors, and
+ * nothing of the interpreter may run once its descriptors are gone.
+ * Returns only when the command could not be started, with errno set. */
 extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
     const char *what;
@@ -333,16 +329,15 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
      * own stdio. A peer waiting for end-of-file on one of them (the status
      * pipe IPC::Open3 reads to learn that exec succeeded) must not wait
      * until the command ends. */
-    wasi_exec_ran = true;
     wasi_host_fd_closefrom(0);
     int status = 0;
     pid_t r;
     do {
         r = waitpid(pid, &status, 0);
     } while (r == -1 && errno == EINTR);
-    if (r == -1) my_exit(255);
+    if (r == -1) _exit(255);
     /* a command killed by a signal reports the shell's 128+signal */
-    my_exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status));
+    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status));
 }
 
 extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {

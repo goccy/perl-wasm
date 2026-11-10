@@ -1155,19 +1155,11 @@ std::string perl_eval(uint64_t h, const char *src) {
     return out;
 }
 
-extern "C" int wasi_exited_through_exec(void);
 extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out);
 
 void perl_close(uint64_t h) {
     if (!g_my_perl || h == 0) return;
     PERL_SET_CONTEXT(g_my_perl);
-    if (wasi_exited_through_exec()) {
-        /* exec replaced the program: like a replaced process image, the
-         * interpreter runs neither END blocks nor destructors. Its output
-         * was flushed before the command started. */
-        g_my_perl = nullptr;
-        return;
-    }
     {
         dTHX;
         reg_clear(aTHX); /* drop registry pins so destruct sees true counts */
