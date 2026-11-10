@@ -1146,9 +1146,19 @@ std::string perl_eval(uint64_t h, const char *src) {
     return out;
 }
 
+extern "C" int wasi_exited_through_exec(void);
+extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out);
+
 void perl_close(uint64_t h) {
     if (!g_my_perl || h == 0) return;
     PERL_SET_CONTEXT(g_my_perl);
+    if (wasi_exited_through_exec()) {
+        /* exec replaced the program: like a replaced process image, the
+         * interpreter runs neither END blocks nor destructors. Its output
+         * was flushed before the command started. */
+        g_my_perl = nullptr;
+        return;
+    }
     {
         dTHX;
         reg_clear(aTHX); /* drop registry pins so destruct sees true counts */
@@ -1159,6 +1169,16 @@ void perl_close(uint64_t h) {
     g_my_perl = nullptr;
     /* PERL_SYS_TERM is intentionally NOT called here: it is process teardown,
      * and the instance may create a fresh interpreter afterwards. */
+}
+
+uint32_t perl_fork_child(uint64_t h, int32_t pid) {
+    if (!g_my_perl || h == 0) return UINT32_MAX;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    int status = 0;
+    if (wasi_fork_child_run(aTHX_ static_cast<int>(pid), &status) != 0)
+        return UINT32_MAX;
+    return static_cast<uint32_t>(status) & 0xff;
 }
 
 uint32_t perl_interrupt_addr(uint64_t h) {

@@ -11,6 +11,7 @@
 #include <perl.h>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -80,187 +81,283 @@ static PerlIO *wasi_spawn_finish(pTHX_ int parent_fd, const char *mode,
     return fp;
 }
 
-/* ---- fork emulation by statement replay ----------------------------------
- * The fork-then-exec idioms — my $pid = open FH, "-|" (child execs, parent
- * reads its output) and my $pid = fork (child redirects stdio and execs,
- * parent waitpids) — are how the CPAN toolchain (Module::Build's
- * _backticks, cpanm's run) drives subprocesses. WASI has no fork, but
- * both idioms carry a vfork-shaped contract: the child only adjusts fds
- * and then execs (or exits). That contract can be met without fork by a
- * statement replay:
+/* ---- fork as a pseudo-process ---------------------------------------------
+ * WASI has no fork, by design: process creation is spawn-shaped (see
+ * above). fork therefore cannot be a system call here; it is emulated one
+ * layer up, the way perl itself emulates it on Windows (perlfork): the
+ * interpreter is duplicated and the duplicate carries on as the child.
  *
- *   1. Arming (my_popen("-"), or the pp_fork hook): record the COP of
- *      the forking statement plus the context/savestack depths, save the
- *      stdio fds (a fork child's redirections must not survive into the
- *      parent), and return the CHILD result (pid 0). The program
- *      continues into its child branch in-process. The pipe-open form
- *      also creates the pipe and points the guest's stdout (or stdin)
- *      at it, so the child sees the fds a fork child would.
- *   2. When the child branch execs, the hook pp_exec calls (the
- *      configure patch inserts it) spawns the command against the
- *      guest's current fds, restores the saved stdio, unwinds any scopes
- *      the child branch entered (the same machinery die uses), and
- *      resumes execution AT THE FORKING STATEMENT's COP.
- *   3. The statement re-runs; the arming site now returns the PARENT
- *      result — the spawned pid (fork), or the other pipe end with the
- *      pid in PL_fdpid (pipe-open) — and the parent branch runs.
+ * The duplication is done by the host. proc_fork snapshots this
+ * instance's whole linear memory into a NEW instance (with a copy of the
+ * fd table whose slots share the parent's open descriptors, as fork's
+ * do) and returns the child's pid here, in the parent. The new instance
+ * holds an exact copy of the interpreter — heap, perl stacks, the very op
+ * that was forking — but no native call stack: nothing is "inside"
+ * pp_fork there. So the host starts the child through
+ * wasi_fork_child_run, which finishes the forking op by hand (pushes the
+ * child's result, 0) and runs a fresh run loop from the next op, exactly
+ * what win32's fork emulation does after perl_clone. The child ends when
+ * that run loop ends or the program exits.
  *
- * A child branch that exits instead of execing is emulated with a shell
- * child carrying the exit status. As with real vfork, a child branch
- * that neither execs nor exits (or that expects copied state) is outside
- * the contract: it keeps running with $pid == 0. */
-enum { WASI_VFORK_FORK = 0, WASI_VFORK_POPEN = 1 };
+ * Two consequences of the missing native stack, both shared with perl's
+ * Windows emulation: a child forked while a nested run loop was active (a
+ * sort block, a BEGIN block, a tie or overload handler) exits when that
+ * nested level finishes instead of returning into C code; and exec in a
+ * child cannot replace a process image — it runs the command and exits
+ * with its status.
+ *
+ * wasi_fork_point is how the forking parent tells the child, through the
+ * copied memory, where and how to resume. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_fork")))
+extern "C" int wasi_host_proc_fork(int *pid_out);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_kill")))
+extern "C" int wasi_host_proc_kill(int pid, int sig);
+
+enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2 };
 static struct {
-    int phase; /* 0 idle; 1 child branch running; 2 replay pending */
     int kind;
-    OP *replay_op;
-    I32 cx_ix;
-    I32 ss_ix;
-    int parent_fd;
-    int child_fd;
-    char mode;
-    pid_t pid;
-    int saved_fd[3];
-} wasi_vfork;
+    OP *resume_op;
+    /* pipe-open only: the pipe end that becomes the child's stdio fd, the
+     * end the parent keeps, and the stack height pp_open returns at */
+    int child_end;
+    int parent_end;
+    int stdio_fd;
+    SSize_t return_sp;
+} wasi_fork_point;
 
-static void wasi_vfork_arm(pTHX_ int kind) {
-    wasi_vfork.kind = kind;
-    wasi_vfork.replay_op = (OP *)PL_curcop;
-    wasi_vfork.cx_ix = cxstack_ix;
-    wasi_vfork.ss_ix = PL_savestack_ix;
-    for (int i = 0; i < 3; i++) wasi_vfork.saved_fd[i] = dup(i);
-    wasi_vfork.phase = 1;
-    PL_forkprocess = 0;
+/* Set by pp_open just before do_open6 (configure patch): the stack height
+ * the op returns its result at. A pipe-open child needs it to finish
+ * pp_open without the C frame that held it. */
+extern "C" { SSize_t wasi_open_return_sp = 0; }
+
+/* A pseudo-process has the pid the host registered it under; the first
+ * process keeps libc's. */
+static pid_t wasi_self_pid = 0;
+static pid_t wasi_parent_pid = 0;
+
+extern "C" pid_t getpid(void) {
+    /* 42 is the value wasi-libc's emulated getpid reports; the first
+     * process keeps it so behaviour without fork is unchanged. */
+    return wasi_self_pid ? wasi_self_pid : 42;
 }
 
-static void wasi_vfork_restore_stdio(void) {
-    for (int i = 0; i < 3; i++) {
-        if (wasi_vfork.saved_fd[i] >= 0) {
-            dup2(wasi_vfork.saved_fd[i], i);
-            close(wasi_vfork.saved_fd[i]);
-            wasi_vfork.saved_fd[i] = -1;
-        }
+extern "C" pid_t getppid(void) {
+    return wasi_parent_pid ? wasi_parent_pid : 1;
+}
+
+extern "C" int kill(pid_t pid, int sig) {
+    if (pid == getpid()) {
+        if (sig == 0) return 0;
+        return raise(sig);
     }
+    int rc = wasi_host_proc_kill((int)pid, sig);
+    if (rc != 0) {
+        errno = rc < 0 ? -rc : rc;
+        return -1;
+    }
+    return 0;
 }
 
-/* Ends the child phase: records the spawned pid, restores stdio, unwinds
- * to the forking statement's depths, and returns its COP for the runloop
- * to re-enter. */
-static OP *wasi_vfork_resume(pTHX_ pid_t pid) {
-    wasi_vfork.pid = pid;
-    wasi_vfork.phase = 2;
-    /* anything the child branch printed must reach ITS fds (the pipe)
-     * before the parent's are restored */
-    PerlIO_flush(NULL);
-    wasi_vfork_restore_stdio();
-    if (cxstack_ix > wasi_vfork.cx_ix)
-        dounwind(wasi_vfork.cx_ix);
-    LEAVE_SCOPE(wasi_vfork.ss_ix);
-    return wasi_vfork.replay_op;
+/* Forks at the current op. Returns the child's pid, or -1 with errno set.
+ * Only the parent ever returns from this. */
+static pid_t wasi_fork_here(pTHX_ int kind) {
+    wasi_fork_point.kind = kind;
+    wasi_fork_point.resume_op = PL_op->op_next;
+    int pid = -1;
+    int rc = wasi_host_proc_fork(&pid);
+    wasi_fork_point.kind = WASI_FORK_NONE;
+    if (rc != 0) {
+        errno = rc < 0 ? -rc : rc;
+        return -1;
+    }
+    return (pid_t)pid;
 }
 
-/* Called at the top of pp_fork (configure patch): bare fork() arms a
- * child phase with unchanged fds; the replay of the same statement then
- * delivers the spawned pid to the parent branch. */
-extern "C" OP *wasi_vfork_fork(pTHX) {
-    if (wasi_vfork.phase == 1)
-        return NULL; /* fork inside a child branch: outside the contract */
+/* pp_fork (configure patch routes the whole op here). */
+extern "C" OP *wasi_fork(pTHX) {
     dSP;
     EXTEND(SP, 1);
-    if (wasi_vfork.phase == 2 && wasi_vfork.kind == WASI_VFORK_FORK) {
-        wasi_vfork.phase = 0;
-        PL_forkprocess = wasi_vfork.pid;
-        mPUSHi((IV)wasi_vfork.pid);
-        PUTBACK;
-        return NORMAL;
-    }
     PERL_FLUSHALL_FOR_CHILD;
-    wasi_vfork_arm(aTHX_ WASI_VFORK_FORK);
-    wasi_vfork.parent_fd = wasi_vfork.child_fd = -1;
-    wasi_vfork.mode = 0;
-    mPUSHi(0);
+    PUTBACK; /* the snapshot must see the stack as the op found it */
+    pid_t pid = wasi_fork_here(aTHX_ WASI_FORK_OP);
+    if (pid < 0) {
+        PUSHs(&PL_sv_undef);
+    } else {
+        PERL_SRAND_OVERRIDE_NEXT_PARENT();
+        mPUSHi((IV)pid);
+    }
     PUTBACK;
     return NORMAL;
 }
 
-/* Called at the top of pp_exec (configure patch). Outside a child phase
- * it returns NULL and pp_exec proceeds normally; inside one it spawns
- * the command wired to the fork-pipe and resumes the open statement. */
-extern "C" OP *wasi_vfork_exec(pTHX_ SV **mark, SV **sp, int stacked) {
-    if (wasi_vfork.phase != 1)
-        return NULL;
-    /* The child branch may have redirected fds 0/1/2 (the arming site
-     * pointed them at the pipe for pipe-opens; cpanm's fork children
-     * re-open them onto its log): the spawn's stdio defaults follow the
-     * guest's CURRENT fds, which is exactly the fork-child picture. */
+/* Runs a forked child to its end. Called by the host on the NEW instance,
+ * once, before anything else runs there. Returns 0 with the child's exit
+ * status in *status_out, or -1 when this instance is not a fork child. */
+extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
+    const int kind = wasi_fork_point.kind;
+    if (kind == WASI_FORK_NONE) return -1;
+    wasi_fork_point.kind = WASI_FORK_NONE;
+
+    wasi_parent_pid = getpid();
+    wasi_self_pid = (pid_t)pid;
+
+    /* The jump environments the copied interpreter points at lived in
+     * native frames this instance does not have. */
+    PL_top_env = &PL_start_env;
+    /* What stock pp_fork does in the child. */
+    PL_sig_pending = 0;
+    if (PL_psig_pend)
+        for (int sig = 1; sig < SIG_SIZE; sig++) PL_psig_pend[sig] = 0;
+#ifdef PERL_USES_PL_PIDSTATUS
+    hv_clear(PL_pidstatus); /* no kids, so don't wait for 'em */
+#endif
+    PERL_SRAND_OVERRIDE_NEXT_CHILD();
+    PL_forkprocess = 0;
+
+    /* Finish the forking op as the child. */
+    {
+        dSP;
+        if (kind == WASI_FORK_PIPE_OPEN) {
+            /* my_popen's child half: the pipe end becomes stdin/stdout,
+             * and pp_open returns 0 ("we are a new child"). */
+            dup2(wasi_fork_point.child_end, wasi_fork_point.stdio_fd);
+            close(wasi_fork_point.child_end);
+            close(wasi_fork_point.parent_end);
+            SP = PL_stack_base + wasi_fork_point.return_sp;
+            XPUSHs(&PL_sv_zero);
+        } else {
+            mPUSHi(0);
+        }
+        PUTBACK;
+    }
+    PL_op = wasi_fork_point.resume_op;
+
+    /* From here this is perl_run's own shape (and win32_start_child's):
+     * run under a jump environment that fields exit and die. */
+    dJMPENV;
+    int ret;
+    JMPENV_PUSH(ret);
+    switch (ret) {
+    case 0:
+    redo_body:
+        if (PL_op) CALLRUNOPS(aTHX);
+        /* The program (or the nested level the fork happened in) ran to
+         * its end. */
+        my_exit(0);
+        NOT_REACHED; /* NOTREACHED */
+    case 2: /* my_exit() */
+        /* This frame is the bottom of the child: it owns every scope. */
+        while (PL_scopestack_ix > 1) LEAVE;
+        FREETMPS;
+        if (PL_curstash != PL_defstash) {
+            SvREFCNT_dec(PL_curstash);
+            PL_curstash = (HV *)SvREFCNT_inc(PL_defstash);
+        }
+        *status_out = (int)STATUS_EXIT;
+        break;
+    case 3: /* die */
+        if (PL_restartop) {
+            /* caught by an eval the child inherited: resume after it */
+            PL_restartjmpenv = NULL;
+            PL_op = PL_restartop;
+            PL_restartop = NULL;
+            goto redo_body;
+        }
+        /* The die unwound to the eval of the call the PARENT was started
+         * with, which has no continuation here: an uncaught die. */
+        PerlIO_printf(Perl_error_log, "%" SVf, SVfARG(ERRSV));
+        my_failure_exit();
+        NOT_REACHED; /* NOTREACHED */
+    default:
+        PerlIO_printf(Perl_error_log, "panic: fork child: unexpected jump %d\n", ret);
+        *status_out = 255;
+        break;
+    }
+    JMPENV_POP;
+    return 0;
+}
+
+/* Set when the process ran exec: the command's exit is this process's
+ * exit, and a replaced process image runs neither END blocks nor
+ * destructors. perl_close consults it. */
+static bool wasi_exec_ran = false;
+extern "C" int wasi_exited_through_exec(void) { return wasi_exec_ran ? 1 : 0; }
+
+/* pp_exec (configure patch). A process image cannot be replaced, so exec
+ * runs the command with this process's current fds and environment, waits
+ * for it, and exits with its status. Returns only when the command could
+ * not be started, with errno set. */
+extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
+    const char *what;
     if (!stacked && sp - mark == 1) {
         /* exec STRING: shell semantics */
-        pid = wasi_spawn_shell(SvPV_nolen(*sp), -1, -1);
+        what = SvPV_nolen(*sp);
+        pid = wasi_spawn_shell(what, -1, -1);
     } else {
         SV *really = NULL;
-        if (stacked)
-            really = *++mark;
+        if (stacked) really = *++mark;
         char **argv = (char **)malloc(sizeof(char *) * (size_t)(sp - mark + 1));
-        if (!argv)
-            return wasi_vfork_resume(aTHX_ -1);
+        if (!argv) {
+            errno = ENOMEM;
+            return;
+        }
         int out = 0;
         for (SV **p = mark + 1; p <= sp; p++) argv[out++] = SvPV_nolen(*p);
         argv[out] = NULL;
+        if (out == 0) {
+            free(argv);
+            errno = ENOENT;
+            return;
+        }
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
+        what = argv[0];
         pid = wasi_spawn_argv(argv, -1, -1);
         free(argv);
     }
     if (pid < 0) {
-        /* exec failure in a real fork child leaves the parent an empty
-         * pipe and a child that exited nonzero. */
-        pid = wasi_spawn_shell("exit 1", -1, -1);
+        const int e = errno;
+        Perl_ck_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s",
+                       what, Strerror(e));
+        errno = e;
+        return;
     }
-    return wasi_vfork_resume(aTHX_ pid);
-}
-
-/* Called by pp_exit just before my_exit (configure patch): an exit in
- * the child branch becomes a shell child carrying the status. */
-extern "C" OP *wasi_vfork_exit(pTHX_ int status) {
-    if (wasi_vfork.phase != 1)
-        return NULL;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "exit %d", status & 0xff);
-    return wasi_vfork_resume(aTHX_ wasi_spawn_shell(cmd, -1, -1));
+    int status = 0;
+    pid_t r;
+    do {
+        r = waitpid(pid, &status, 0);
+    } while (r == -1 && errno == EINTR);
+    wasi_exec_ran = true;
+    if (r == -1) my_exit(255);
+    /* a command killed by a signal reports the shell's 128+signal */
+    my_exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status));
 }
 
 extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
     if (*cmd == '-' && cmd[1] == '\0') {
-        if (wasi_vfork.phase == 2) {
-            /* the open statement replaying after the child phase */
-            wasi_vfork.phase = 0;
-            PL_forkprocess = wasi_vfork.pid;
-            return wasi_spawn_finish(aTHX_ wasi_vfork.parent_fd, mode,
-                                     wasi_vfork.pid);
-        }
-        if (wasi_vfork.phase != 0) {
-            errno = EAGAIN;
-            return NULL;
-        }
+        /* open(FH, "-|") / open(FH, "|-"): fork with a pipe between the
+         * parent's handle and the child's stdout / stdin. */
         PERL_FLUSHALL_FOR_CHILD;
         int p[2];
         if (pipe(p) < 0) return NULL;
         const bool rd = (*mode == 'r');
-        wasi_vfork_arm(aTHX_ WASI_VFORK_POPEN);
-        wasi_vfork.mode = *mode;
-        wasi_vfork.parent_fd = rd ? p[0] : p[1];
-        /* Point the guest's stdout (or stdin) at the pipe, like the fork
-         * child's fds would be: both a child branch that prints and the
-         * command it execs (whose spawn follows the current fds) write
-         * into the pipe. The saved fds restore the real stdio at resume. */
-        const int stdio_fd = rd ? 1 : 0;
-        dup2(rd ? p[1] : p[0], stdio_fd);
-        close(rd ? p[1] : p[0]);
-        wasi_vfork.child_fd = -1;
-        /* the child's handle, like a fork child's: a wrapper over its
-         * (now pipe-backed) stdio fd */
-        return PerlIO_fdopen(dup(stdio_fd), rd ? "w" : "r");
+        wasi_fork_point.child_end = rd ? p[1] : p[0];
+        wasi_fork_point.parent_end = rd ? p[0] : p[1];
+        wasi_fork_point.stdio_fd = rd ? 1 : 0;
+        wasi_fork_point.return_sp = wasi_open_return_sp;
+        pid_t pid = wasi_fork_here(aTHX_ WASI_FORK_PIPE_OPEN);
+        if (pid < 0) {
+            const int e = errno;
+            close(p[0]);
+            close(p[1]);
+            errno = e;
+            return NULL;
+        }
+        close(wasi_fork_point.child_end);
+        PL_forkprocess = pid;
+        return wasi_spawn_finish(aTHX_ wasi_fork_point.parent_end, mode, pid);
     }
     PERL_FLUSHALL_FOR_CHILD;
     int p[2];

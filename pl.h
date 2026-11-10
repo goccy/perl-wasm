@@ -261,4 +261,18 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
 
+/* Run a forked child to its end.
+ *
+ * fork is emulated the way perl emulates it on Windows: when the guest
+ * forks, the host duplicates the whole instance (the proc_fork host import)
+ * and the duplicate becomes the child. The host calls this once on the NEW
+ * instance, before any other entry point, with the pid it registered the
+ * child under. The call resumes the program right after the forking op,
+ * with fork's result being 0, and returns when the child's program ends.
+ *
+ * Returns the child's exit status (0..255), or UINT32_MAX when the instance
+ * is not a freshly forked child. perl_close must follow, as after an exit
+ * envelope: it flushes PerlIO and runs END blocks and destructors. */
+uint32_t perl_fork_child(uint64_t h, int32_t pid);
+
 #endif /* PERLEMBED_H */

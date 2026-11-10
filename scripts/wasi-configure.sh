@@ -457,17 +457,24 @@ c = "#if (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defin
 # only correct where fd_set is that bitmask; wasi-libc's fd_set is a
 # {count, fd array} struct. Route the call through the bridge's converter.
 d = "#ifdef PERL_IRIX5_SELECT_TIMEVAL_VOID_CAST"
-# The fork-pipe (open FH, "-|") emulation resumes the open statement when
-# the child branch execs or exits; the hooks live in the bridge
-# (wasi_vfork_* in perl.cc) and return NULL outside a child phase.
-e = "PP_wrapped(pp_exec, 0, 1)\n{\n    dSP; dMARK; dORIGMARK; dTARGET;\n    I32 value;\n"
+# fork is a pseudo-process (see "fork as a pseudo-process" in perl_wasi.cc):
+# pp_fork forks through the host, exec runs the command and exits with its
+# status, and pp_open records the stack height it returns at so a pipe-open
+# child can finish the op without the C frame that held it.
+e = ("    PERL_FLUSHALL_FOR_CHILD;\n"
+     "    if (PL_op->op_flags & OPf_STACKED) {\n"
+     "        SV * const really = *++MARK;\n"
+     "        value = (I32)do_aexec(really, MARK, SP);\n")
 g = "PP_wrapped(pp_fork, 0, 0)\n{\n#ifdef HAS_FORK\n    dSP; dTARGET;\n    Pid_t childpid;\n"
+o = "    tmps = SvPV_const(sv, len);\n    ok = do_open6(gv, tmps, len, NULL, MARK+1, (SP-MARK));\n"
 patch("pp_sys.c", [
     (g, g + "#ifdef PERL_WASI_SPAWN\n"
         "    {\n"
-        "        extern OP *wasi_vfork_fork(pTHX);\n"
-        "        OP *o = wasi_vfork_fork(aTHX);\n"
-        "        if (o) return o;\n"
+        "        extern OP *wasi_fork(pTHX);\n"
+        "        PERL_UNUSED_VAR(sp);\n"
+        "        PERL_UNUSED_VAR(targ);\n"
+        "        PERL_UNUSED_VAR(childpid);\n"
+        "        return wasi_fork(aTHX);\n"
         "    }\n"
         "#endif\n", 1),
     (c, "#if (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defined(OS2) && !defined(PERL_WASI_SPAWN)", 1),
@@ -477,25 +484,28 @@ patch("pp_sys.c", [
         "        nfound = wasi_bitvec_select(maxlen * 8, fd_sets[1], fd_sets[2], fd_sets[3], tbuf);\n"
         "    }\n"
         "#elif defined(PERL_IRIX5_SELECT_TIMEVAL_VOID_CAST)", 1),
-    (e, e + "#ifdef PERL_WASI_SPAWN\n"
-        "    {\n"
-        "        extern OP *wasi_vfork_exec(pTHX_ SV **mark, SV **sp, int stacked);\n"
-        "        OP *o = wasi_vfork_exec(aTHX_ MARK, SP, (PL_op->op_flags & OPf_STACKED) != 0);\n"
-        "        if (o) return o;\n"
-        "    }\n"
-        "#endif\n", 1),
-])
-f = "    PL_exit_flags |= PERL_EXIT_EXPECTED;\n    my_exit(anum);\n"
-patch("pp_ctl.c", [
-    (f, "    PL_exit_flags |= PERL_EXIT_EXPECTED;\n"
+    (e, "    PERL_FLUSHALL_FOR_CHILD;\n"
         "#ifdef PERL_WASI_SPAWN\n"
         "    {\n"
-        "        extern OP *wasi_vfork_exit(pTHX_ int status);\n"
-        "        OP *o = wasi_vfork_exit(aTHX_ (int)anum);\n"
-        "        if (o) return o;\n"
+        "        /* returns only when the command could not be started */\n"
+        "        extern void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked);\n"
+        "        wasi_exec(aTHX_ MARK, SP, (PL_op->op_flags & OPf_STACKED) != 0);\n"
+        "        SP = ORIGMARK;\n"
+        "        XPUSHi(0);\n"
+        "        RETURN;\n"
         "    }\n"
         "#endif\n"
-        "    my_exit(anum);\n", 1),
+        "    if (PL_op->op_flags & OPf_STACKED) {\n"
+        "        SV * const really = *++MARK;\n"
+        "        value = (I32)do_aexec(really, MARK, SP);\n", 1),
+    (o, "    tmps = SvPV_const(sv, len);\n"
+        "#ifdef PERL_WASI_SPAWN\n"
+        "    {\n"
+        "        extern SSize_t wasi_open_return_sp;\n"
+        "        wasi_open_return_sp = ORIGMARK - PL_stack_base;\n"
+        "    }\n"
+        "#endif\n"
+        "    ok = do_open6(gv, tmps, len, NULL, MARK+1, (SP-MARK));\n", 1),
 ])
 print("wasi-spawn source routing applied")
 PYPATCH
