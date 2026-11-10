@@ -94,7 +94,8 @@
       "perl_release",
       "perl_set_go_dispatcher",
       "perl_register_native_xs",
-      "perl_xs_helper"
+      "perl_xs_helper",
+      "perl_fork_child"
     ]
   },
   "phases": {

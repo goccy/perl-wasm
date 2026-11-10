@@ -114,7 +114,11 @@ void perl_close(uint64_t h);
  * The guest clears the flag when it fires. Addresses are 32-bit linear-memory
  * offsets (wasm32). Like CPython's eval-breaker, this only fires at opcode
  * boundaries: a single long-running op (a pathological regex, a big sort) is
- * not preempted until it returns to the run loop. */
+ * not preempted until it returns to the run loop.
+ *
+ * Storing 0x100 | signal instead delivers a terminating signal to the
+ * (pseudo-)process: no eval can catch it, and the program ends with exit
+ * status 128 + signal at the next opcode boundary. */
 uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
 
 /* Call the named Perl subroutine in list context. `sub_name` is a fully

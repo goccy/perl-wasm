@@ -346,12 +346,21 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
  * Perl_croak longjmps out to the nearest eval trap — for perl_eval that is the
  * `eval $src` inside the wrapper, so the eval returns ok=false with the message
  * in $@, exactly like a Perl-level die. Otherwise identical to
- * Perl_runops_standard (see run.c), plus the pp-hook dispatch above. */
+ * Perl_runops_standard (see run.c), plus the pp-hook dispatch above.
+ *
+ * A flag value with GOPERL_INTERRUPT_SIGNAL set is a terminating signal
+ * delivered to this (pseudo-)process: its low bits are the signal number.
+ * Unlike an interruption it cannot be caught by eval — the program ends as
+ * the shell would report a signal death, exit status 128+signal. */
+#define GOPERL_INTERRUPT_SIGNAL 0x100u
 static int runops_interruptible(pTHX) {
     OP *op = PL_op;
     while ((PL_op = op = goperl_exec_op(aTHX_ op))) {
         if (g_interrupt) {
+            const uint32_t flag = g_interrupt;
             g_interrupt = 0;
+            if (flag & GOPERL_INTERRUPT_SIGNAL)
+                my_exit(128 + (int)(flag & 0x7f));
             Perl_croak(aTHX_ "Perl execution interrupted");
         }
     }

@@ -114,6 +114,9 @@ extern "C" int wasi_host_proc_fork(int *pid_out);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_kill")))
 extern "C" int wasi_host_proc_kill(int pid, int sig);
 
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_closefrom")))
+extern "C" int wasi_host_fd_closefrom(int low_fd);
+
 enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2 };
 static struct {
     int kind;
@@ -324,12 +327,19 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         errno = e;
         return;
     }
+    /* The program is gone from here on: only the command remains. Give up
+     * every descriptor this process holds, as exec does for the
+     * close-on-exec ones (all but stdio, in perl) — the command has its
+     * own stdio. A peer waiting for end-of-file on one of them (the status
+     * pipe IPC::Open3 reads to learn that exec succeeded) must not wait
+     * until the command ends. */
+    wasi_exec_ran = true;
+    wasi_host_fd_closefrom(0);
     int status = 0;
     pid_t r;
     do {
         r = waitpid(pid, &status, 0);
     } while (r == -1 && errno == EINTR);
-    wasi_exec_ran = true;
     if (r == -1) my_exit(255);
     /* a command killed by a signal reports the shell's 128+signal */
     my_exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status));
