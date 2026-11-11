@@ -36,8 +36,11 @@
 
 extern char **environ;
 
+/* child_stdin / child_stdout / child_stderr name the fds of this process
+ * that become the command's fds 0 / 1 / 2; a negative one stands for this
+ * process's own fd of that number. */
 static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
-                             int child_stdout) {
+                             int child_stdout, int child_stderr = -1) {
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     /* Default the child's stdio to the guest's CURRENT fds 0/1/2, not the
@@ -47,7 +50,7 @@ static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
      * the interpreter stream. */
     posix_spawn_file_actions_adddup2(&fa, child_stdin >= 0 ? child_stdin : 0, 0);
     posix_spawn_file_actions_adddup2(&fa, child_stdout >= 0 ? child_stdout : 1, 1);
-    posix_spawn_file_actions_adddup2(&fa, 2, 2);
+    posix_spawn_file_actions_adddup2(&fa, child_stderr >= 0 ? child_stderr : 2, 2);
     pid_t pid = -1;
     /* perl runs commands with execvp: a bare name is looked up on PATH. */
     int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
@@ -67,6 +70,95 @@ static pid_t wasi_spawn_shell(const char *cmd, int child_stdin,
     argv[2] = (char *)cmd;
     argv[3] = NULL;
     return wasi_spawn_argv(argv, child_stdin, child_stdout);
+}
+
+/* Starts a command given as ONE string, by the rule of perl's own exec of a
+ * string (doio.c, Perl_do_exec3): a command without shell metacharacters is
+ * split into words and run directly — so that a command that does not
+ * exist is an error of the caller's (system returns -1 with $! set, a
+ * piped open fails) and not a shell's exit status 127 — and only a command
+ * that needs the shell goes to sh -c. As there:
+ *
+ *   - leading white space is skipped;
+ *   - ". file", "exec command" and a leading VAR=value go to the shell;
+ *   - a single trailing newline is dropped;
+ *   - a trailing " 2>&1" is honoured without a shell: the command's
+ *     stderr becomes its stdout;
+ *   - a file that cannot be executed as a program (ENOEXEC) is given to
+ *     the shell after all.
+ *
+ * Returns the pid, or -1 with errno set. A command with no word in it
+ * starts nothing: -1 with errno 0, and *blank set. */
+static pid_t wasi_spawn_command(const char *incmd, int child_stdin,
+                                int child_stdout, bool *blank) {
+    *blank = false;
+    while (*incmd && isSPACE(*incmd)) incmd++;
+    const size_t len = strlen(incmd);
+    char *cmd = (char *)malloc(len + 1);
+    char **argv = (char **)malloc(sizeof(char *) * (len / 2 + 2));
+    if (!cmd || !argv) {
+        free(cmd);
+        free(argv);
+        errno = ENOMEM;
+        return -1;
+    }
+    memcpy(cmd, incmd, len + 1);
+
+    bool shell = false;
+    int child_stderr = -1;
+    char *end = cmd + len; /* where the words end */
+    if ((*cmd == '.' && isSPACE(cmd[1])) || (strncmp(cmd, "exec", 4) == 0 && isSPACE(cmd[4]))) {
+        shell = true;
+    } else {
+        char *s = cmd;
+        while (isWORDCHAR(*s)) s++; /* catch VAR=val gizmo */
+        if (*s == '=') shell = true;
+    }
+    for (char *s = cmd; !shell && *s; s++) {
+        if (*s == ' ' || isALPHA(*s) || !memCHRs("$&*(){}[]'\";\\|?<>~`\n", *s)) continue;
+        if (*s == '\n' && !s[1]) {
+            end = s;
+            break;
+        }
+        /* the 2>&1 construct at the end */
+        if (*s == '>' && s[1] == '&' && s[2] == '1' && s > cmd + 1 && s[-1] == '2' &&
+            isSPACE(s[-2]) && (!s[3] || isSPACE(s[3]))) {
+            const char *t = s + 3;
+            while (*t && isSPACE(*t)) ++t;
+            if (!*t) {
+                child_stderr = child_stdout >= 0 ? child_stdout : 1;
+                end = s - 2;
+                break;
+            }
+        }
+        shell = true;
+    }
+
+    pid_t pid = -1;
+    if (!shell) {
+        *end = '\0';
+        char **a = argv;
+        for (char *s = cmd; *s;) {
+            while (isSPACE(*s)) s++;
+            if (*s) *(a++) = s;
+            while (*s && !isSPACE(*s)) s++;
+            if (*s) *s++ = '\0';
+        }
+        *a = NULL;
+        if (!argv[0]) {
+            *blank = true;
+            errno = 0;
+        } else {
+            pid = wasi_spawn_argv(argv, child_stdin, child_stdout, child_stderr);
+            if (pid < 0 && errno == ENOEXEC) shell = true; /* a script without #! */
+        }
+    }
+    if (shell) pid = wasi_spawn_shell(incmd, child_stdin, child_stdout);
+    const int e = errno;
+    free(cmd);
+    free(argv);
+    errno = e;
+    return pid;
 }
 
 /* Record the child pid under the stream's fd, the shape stock my_pclose
@@ -327,9 +419,11 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
     const char *what;
     if (!stacked && sp - mark == 1) {
-        /* exec STRING: shell semantics */
+        /* exec STRING */
+        bool blank = false;
         what = SvPV_nolen(*sp);
-        pid = wasi_spawn_shell(what, -1, -1);
+        pid = wasi_spawn_command(what, -1, -1, &blank);
+        if (blank) return; /* nothing to run: exec fails, as perl's does */
     } else {
         SV *really = NULL;
         if (stacked) really = *++mark;
@@ -404,11 +498,21 @@ extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
     int p[2];
     if (pipe(p) < 0) return NULL;
     const bool reading = (*mode == 'r');
-    pid_t pid = reading ? wasi_spawn_shell(cmd, -1, p[1])
-                        : wasi_spawn_shell(cmd, p[0], -1);
+    bool blank = false;
+    pid_t pid = reading ? wasi_spawn_command(cmd, -1, p[1], &blank)
+                        : wasi_spawn_command(cmd, p[0], -1, &blank);
+    if (blank) {
+        /* perl's forked child finds nothing to exec and exits with status
+         * 1; the open itself succeeds. A shell that does just that stands
+         * in for the child. */
+        pid = reading ? wasi_spawn_shell("exit 1", -1, p[1])
+                      : wasi_spawn_shell("exit 1", p[0], -1);
+    }
     if (pid < 0) {
+        const int e = errno;
         close(p[0]);
         close(p[1]);
+        errno = e;
         return NULL;
     }
     if (reading) {
@@ -456,7 +560,10 @@ extern "C" PerlIO *wasi_spawn_popen_list(pTHX_ const char *mode, int n,
  * win32's do_spawn/do_aspawn play — embed.h maps the calls to the Perl_
  * names): run and wait, returning the native wait status. */
 extern "C" int do_spawn(char *cmd) {
-    pid_t pid = wasi_spawn_shell(cmd, -1, -1);
+    bool blank = false;
+    pid_t pid = wasi_spawn_command(cmd, -1, -1, &blank);
+    /* perl's forked child finds nothing to exec and exits with status 255 */
+    if (blank) return 255 << 8;
     if (pid < 0) return -1;
     int status = 0;
     pid_t r;
