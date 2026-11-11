@@ -3536,8 +3536,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvSMAGICAL(sv)) mg_set(sv);
         return 0;
     }
-    case GOPERL_OP_GIMME_V: /* caller context of the innermost block */
-        return (uint64_t)(int64_t)block_gimme();
+    case GOPERL_OP_GIMME_V: /* the context the running XSUB was called in:
+                 * the want bits of the calling op, and only without them
+                 * the context of the enclosing sub (an XSUB pushes no
+                 * context of its own, so block_gimme alone answers for the
+                 * caller's caller) */
+        return (uint64_t)(int64_t)GIMME_V;
     case GOPERL_OP_CKWARN: /* a = warning category; b = ckWARN_d variant */
         return (b ? ckWARN_d((U32)a) : ckWARN((U32)a)) ? 1 : 0;
     case GOPERL_OP_SV_LEN_BUF: /* SvLEN: the ALLOCATED buffer size */
