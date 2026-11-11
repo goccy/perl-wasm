@@ -2390,7 +2390,129 @@ enum goperl_xs_op {
     GOPERL_OP_KEYWORD_ENABLE = 181,
     GOPERL_OP_CHARCLASS = 182,
     GOPERL_OP_SAVE_MISC = 183,
-    GOPERL_OP_SV_CLASSIFY = 184
+    GOPERL_OP_SV_CLASSIFY = 184,
+    GOPERL_OP_SV_FLAGS = 185,
+    GOPERL_OP_SV_SLOT_SET = 186,
+    GOPERL_OP_SV_CALL = 187,
+    GOPERL_OP_GV_CALL = 188,
+    GOPERL_OP_SV_STR = 189
+};
+
+/* SAVE_MISC selectors. */
+enum {
+    GOPERL_SAVE_FREESV = 0,
+    GOPERL_SAVE_MORTALIZESV = 1,
+    GOPERL_SAVE_ITEM = 2,
+    GOPERL_SAVE_ARY = 3,
+    GOPERL_SAVE_HASH = 4,
+    GOPERL_SAVE_GP = 5,
+    GOPERL_SAVE_HINTS = 6,
+    GOPERL_SAVE_COMPILE_WARNINGS = 7
+};
+
+/* SV_SLOT_SET selectors. */
+enum {
+    GOPERL_SVSLOT_RV = 0,
+    GOPERL_SVSLOT_STASH = 1,
+    GOPERL_SVSLOT_IV = 2,
+    GOPERL_SVSLOT_UV = 3,
+    GOPERL_SVSLOT_NV = 4,
+    GOPERL_SVSLOT_PV = 5,
+    GOPERL_SVSLOT_LEN = 6
+};
+
+/* SV_CALL selectors. */
+enum {
+    GOPERL_SVCALL_MG_GET = 0,
+    GOPERL_SVCALL_MG_CLEAR = 1,
+    GOPERL_SVCALL_MG_FREE = 2,
+    GOPERL_SVCALL_MG_MAGICAL = 3,
+    GOPERL_SVCALL_MG_SIZE = 4,
+    GOPERL_SVCALL_BACKOFF = 5,
+    GOPERL_SVCALL_UNREF = 6,
+    GOPERL_SVCALL_RVUNWEAKEN = 7,
+    GOPERL_SVCALL_UTF8_ENCODE = 8,
+    GOPERL_SVCALL_LEN_UTF8 = 9,
+    GOPERL_SVCALL_DEC = 10,
+    GOPERL_SVCALL_TAINTED = 11,
+    GOPERL_SVCALL_TAINT = 12,
+    GOPERL_SVCALL_UNTAINT = 13,
+    GOPERL_SVCALL_REF = 14,
+    GOPERL_SVCALL_CV_CONST_SV = 15,
+    GOPERL_SVCALL_CV_UNDEF = 16,
+    GOPERL_SVCALL_POS_U2B = 17,
+    GOPERL_SVCALL_POS_B2U = 18,
+    GOPERL_SVCALL_SET_UNDEF = 19,
+    GOPERL_SVCALL_SHRINK_TO_CUR = 20,
+    GOPERL_SVCALL_AV_DELETE = 21,
+    GOPERL_SVCALL_VOK = 22,
+    GOPERL_SVCALL_HV_USEDKEYS = 23,
+    GOPERL_SVCALL_HV_TOTALKEYS = 24,
+    GOPERL_SVCALL_HV_FILL = 25,
+    GOPERL_SVCALL_HV_MAX = 26,
+    GOPERL_SVCALL_AV_MAX = 27,
+    GOPERL_SVCALL_UTF8_UPGRADE = 28,
+    GOPERL_SVCALL_NEWSVSV = 29,
+    GOPERL_SVCALL_NEWAVAV = 30,
+    GOPERL_SVCALL_NEWAVHV = 31,
+    GOPERL_SVCALL_SETRV_INC = 32,
+    GOPERL_SVCALL_SETRV_NOINC = 33,
+    GOPERL_SVCALL_SETSV = 34,
+    GOPERL_SVCALL_CATSV = 35,
+    GOPERL_SVCALL_CMP = 36,
+    GOPERL_SVCALL_EQ = 37,
+    GOPERL_SVCALL_MRO_LINEAR_ISA = 38,
+    GOPERL_SVCALL_MRO_METHOD_CHANGED = 39,
+    GOPERL_SVCALL_2BOOL = 40,
+    GOPERL_SVCALL_2IV = 41,
+    GOPERL_SVCALL_2UV = 42,
+    GOPERL_SVCALL_2NV = 43,
+    GOPERL_SVCALL_2PV = 44,
+    GOPERL_SVCALL_CLEAR_UNDEF = 45,
+    GOPERL_SVCALL_IO_TYPE = 46,
+    GOPERL_SVCALL_IO_FLAGS = 47,
+    GOPERL_SVCALL_IO_LINES = 48,
+    GOPERL_SVCALL_SETPV_BUFSIZE = 49
+};
+
+/* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
+enum {
+    GOPERL_GVCALL_SVN = 0,
+    GOPERL_GVCALL_AVN = 1,
+    GOPERL_GVCALL_HVN = 2,
+    GOPERL_GVCALL_ION = 3,
+    GOPERL_GVCALL_CV_SET = 4,
+    GOPERL_GVCALL_FLAGS = 5,
+    GOPERL_GVCALL_CVGEN = 6,
+    GOPERL_GVCALL_FORM = 7,
+    GOPERL_GVCALL_FULLNAME = 8,
+    GOPERL_GVCALL_GP = 9,
+    GOPERL_GVCALL_FILE = 10,
+    GOPERL_GVCALL_LINE = 11,
+    GOPERL_GVCALL_NAME_UTF8 = 12,
+    GOPERL_GVCALL_SV_SET = 13,
+    GOPERL_GVCALL_AV_SET = 14,
+    GOPERL_GVCALL_HV_SET = 15,
+    GOPERL_GVCALL_FIRST_CV = 32,
+    GOPERL_GVCALL_CV_GV_SET = 32,
+    GOPERL_GVCALL_CV_STASH_SET = 33,
+    GOPERL_GVCALL_CV_FLAGS = 34,
+    GOPERL_GVCALL_CV_OUTSIDE = 35,
+    GOPERL_GVCALL_CV_PROTO = 36
+};
+
+/* SV_STR selectors. */
+enum {
+    GOPERL_SVSTR_CATPVN = 0,
+    GOPERL_SVSTR_NEWSVRV = 1,
+    GOPERL_SVSTR_DOES = 2,
+    GOPERL_SVSTR_FETCHMETH = 3,
+    GOPERL_SVSTR_FETCHMETH_AUTOLOAD = 4,
+    GOPERL_SVSTR_FETCHMETHOD = 5,
+    GOPERL_SVSTR_GV_FETCHPVN = 6,
+    GOPERL_SVSTR_GET_CVN = 7,
+    GOPERL_SVSTR_WHICHSIG = 8,
+    GOPERL_SVSTR_COP_HINT = 9
 };
 
 /* v8 sub-selectors (shared with the SDK headers). */
@@ -2511,6 +2633,35 @@ enum {
 #define GOPERL_PL_DEFGV 26
 #define GOPERL_PL_HINTGV 27
 #define GOPERL_PL_COMPCV 28
+#define GOPERL_PL_ERRGV 29
+#define GOPERL_PL_DEFSTASH 30
+#define GOPERL_PL_INCGV 31
+#define GOPERL_PL_STDERRGV 32
+#define GOPERL_PL_DEFOUTGV 33
+#define GOPERL_PL_RS 34
+#define GOPERL_PL_IN_EVAL 35
+#define GOPERL_PL_PHASE 36
+#define GOPERL_PL_TAINTING 37
+#define GOPERL_PL_TAINTED 38
+#define GOPERL_PL_DIRTY 39
+#define GOPERL_PL_SAVESTACK_IX 40
+#define GOPERL_PL_TMPS_IX 41
+#define GOPERL_PL_STDINGV 42
+#define GOPERL_PL_ARGVGV 43
+#define GOPERL_PL_ENVGV 44
+#define GOPERL_PL_LOCALIZING 45
+#define GOPERL_PL_BEGINAV 46
+#define GOPERL_PL_UNITCHECKAV 47
+#define GOPERL_PL_SV_ZERO 48
+#define GOPERL_PL_SV_PLACEHOLDER 49
+#define GOPERL_PL_STRTAB 50
+#define GOPERL_PL_STATGV 51
+#define GOPERL_PL_TMPS_FLOOR 52
+#define GOPERL_PL_ORIGFILENAME 53
+#define GOPERL_PL_UNSAFE 54
+#define GOPERL_PL_DESTRUCT_LEVEL 55
+#define GOPERL_PL_LASTGV 56
+#define GOPERL_PL_COP_SEQMAX 57
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -2915,6 +3066,39 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_DOWARN: return (uint64_t)PL_dowarn;
         case GOPERL_PL_HINTS: return (uint64_t)PL_hints;
         case GOPERL_PL_SUB_GENERATION: return (uint64_t)PL_sub_generation;
+        case GOPERL_PL_ERRGV: return (uint64_t)(uintptr_t)PL_errgv;
+        case GOPERL_PL_DEFSTASH: return (uint64_t)(uintptr_t)(SV *)PL_defstash;
+        case GOPERL_PL_INCGV: return (uint64_t)(uintptr_t)PL_incgv;
+        case GOPERL_PL_STDERRGV: return (uint64_t)(uintptr_t)PL_stderrgv;
+        case GOPERL_PL_DEFOUTGV: return (uint64_t)(uintptr_t)PL_defoutgv;
+        case GOPERL_PL_RS: return (uint64_t)(uintptr_t)PL_rs;
+        case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
+        case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
+        case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
+        case GOPERL_PL_TAINTED: return TAINT_get ? 1 : 0;
+        case GOPERL_PL_DIRTY: return PL_dirty ? 1 : 0;
+        case GOPERL_PL_SAVESTACK_IX: return (uint64_t)(int64_t)PL_savestack_ix;
+        case GOPERL_PL_TMPS_IX: return (uint64_t)(int64_t)PL_tmps_ix;
+        case GOPERL_PL_STDINGV: return (uint64_t)(uintptr_t)PL_stdingv;
+        case GOPERL_PL_ARGVGV: return (uint64_t)(uintptr_t)PL_argvgv;
+        case GOPERL_PL_ENVGV: return (uint64_t)(uintptr_t)PL_envgv;
+        case GOPERL_PL_LOCALIZING: return (uint64_t)PL_localizing;
+        case GOPERL_PL_BEGINAV: return (uint64_t)(uintptr_t)(SV *)PL_beginav;
+        case GOPERL_PL_UNITCHECKAV: return (uint64_t)(uintptr_t)(SV *)PL_unitcheckav;
+        case GOPERL_PL_SV_ZERO: return (uint64_t)(uintptr_t)&PL_sv_zero;
+        case GOPERL_PL_SV_PLACEHOLDER: return (uint64_t)(uintptr_t)&PL_sv_placeholder;
+        case GOPERL_PL_STRTAB: return (uint64_t)(uintptr_t)(SV *)PL_strtab;
+        case GOPERL_PL_STATGV: return (uint64_t)(uintptr_t)PL_statgv;
+        case GOPERL_PL_TMPS_FLOOR: return (uint64_t)(int64_t)PL_tmps_floor;
+        case GOPERL_PL_ORIGFILENAME: {
+            if (!PL_origfilename) return 0;
+            return ((uint64_t)(uint32_t)(uintptr_t)PL_origfilename << 32) |
+                   (uint32_t)strlen(PL_origfilename);
+        }
+        case GOPERL_PL_UNSAFE: return PL_unsafe ? 1 : 0;
+        case GOPERL_PL_DESTRUCT_LEVEL: return (uint64_t)(int64_t)PL_perl_destruct_level;
+        case GOPERL_PL_LASTGV: return (uint64_t)(uintptr_t)PL_last_in_gv;
+        case GOPERL_PL_COP_SEQMAX: return (uint64_t)PL_cop_seqmax;
         }
         return 0;
     }
@@ -2931,6 +3115,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_INITAV: PL_initav = (AV *)val; return 0;
         case GOPERL_PL_EXIT_FLAGS: PL_exit_flags = (U8)b; return 0;
         case GOPERL_PL_HINTS: PL_hints = (U32)b; return 0;
+        case GOPERL_PL_DEFOUTGV: PL_defoutgv = (GV *)val; return 0;
+        case GOPERL_PL_RS: PL_rs = val; return 0;
+        case GOPERL_PL_CURSTASH: PL_curstash = (HV *)val; return 0;
+        case GOPERL_PL_TAINTED: TAINT_set(cBOOL(b)); return 0;
+        case GOPERL_PL_DESTRUCT_LEVEL: PL_perl_destruct_level = (signed char)(int64_t)b; return 0;
+        case GOPERL_PL_LOCALIZING: PL_localizing = (U8)b; return 0;
         }
         return 0;
     }
@@ -3750,10 +3940,18 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         return 0;
     }
-    case GOPERL_OP_SAVE_MISC: { /* a: 0 = save_freesv(b = sv token) */
-        if ((int)a == 0) {
-            save_freesv((SV *)(uintptr_t)(uint32_t)b);
-            return 0;
+    case GOPERL_OP_SAVE_MISC: { /* a = a GOPERL_SAVE_ selector; b = sv token
+                 * (save_gp: empty<<32 | gv) */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)b;
+        switch ((int)a) {
+        case GOPERL_SAVE_FREESV: save_freesv(sv); return 0;
+        case GOPERL_SAVE_MORTALIZESV: save_mortalizesv(sv); return 0;
+        case GOPERL_SAVE_ITEM: save_item(sv); return 0;
+        case GOPERL_SAVE_ARY: return (uint64_t)(uintptr_t)(SV *)save_ary((GV *)sv);
+        case GOPERL_SAVE_HASH: return (uint64_t)(uintptr_t)(SV *)save_hash((GV *)sv);
+        case GOPERL_SAVE_GP: save_gp((GV *)sv, (I32)(b >> 32)); return 0;
+        case GOPERL_SAVE_HINTS: SAVEHINTS(); return 0;
+        case GOPERL_SAVE_COMPILE_WARNINGS: SAVECOMPILEWARNINGS(); return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown save call %d", (int)a);
     }
@@ -3781,6 +3979,210 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case 6: return sv_streq_flags(sv, other, flags) ? 1 : 0;
         }
         Perl_croak(aTHX_ "goperl: unknown sv classify mode %d", mode);
+    }
+    case GOPERL_OP_SV_FLAGS: { /* a = sv; b = clear<<32 | set; -> the flags
+                 * after the change. SvFLAGS itself and every SvXXX_on/_off
+                 * macro of sv.h are this one operation. */
+        SV *sv = (SV *)(uintptr_t)a;
+        U32 clear = (U32)(b >> 32), set = (U32)b;
+        if (clear || set) SvFLAGS(sv) = (SvFLAGS(sv) & ~clear) | set;
+        return (uint64_t)SvFLAGS(sv);
+    }
+    case GOPERL_OP_SV_SLOT_SET: { /* a = a GOPERL_SVSLOT_ selector<<32 | sv;
+                 * b = the value: the SvXXX_set macros of sv.h */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)a;
+        switch ((int)(a >> 32)) {
+        case GOPERL_SVSLOT_RV: SvRV_set(sv, (SV *)(uintptr_t)(uint32_t)b); return 0;
+        case GOPERL_SVSLOT_STASH: SvSTASH_set(sv, (HV *)(uintptr_t)(uint32_t)b); return 0;
+        case GOPERL_SVSLOT_IV: SvIV_set(sv, (IV)(int64_t)b); return 0;
+        case GOPERL_SVSLOT_UV: SvUV_set(sv, (UV)b); return 0;
+        case GOPERL_SVSLOT_NV: {
+            NV nv;
+            memcpy(&nv, &b, sizeof nv);
+            SvNV_set(sv, nv);
+            return 0;
+        }
+        case GOPERL_SVSLOT_PV: SvPV_set(sv, (char *)(uintptr_t)(uint32_t)b); return 0;
+        case GOPERL_SVSLOT_LEN: SvLEN_set(sv, (STRLEN)b); return 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown sv slot %d", (int)(a >> 32));
+    }
+    case GOPERL_OP_SV_CALL: { /* a = a GOPERL_SVCALL_ selector<<32 | sv;
+                 * b = the remaining argument of that API function */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)a;
+        SV *other = (SV *)(uintptr_t)(uint32_t)b;
+        U32 hi = (U32)(b >> 32);
+        switch ((int)(a >> 32)) {
+        case GOPERL_SVCALL_MG_GET: return (uint64_t)(int64_t)mg_get(sv);
+        case GOPERL_SVCALL_MG_CLEAR: return (uint64_t)(int64_t)mg_clear(sv);
+        case GOPERL_SVCALL_MG_FREE: return (uint64_t)(int64_t)mg_free(sv);
+        case GOPERL_SVCALL_MG_MAGICAL: mg_magical(sv); return 0;
+        case GOPERL_SVCALL_MG_SIZE: return (uint64_t)mg_size(sv);
+        case GOPERL_SVCALL_BACKOFF: sv_backoff(sv); return 0;
+        case GOPERL_SVCALL_UNREF: sv_unref_flags(sv, (U32)b); return 0;
+        case GOPERL_SVCALL_RVUNWEAKEN: sv_rvunweaken(sv); return 0;
+        case GOPERL_SVCALL_UTF8_ENCODE: sv_utf8_encode(sv); return 0;
+        case GOPERL_SVCALL_LEN_UTF8: return (uint64_t)sv_len_utf8(sv);
+        case GOPERL_SVCALL_DEC: sv_dec(sv); return 0;
+        case GOPERL_SVCALL_TAINTED: return sv_tainted(sv) ? 1 : 0;
+        case GOPERL_SVCALL_TAINT: sv_taint(sv); return 0;
+        case GOPERL_SVCALL_UNTAINT: sv_untaint(sv); return 0;
+        case GOPERL_SVCALL_REF: return (uint64_t)(uintptr_t)sv_ref(NULL, sv, (int)b);
+        case GOPERL_SVCALL_CV_CONST_SV:
+            return (uint64_t)(uintptr_t)cv_const_sv((const CV *)sv);
+        case GOPERL_SVCALL_CV_UNDEF: cv_undef((CV *)sv); return 0;
+        case GOPERL_SVCALL_POS_U2B:
+            return (uint64_t)sv_pos_u2b_flags(sv, (STRLEN)b, NULL, SV_GMAGIC | SV_CONST_RETURN);
+        case GOPERL_SVCALL_POS_B2U:
+            return (uint64_t)sv_pos_b2u_flags(sv, (STRLEN)b, SV_GMAGIC | SV_CONST_RETURN);
+        case GOPERL_SVCALL_SET_UNDEF: sv_set_undef(sv); return 0;
+        case GOPERL_SVCALL_SHRINK_TO_CUR: SvPV_shrink_to_cur(sv); return 0;
+        case GOPERL_SVCALL_AV_DELETE: /* b = flags<<32 | index (two's complement) */
+            return (uint64_t)(uintptr_t)av_delete((AV *)sv, (SSize_t)(int32_t)(uint32_t)b, (I32)hi);
+        case GOPERL_SVCALL_VOK: return SvVOK(sv) ? 1 : 0;
+        case GOPERL_SVCALL_HV_USEDKEYS: return (uint64_t)HvUSEDKEYS((HV *)sv);
+        case GOPERL_SVCALL_HV_TOTALKEYS: return (uint64_t)HvTOTALKEYS((HV *)sv);
+        case GOPERL_SVCALL_HV_FILL: return (uint64_t)HvFILL((HV *)sv);
+        case GOPERL_SVCALL_HV_MAX: return (uint64_t)HvMAX((HV *)sv);
+        case GOPERL_SVCALL_AV_MAX: return (uint64_t)(int64_t)AvMAX((AV *)sv);
+        case GOPERL_SVCALL_UTF8_UPGRADE:
+            return (uint64_t)sv_utf8_upgrade_flags(sv, (I32)b);
+        case GOPERL_SVCALL_NEWSVSV: /* sv may be NULL, as for newSVsv */
+            return (uint64_t)(uintptr_t)newSVsv_flags(sv, (I32)b);
+        case GOPERL_SVCALL_NEWAVAV: return (uint64_t)(uintptr_t)(SV *)newAVav((AV *)sv);
+        case GOPERL_SVCALL_NEWAVHV: return (uint64_t)(uintptr_t)(SV *)newAVhv((HV *)sv);
+        case GOPERL_SVCALL_SETRV_INC: sv_setrv_inc(sv, other); return 0;
+        case GOPERL_SVCALL_SETRV_NOINC: sv_setrv_noinc(sv, other); return 0;
+        case GOPERL_SVCALL_SETSV: /* b = flags<<32 | source */
+            sv_setsv_flags(sv, other, (I32)hi);
+            return 0;
+        case GOPERL_SVCALL_CATSV:
+            sv_catsv_flags(sv, other, (I32)hi);
+            return 0;
+        case GOPERL_SVCALL_CMP:
+            return (uint64_t)(int64_t)sv_cmp_flags(sv, other, hi);
+        case GOPERL_SVCALL_EQ: return sv_eq_flags(sv, other, hi) ? 1 : 0;
+        case GOPERL_SVCALL_MRO_LINEAR_ISA:
+            return (uint64_t)(uintptr_t)(SV *)mro_get_linear_isa((HV *)sv);
+        case GOPERL_SVCALL_MRO_METHOD_CHANGED: mro_method_changed_in((HV *)sv); return 0;
+        /* the value accessors with explicit get-magic control: b carries
+         * SV_GMAGIC for the plain form, 0 for the _nomg form */
+        case GOPERL_SVCALL_2BOOL:
+            return ((b & SV_GMAGIC) ? SvTRUE(sv) : SvTRUE_nomg(sv)) ? 1 : 0;
+        case GOPERL_SVCALL_2IV:
+            return (uint64_t)(int64_t)((b & SV_GMAGIC) ? SvIV(sv) : SvIV_nomg(sv));
+        case GOPERL_SVCALL_2UV:
+            return (uint64_t)((b & SV_GMAGIC) ? SvUV(sv) : SvUV_nomg(sv));
+        case GOPERL_SVCALL_2NV: {
+            NV nv = (b & SV_GMAGIC) ? SvNV(sv) : SvNV_nomg(sv);
+            uint64_t bits;
+            memcpy(&bits, &nv, sizeof bits);
+            return bits;
+        }
+        case GOPERL_SVCALL_2PV: { /* -> (linear-memory ptr << 32) | len */
+            STRLEN len = 0;
+            const char *p = SvPV_flags(sv, len, (I32)b);
+            return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+        }
+        case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
+            SvOK_off(sv);
+            return 0;
+        case GOPERL_SVCALL_IO_TYPE: return (uint64_t)(U8)IoTYPE((IO *)sv);
+        case GOPERL_SVCALL_IO_FLAGS: return (uint64_t)IoFLAGS((IO *)sv);
+        case GOPERL_SVCALL_IO_LINES: return (uint64_t)(int64_t)IoLINES((IO *)sv);
+        case GOPERL_SVCALL_SETPV_BUFSIZE: /* b = cur<<32 | buffer size -> PVX */
+            return (uint64_t)(uint32_t)(uintptr_t)sv_setpv_bufsize(sv, (STRLEN)hi, (STRLEN)(uint32_t)b);
+        }
+        Perl_croak(aTHX_ "goperl: unknown sv call %d", (int)(a >> 32));
+    }
+    case GOPERL_OP_GV_CALL: { /* a = a GOPERL_GVCALL_ selector<<32 | gv or cv;
+                 * b = the remaining argument */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)a;
+        GV *gv = (GV *)sv;
+        CV *cv = (CV *)sv;
+        SV *other = (SV *)(uintptr_t)(uint32_t)b;
+        int fn = (int)(a >> 32);
+        if (fn < GOPERL_GVCALL_FIRST_CV) {
+            if (!isGV_with_GP(sv)) return 0;
+        } else if (SvTYPE(sv) != SVt_PVCV && SvTYPE(sv) != SVt_PVFM) {
+            return 0;
+        }
+        switch (fn) {
+        case GOPERL_GVCALL_SVN: return (uint64_t)(uintptr_t)GvSVn(gv);
+        case GOPERL_GVCALL_AVN: return (uint64_t)(uintptr_t)(SV *)GvAVn(gv);
+        case GOPERL_GVCALL_HVN: return (uint64_t)(uintptr_t)(SV *)GvHVn(gv);
+        case GOPERL_GVCALL_ION: return (uint64_t)(uintptr_t)(SV *)GvIOn(gv);
+        case GOPERL_GVCALL_CV_SET: GvCV_set(gv, (CV *)other); return 0;
+        case GOPERL_GVCALL_FLAGS: { /* b = clear<<32 | set */
+            U32 clear = (U32)(b >> 32), set = (U32)b;
+            if (clear || set) GvFLAGS(gv) = (GvFLAGS(gv) & ~clear) | set;
+            return (uint64_t)GvFLAGS(gv);
+        }
+        case GOPERL_GVCALL_CVGEN: return (uint64_t)GvCVGEN(gv);
+        case GOPERL_GVCALL_FORM: return (uint64_t)(uintptr_t)(SV *)GvFORM(gv);
+        case GOPERL_GVCALL_FULLNAME: /* b = (keepmain<<1 | effective)<<32 | sv */
+            if ((b >> 32) & 1)
+                gv_efullname4(other, gv, NULL, cBOOL((b >> 33) & 1));
+            else
+                gv_fullname4(other, gv, NULL, cBOOL((b >> 33) & 1));
+            return 0;
+        case GOPERL_GVCALL_GP: return (uint64_t)(uintptr_t)GvGP(gv);
+        case GOPERL_GVCALL_FILE: {
+            const char *file = GvFILE(gv);
+            if (!file) return 0;
+            return ((uint64_t)(uint32_t)(uintptr_t)file << 32) | (uint32_t)strlen(file);
+        }
+        case GOPERL_GVCALL_LINE: return (uint64_t)GvLINE(gv);
+        case GOPERL_GVCALL_NAME_UTF8: return GvNAMEUTF8(gv) ? 1 : 0;
+        case GOPERL_GVCALL_SV_SET: GvSV(gv) = other; return 0;
+        case GOPERL_GVCALL_AV_SET: GvAV(gv) = (AV *)other; return 0;
+        case GOPERL_GVCALL_HV_SET: GvHV(gv) = (HV *)other; return 0;
+        case GOPERL_GVCALL_CV_GV_SET: CvGV_set(cv, (GV *)other); return 0;
+        case GOPERL_GVCALL_CV_STASH_SET: CvSTASH_set(cv, (HV *)other); return 0;
+        case GOPERL_GVCALL_CV_FLAGS: {
+            U32 clear = (U32)(b >> 32), set = (U32)b;
+            if (clear || set) CvFLAGS(cv) = (CvFLAGS(cv) & ~clear) | set;
+            return (uint64_t)CvFLAGS(cv);
+        }
+        case GOPERL_GVCALL_CV_OUTSIDE: return (uint64_t)(uintptr_t)(SV *)CvOUTSIDE(cv);
+        case GOPERL_GVCALL_CV_PROTO: {
+            if (!SvPOK(sv)) return 0;
+            return ((uint64_t)(uint32_t)(uintptr_t)CvPROTO(cv) << 32) |
+                   (uint32_t)CvPROTOLEN(cv);
+        }
+        }
+        Perl_croak(aTHX_ "goperl: unknown gv call %d", fn);
+    }
+    case GOPERL_OP_SV_STR: { /* a = a GOPERL_SVSTR_ selector<<32 | sv;
+                 * b = flags<<32 | byte length of s */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)a;
+        STRLEN len = (STRLEN)(uint32_t)b;
+        U32 flags = (U32)(b >> 32);
+        const char *str = s ? s : "";
+        switch ((int)(a >> 32)) {
+        case GOPERL_SVSTR_CATPVN: sv_catpvn_flags(sv, str, len, (I32)flags); return 0;
+        case GOPERL_SVSTR_NEWSVRV: /* flags bit 0: no class */
+            return (uint64_t)(uintptr_t)newSVrv(sv, (flags & 1) ? NULL : str);
+        case GOPERL_SVSTR_DOES: return sv_does_pvn(sv, str, len, flags) ? 1 : 0;
+        case GOPERL_SVSTR_FETCHMETH: /* flags = level (signed byte)<<24 | flags */
+            return (uint64_t)(uintptr_t)gv_fetchmeth_pvn(
+                (HV *)sv, str, len, (I32)(int8_t)(flags >> 24), flags & 0xFFFFFF);
+        case GOPERL_SVSTR_FETCHMETH_AUTOLOAD:
+            return (uint64_t)(uintptr_t)gv_fetchmeth_pvn_autoload(
+                (HV *)sv, str, len, (I32)(int8_t)(flags >> 24), flags & 0xFFFFFF);
+        case GOPERL_SVSTR_FETCHMETHOD:
+            return (uint64_t)(uintptr_t)gv_fetchmethod_pvn_flags((HV *)sv, str, len, flags);
+        case GOPERL_SVSTR_GV_FETCHPVN: /* the sv slot carries the svtype */
+            return (uint64_t)(uintptr_t)gv_fetchpvn_flags(
+                str, len, (I32)flags, (svtype)(uint32_t)a);
+        case GOPERL_SVSTR_GET_CVN:
+            return (uint64_t)(uintptr_t)(SV *)get_cvn_flags(str, len, (I32)flags);
+        case GOPERL_SVSTR_WHICHSIG: return (uint64_t)(int64_t)whichsig_pvn(str, len);
+        case GOPERL_SVSTR_COP_HINT: /* sv slot = COP token, 0 for PL_curcop */
+            return (uint64_t)(uintptr_t)cop_hints_fetch_pvn(
+                sv ? (const COP *)sv : PL_curcop, str, len, 0, flags);
+        }
+        Perl_croak(aTHX_ "goperl: unknown sv string call %d", (int)(a >> 32));
     }
     case GOPERL_OP_SV_MAGIC_STD: { /* real sv_magic: BEHAVIORAL core magic
                  * (ties and friends) must live guest-side to take effect
