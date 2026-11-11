@@ -2710,6 +2710,7 @@ enum {
     GOPERL_SVSTR_THROW = 13,
     GOPERL_SVSTR_SETPVN = 14,
     GOPERL_SVSTR_TAINT_PROPER = 15, /* taint_proper(NULL, s) */
+    GOPERL_SVSTR_GV_NAME_SET = 17, /* gv_name_set(gv, s, len, flags) */
     GOPERL_SVSTR_WARNER = 16 /* a warning of the category in the SV slot.
                  * Flags bit 0: the text is UTF-8; bits 1-2: 0 warner (always
                  * given), 1 ck_warner (when the category is enabled),
@@ -4753,6 +4754,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                  * dies with (see GOPERL_SVCALL_THROW) */
             SvREFCNT_dec(goperl_thrown_sv);
             goperl_thrown_sv = newSVpvn_flags(str, len, (flags & 1) ? SVf_UTF8 : 0);
+            return 0;
+        case GOPERL_SVSTR_GV_NAME_SET:
+            gv_name_set((GV *)sv, str, (U32)len, flags);
             return 0;
         case GOPERL_SVSTR_WARNER: {
             SV *const text =
