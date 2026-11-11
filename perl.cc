@@ -2452,7 +2452,45 @@ enum goperl_xs_op {
     GOPERL_OP_SV_SLOT_SET = 186,
     GOPERL_OP_SV_CALL = 187,
     GOPERL_OP_GV_CALL = 188,
-    GOPERL_OP_SV_STR = 189
+    GOPERL_OP_SV_STR = 189,
+    GOPERL_OP_SV_SLOT_GET = 190,
+    GOPERL_OP_CALLER_CX = 191,
+    GOPERL_OP_PERLIO = 192
+};
+
+/* PERLIO selectors: the handle functions of perlio.h. */
+enum {
+    GOPERL_PIO_STDIN = 0,
+    GOPERL_PIO_STDOUT = 1,
+    GOPERL_PIO_STDERR = 2,
+    GOPERL_PIO_FILENO = 3,
+    GOPERL_PIO_READ = 4,
+    GOPERL_PIO_EOF = 5,
+    GOPERL_PIO_ERROR = 6,
+    GOPERL_PIO_CLEARERR = 7,
+    GOPERL_PIO_SEEK_SET = 8,
+    GOPERL_PIO_SEEK_CUR = 9,
+    GOPERL_PIO_SEEK_END = 10,
+    GOPERL_PIO_TELL = 11,
+    GOPERL_PIO_GETC = 12,
+    GOPERL_PIO_UNGETC = 13,
+    GOPERL_PIO_UNREAD = 14,
+    GOPERL_PIO_FDOPEN = 15,
+    GOPERL_PIO_BINMODE = 16,
+    GOPERL_PIO_SETLINEBUF = 17,
+    GOPERL_PIO_IFP = 18,
+    GOPERL_PIO_OFP = 19,
+    GOPERL_PIO_VALID = 20,
+    GOPERL_PIO_FAST_GETS = 21,
+    GOPERL_PIO_HAS_CNTPTR = 22,
+    GOPERL_PIO_CANSET_CNT = 23,
+    GOPERL_PIO_HAS_BASE = 24,
+    GOPERL_PIO_GET_CNT = 25,
+    GOPERL_PIO_GET_PTR = 26,
+    GOPERL_PIO_GET_BASE = 27,
+    GOPERL_PIO_GET_BUFSIZ = 28,
+    GOPERL_PIO_SET_PTRCNT = 29,
+    GOPERL_PIO_FILL = 30
 };
 
 /* SAVE_MISC selectors. */
@@ -2475,7 +2513,9 @@ enum {
     GOPERL_SVSLOT_UV = 3,
     GOPERL_SVSLOT_NV = 4,
     GOPERL_SVSLOT_PV = 5,
-    GOPERL_SVSLOT_LEN = 6
+    GOPERL_SVSLOT_LEN = 6,
+    GOPERL_SVSLOT_GV_STASH = 7,
+    GOPERL_SVSLOT_GV_CVGEN = 8
 };
 
 /* SV_CALL selectors. */
@@ -2530,7 +2570,9 @@ enum {
     GOPERL_SVCALL_IO_FLAGS = 47,
     GOPERL_SVCALL_IO_LINES = 48,
     GOPERL_SVCALL_SETPV_BUFSIZE = 49,
-    GOPERL_SVCALL_THROW = 50
+    GOPERL_SVCALL_THROW = 50,
+    GOPERL_SVCALL_2PVBYTE = 51,
+    GOPERL_SVCALL_HV_KSPLIT = 52
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -2570,7 +2612,8 @@ enum {
     GOPERL_SVSTR_GV_FETCHPVN = 6,
     GOPERL_SVSTR_GET_CVN = 7,
     GOPERL_SVSTR_WHICHSIG = 8,
-    GOPERL_SVSTR_COP_HINT = 9
+    GOPERL_SVSTR_COP_HINT = 9,
+    GOPERL_SVSTR_SETENV = 10
 };
 
 /* v8 sub-selectors (shared with the SDK headers). */
@@ -2720,6 +2763,7 @@ enum {
 #define GOPERL_PL_DESTRUCT_LEVEL 55
 #define GOPERL_PL_LASTGV 56
 #define GOPERL_PL_COP_SEQMAX 57
+#define GOPERL_PL_ERRSV 58
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -2772,26 +2816,97 @@ enum {
 /* CX_FIELDS result when the context index is out of range. */
 #define GOPERL_CX_TYPE_NONE 0xFFFFFFFFu
 
+/* The IV and UV of native code are 64 bits wide; this interpreter's are 32.
+ * An integer outside the range of both is held the way perl itself holds
+ * one it computes: in the NV, which is exact up to 2**53. */
+static void goperl_sv_set_wide_iv(pTHX_ SV *sv, int64_t v) {
+    if (v >= (int64_t)IV_MIN && v <= (int64_t)IV_MAX)
+        sv_setiv(sv, (IV)v);
+    else if (v > 0 && (uint64_t)v <= (uint64_t)UV_MAX)
+        sv_setuv(sv, (UV)v);
+    else
+        sv_setnv(sv, (NV)v);
+}
+
+static void goperl_sv_set_wide_uv(pTHX_ SV *sv, uint64_t v) {
+    if (v <= (uint64_t)UV_MAX)
+        sv_setuv(sv, (UV)v);
+    else
+        sv_setnv(sv, (NV)v);
+}
+
+/* Whether sv holds an integer of the native width that this interpreter
+ * could only store as an NV (see goperl_sv_set_wide_iv): 1 when it is in the
+ * range of a 64-bit IV, 2 when only in that of a 64-bit UV, 0 otherwise.
+ * Native code sees such a value as the integer it is on a perl with 64-bit
+ * IVs: SvIOK is true for it, so that a module which tests the flag before
+ * taking a pointer or a counter out of an SV finds it. */
+static int goperl_sv_wide_int(pTHX_ SV *sv) {
+    if (!SvNOK(sv) || SvIOK(sv) || SvTYPE(sv) >= SVt_PVAV) return 0;
+    const NV nv = SvNVX(sv);
+    if (nv != nv || __builtin_floor(nv) != nv) return 0;
+    if (nv >= (NV)IV_MIN && nv <= (NV)UV_MAX) return 0; /* fits: a real NV */
+    if (nv >= -9223372036854775808.0 && nv < 9223372036854775808.0) return 1;
+    if (nv >= 0.0 && nv < 18446744073709551616.0) return 2;
+    return 0;
+}
+
+/* The integer value of sv at the native width: what SvIV (or SvUV, for
+ * want_uv) gives on a perl whose IV has 64 bits. Get magic runs once unless
+ * nomg. */
+static uint64_t goperl_sv_wide(pTHX_ SV *sv, bool want_uv, bool nomg) {
+    if (!nomg) SvGETMAGIC(sv);
+    const IV iv = SvIV_nomg(sv);
+    /* A reference numifies to its address or through its overloading, and
+     * an undefined value to zero: both are what the interpreter gave. */
+    if (SvROK(sv) || !SvOK(sv))
+        return want_uv ? (uint64_t)(UV)iv : (uint64_t)(int64_t)iv;
+    if (SvIOK(sv))
+        return SvIsUV(sv) ? (uint64_t)SvUVX(sv) : (uint64_t)(int64_t)SvIVX(sv);
+    /* Not an integer this interpreter's IV holds exactly. */
+    const NV nv = SvNV_nomg(sv);
+    if (nv != nv) return 0;
+    if (want_uv) {
+        if (nv < 0.0)
+            return nv <= -9223372036854775808.0
+                       ? (uint64_t)INT64_MIN
+                       : (uint64_t)(int64_t)nv;
+        return nv >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)nv;
+    }
+    if (nv < 9223372036854775808.0)
+        return nv <= -9223372036854775808.0 ? (uint64_t)INT64_MIN
+                                            : (uint64_t)(int64_t)nv;
+    /* Beyond the signed range the value wraps as an unsigned one does, as
+     * perl's own cast of an NV to an IV has it. */
+    return nv >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)nv;
+}
+
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s) {
     if (!g_my_perl || h == 0) return 0;
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     switch (op) {
-    case GOPERL_OP_SV_IV:
-        return (uint64_t)(int64_t)SvIV((SV *)(uintptr_t)a);
+    case GOPERL_OP_SV_IV: /* b bit 0: as an unsigned value; bit 1: no get magic */
+        return goperl_sv_wide(aTHX_ (SV *)(uintptr_t)a, cBOOL(b & 1), cBOOL(b & 2));
     case GOPERL_OP_SV_PV: { /* (linear-memory ptr << 32) | len */
         STRLEN len = 0;
         const char *p = SvPV((SV *)(uintptr_t)a, len);
         return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
     }
-    case GOPERL_OP_NEW_IV:
-        return (uint64_t)(uintptr_t)newSViv((IV)(int64_t)a);
+    case GOPERL_OP_NEW_IV: {
+        SV *sv = newSV(0);
+        goperl_sv_set_wide_iv(aTHX_ sv, (int64_t)a);
+        return (uint64_t)(uintptr_t)sv;
+    }
     case GOPERL_OP_NEW_PVN:
         return (uint64_t)(uintptr_t)newSVpvn(s ? s : "", (STRLEN)b);
     case GOPERL_OP_SV_MORTAL:
         return (uint64_t)(uintptr_t)sv_2mortal((SV *)(uintptr_t)a);
-    case GOPERL_OP_NEW_UV:
-        return (uint64_t)(uintptr_t)newSVuv((UV)a);
+    case GOPERL_OP_NEW_UV: {
+        SV *sv = newSV(0);
+        goperl_sv_set_wide_uv(aTHX_ sv, a);
+        return (uint64_t)(uintptr_t)sv;
+    }
     case GOPERL_OP_NEW_AV:
         return (uint64_t)(uintptr_t)(SV *)newAV();
     case GOPERL_OP_NEW_HV:
@@ -2836,8 +2951,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     case GOPERL_OP_SV_DERIVED_FROM:
         return sv_derived_from((SV *)(uintptr_t)a, s ? s : "") ? 1 : 0;
     case GOPERL_OP_SETREF_IV: /* bless rv `a` as class s pointing at IV b */
-        return (uint64_t)(uintptr_t)sv_setref_iv((SV *)(uintptr_t)a,
-                                                 s ? s : "", (IV)(int64_t)b);
+    {
+        SV *rv = (SV *)(uintptr_t)a;
+        goperl_sv_set_wide_iv(aTHX_ newSVrv(rv, s ? s : ""), (int64_t)b);
+        return (uint64_t)(uintptr_t)rv;
+    }
 
     /* ---- v3: the surface interpreter-heavy XS (Text::Xslate class)
      * compiles against. Conventions as above: a/b are u64 operands
@@ -2853,10 +2971,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         sv_setsv_mg((SV *)(uintptr_t)a, (SV *)(uintptr_t)b);
         return 0;
     case GOPERL_OP_SV_SETIV:
-        sv_setiv((SV *)(uintptr_t)a, (IV)(int64_t)b);
+        goperl_sv_set_wide_iv(aTHX_ (SV *)(uintptr_t)a, (int64_t)b);
         return 0;
     case GOPERL_OP_SV_SETUV:
-        sv_setuv((SV *)(uintptr_t)a, (UV)b);
+        goperl_sv_set_wide_uv(aTHX_ (SV *)(uintptr_t)a, b);
         return 0;
     case GOPERL_OP_SV_SETNV: { /* b = IEEE bits */
         union { uint64_t u; double d; } cvt;
@@ -2915,6 +3033,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvAMAGIC(sv)) f |= 65536;           /* GOPERL_INFO_AMAGIC */
         if (SvIOKp(sv)) f |= 131072;            /* GOPERL_INFO_IOKp */
         if (SvNOKp(sv)) f |= 262144;            /* GOPERL_INFO_NOKp */
+        if (const int wide = goperl_sv_wide_int(aTHX_ sv)) {
+            f |= GOPERL_INFO_IOK | 131072;
+            if (wide == 2) f |= GOPERL_INFO_ISUV;
+        }
         return f;
     }
     case GOPERL_OP_SV_CUR_SET:
@@ -3125,6 +3247,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_HINTS: return (uint64_t)PL_hints;
         case GOPERL_PL_SUB_GENERATION: return (uint64_t)PL_sub_generation;
         case GOPERL_PL_ERRGV: return (uint64_t)(uintptr_t)PL_errgv;
+        case GOPERL_PL_ERRSV: return (uint64_t)(uintptr_t)ERRSV;
         case GOPERL_PL_DEFSTASH: return (uint64_t)(uintptr_t)(SV *)PL_defstash;
         case GOPERL_PL_INCGV: return (uint64_t)(uintptr_t)PL_incgv;
         case GOPERL_PL_STDERRGV: return (uint64_t)(uintptr_t)PL_stderrgv;
@@ -3177,6 +3300,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_RS: PL_rs = val; return 0;
         case GOPERL_PL_CURSTASH: PL_curstash = (HV *)val; return 0;
         case GOPERL_PL_TAINTED: TAINT_set(cBOOL(b)); return 0;
+        case GOPERL_PL_TAINTING: TAINTING_set(cBOOL(b)); return 0;
+        case GOPERL_PL_ERRSV: GvSV(PL_errgv) = val; return 0;
+        case GOPERL_PL_BEGINAV: PL_beginav = (AV *)val; return 0;
+        case GOPERL_PL_UNITCHECKAV: PL_unitcheckav = (AV *)val; return 0;
         case GOPERL_PL_DESTRUCT_LEVEL: PL_perl_destruct_level = (signed char)(int64_t)b; return 0;
         case GOPERL_PL_LOCALIZING: PL_localizing = (U8)b; return 0;
         }
@@ -3432,7 +3559,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (!si || (I32)(int64_t)b < 0 || (I32)(int64_t)b > si->si_cxix)
             return (uint64_t)GOPERL_CX_TYPE_NONE;
         PERL_CONTEXT *cx = &si->si_cxstack[(I32)(int64_t)b];
-        return (uint64_t)CxTYPE(cx);
+        /* the whole type byte (CXTYPEMASK and the CXp_ bits), and the
+         * context the block was entered in above it */
+        return (uint64_t)cx->cx_type | ((uint64_t)cx->blk_gimme << 8);
     }
     case GOPERL_OP_CX_PTR: { /* a = si token or 0,
                  * b = ix<<8 | a GOPERL_CXPTR_ selector */
@@ -4048,7 +4177,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         SV *sv = (SV *)(uintptr_t)a;
         U32 clear = (U32)(b >> 32), set = (U32)b;
         if (clear || set) SvFLAGS(sv) = (SvFLAGS(sv) & ~clear) | set;
-        return (uint64_t)SvFLAGS(sv);
+        U32 flags = SvFLAGS(sv);
+        if (const int wide = goperl_sv_wide_int(aTHX_ sv)) {
+            flags |= SVf_IOK | SVp_IOK;
+            if (wide == 2) flags |= SVf_IVisUV;
+        }
+        return (uint64_t)flags;
     }
     case GOPERL_OP_SV_SLOT_SET: { /* a = a GOPERL_SVSLOT_ selector<<32 | sv;
                  * b = the value: the SvXXX_set macros of sv.h */
@@ -4056,18 +4190,157 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         switch ((int)(a >> 32)) {
         case GOPERL_SVSLOT_RV: SvRV_set(sv, (SV *)(uintptr_t)(uint32_t)b); return 0;
         case GOPERL_SVSLOT_STASH: SvSTASH_set(sv, (HV *)(uintptr_t)(uint32_t)b); return 0;
-        case GOPERL_SVSLOT_IV: SvIV_set(sv, (IV)(int64_t)b); return 0;
-        case GOPERL_SVSLOT_UV: SvUV_set(sv, (UV)b); return 0;
+        /* The SvXXX_set macros write into the body the SV has: one that
+         * is too small for the slot is grown first, as the callers of
+         * these macros do with SvUPGRADE. */
+        case GOPERL_SVSLOT_IV:
+            if (SvTYPE(sv) != SVt_IV && SvTYPE(sv) < SVt_PVIV) sv_upgrade(sv, SVt_PVIV);
+            SvIV_set(sv, (IV)(int64_t)b);
+            return 0;
+        case GOPERL_SVSLOT_UV:
+            if (SvTYPE(sv) != SVt_IV && SvTYPE(sv) < SVt_PVIV) sv_upgrade(sv, SVt_PVIV);
+            SvUV_set(sv, (UV)b);
+            return 0;
         case GOPERL_SVSLOT_NV: {
             NV nv;
             memcpy(&nv, &b, sizeof nv);
+            if (SvTYPE(sv) != SVt_NV && SvTYPE(sv) < SVt_PVNV)
+                sv_upgrade(sv, SvTYPE(sv) == SVt_NULL ? SVt_NV : SVt_PVNV);
             SvNV_set(sv, nv);
             return 0;
         }
         case GOPERL_SVSLOT_PV: SvPV_set(sv, (char *)(uintptr_t)(uint32_t)b); return 0;
         case GOPERL_SVSLOT_LEN: SvLEN_set(sv, (STRLEN)b); return 0;
+        case GOPERL_SVSLOT_GV_STASH:
+            if (isGV_with_GP(sv)) GvSTASH((GV *)sv) = (HV *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case GOPERL_SVSLOT_GV_CVGEN:
+            if (isGV_with_GP(sv)) GvCVGEN((GV *)sv) = (U32)b;
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown sv slot %d", (int)(a >> 32));
+    }
+    case GOPERL_OP_SV_SLOT_GET: { /* a = a GOPERL_SVSLOT_ selector<<32 | sv
+                 * -> what the body slot holds, as the SvXXX_set op takes
+                 * it. A body too small to have the slot reads as zero. */
+        SV *sv = (SV *)(uintptr_t)(uint32_t)a;
+        const svtype t = SvTYPE(sv);
+        switch ((int)(a >> 32)) {
+        case GOPERL_SVSLOT_RV:
+            return SvROK(sv) ? (uint64_t)(uintptr_t)SvRV(sv) : 0;
+        case GOPERL_SVSLOT_STASH:
+            return t >= SVt_PVMG ? (uint64_t)(uintptr_t)(SV *)SvSTASH(sv) : 0;
+        case GOPERL_SVSLOT_IV:
+            if (t != SVt_IV && t < SVt_PVIV) return 0;
+            if (SvROK(sv) || isGV_with_GP(sv)) return 0;
+            return (uint64_t)(int64_t)SvIVX(sv);
+        case GOPERL_SVSLOT_UV:
+            if (t != SVt_IV && t < SVt_PVIV) return 0;
+            if (SvROK(sv) || isGV_with_GP(sv)) return 0;
+            return (uint64_t)SvUVX(sv);
+        case GOPERL_SVSLOT_NV: {
+            if (isGV_with_GP(sv)) return 0;
+            uint64_t bits;
+            /* a body without the slot has no bits to give: its value */
+            const NV nv = (t != SVt_NV && t < SVt_PVNV) ? SvNV_nomg(sv) : SvNVX(sv);
+            memcpy(&bits, &nv, sizeof bits);
+            return bits;
+        }
+        case GOPERL_SVSLOT_GV_STASH:
+            return isGV_with_GP(sv) ? (uint64_t)(uintptr_t)(SV *)GvSTASH((GV *)sv) : 0;
+        case GOPERL_SVSLOT_GV_CVGEN:
+            return isGV_with_GP(sv) ? (uint64_t)GvCVGEN((GV *)sv) : 0;
+        }
+        Perl_croak(aTHX_ "goperl: unknown sv slot %d", (int)(a >> 32));
+    }
+    case GOPERL_OP_CALLER_CX: { /* a = level, b bit 0: the frame the debugger
+                 * hides -> (stackinfo token << 32) | (context index + 1),
+                 * or 0 when there is no such frame */
+        const PERL_CONTEXT *dbcx = NULL;
+        const PERL_CONTEXT *cx = caller_cx((I32)(int64_t)a, &dbcx);
+        if (b & 1) cx = dbcx;
+        if (!cx) return 0;
+        for (PERL_SI *si = PL_curstackinfo; si; si = si->si_prev) {
+            if (cx >= si->si_cxstack && cx <= si->si_cxstack + si->si_cxix)
+                return ((uint64_t)(uintptr_t)si << 32) |
+                       (uint32_t)(cx - si->si_cxstack + 1);
+        }
+        return 0;
+    }
+    case GOPERL_OP_PERLIO: { /* a = a GOPERL_PIO_ selector<<32 | handle (or
+                 * IO sv); b and s = the remaining arguments */
+        PerlIO *f = (PerlIO *)(uintptr_t)(uint32_t)a;
+        const int fn = (int)(a >> 32);
+        switch (fn) {
+        case GOPERL_PIO_STDIN: return (uint64_t)(uintptr_t)PerlIO_stdin();
+        case GOPERL_PIO_STDOUT: return (uint64_t)(uintptr_t)PerlIO_stdout();
+        case GOPERL_PIO_STDERR: return (uint64_t)(uintptr_t)PerlIO_stderr();
+        case GOPERL_PIO_FDOPEN: /* b = descriptor, s = mode */
+            return (uint64_t)(uintptr_t)PerlIO_fdopen((int)(int64_t)b, s ? s : "r");
+        case GOPERL_PIO_IFP: {
+            IO *io = (IO *)(uintptr_t)(uint32_t)a;
+            if (!io || SvTYPE((SV *)io) != SVt_PVIO) return 0;
+            return (uint64_t)(uintptr_t)IoIFP(io);
+        }
+        case GOPERL_PIO_OFP: {
+            IO *io = (IO *)(uintptr_t)(uint32_t)a;
+            if (!io || SvTYPE((SV *)io) != SVt_PVIO) return 0;
+            return (uint64_t)(uintptr_t)IoOFP(io);
+        }
+        case GOPERL_PIO_VALID: return PerlIOValid(f) ? 1 : 0;
+        }
+        /* Everything below works on an open handle; on anything else it
+         * fails the way the function does on a closed one. */
+        if (!PerlIOValid(f)) {
+            SETERRNO(EBADF, SS_IVCHAN);
+            return fn == GOPERL_PIO_EOF ? 1 : (uint64_t)(int64_t)-1;
+        }
+        switch (fn) {
+        case GOPERL_PIO_FILENO: return (uint64_t)(int64_t)PerlIO_fileno(f);
+        case GOPERL_PIO_READ: { /* b = count -> buffer<<32 | count read (as
+                 * a signed 32-bit value; negative on error). The bytes
+                 * stay valid until the next read operation. */
+            static char buf[65536];
+            Size_t want = (Size_t)b;
+            if (want > sizeof buf) want = sizeof buf;
+            const SSize_t n = PerlIO_read(f, buf, want);
+            return ((uint64_t)(uint32_t)(uintptr_t)buf << 32) | (uint32_t)(int32_t)n;
+        }
+        case GOPERL_PIO_EOF: return PerlIO_eof(f) ? 1 : 0;
+        case GOPERL_PIO_ERROR: return PerlIO_error(f) ? 1 : 0;
+        case GOPERL_PIO_CLEARERR: PerlIO_clearerr(f); return 0;
+        case GOPERL_PIO_SEEK_SET:
+            return (uint64_t)(int64_t)PerlIO_seek(f, (Off_t)(int64_t)b, SEEK_SET);
+        case GOPERL_PIO_SEEK_CUR:
+            return (uint64_t)(int64_t)PerlIO_seek(f, (Off_t)(int64_t)b, SEEK_CUR);
+        case GOPERL_PIO_SEEK_END:
+            return (uint64_t)(int64_t)PerlIO_seek(f, (Off_t)(int64_t)b, SEEK_END);
+        case GOPERL_PIO_TELL: return (uint64_t)(int64_t)PerlIO_tell(f);
+        case GOPERL_PIO_GETC: return (uint64_t)(int64_t)PerlIO_getc(f);
+        case GOPERL_PIO_UNGETC:
+            return (uint64_t)(int64_t)PerlIO_ungetc(f, (int)(int64_t)b);
+        case GOPERL_PIO_UNREAD: /* s + b = bytes */
+            return (uint64_t)(int64_t)PerlIO_unread(f, s ? s : "", (Size_t)b);
+        case GOPERL_PIO_BINMODE: /* b = iotype<<32 | open mode, s = layers */
+            return PerlIO_binmode(aTHX_ f, (int)(b >> 32), (int)(uint32_t)b,
+                                  (s && *s) ? s : NULL) ? 1 : 0;
+        case GOPERL_PIO_SETLINEBUF: PerlIO_setlinebuf(f); return 0;
+        /* the read buffer of the handle; pointers are linear-memory ones */
+        case GOPERL_PIO_FAST_GETS: return PerlIO_fast_gets(f) ? 1 : 0;
+        case GOPERL_PIO_HAS_CNTPTR: return PerlIO_has_cntptr(f) ? 1 : 0;
+        case GOPERL_PIO_CANSET_CNT: return PerlIO_canset_cnt(f) ? 1 : 0;
+        case GOPERL_PIO_HAS_BASE: return PerlIO_has_base(f) ? 1 : 0;
+        case GOPERL_PIO_GET_CNT: return (uint64_t)(int64_t)PerlIO_get_cnt(f);
+        case GOPERL_PIO_GET_PTR: return (uint64_t)(uintptr_t)PerlIO_get_ptr(f);
+        case GOPERL_PIO_GET_BASE: return (uint64_t)(uintptr_t)PerlIO_get_base(f);
+        case GOPERL_PIO_GET_BUFSIZ: return (uint64_t)PerlIO_get_bufsiz(f);
+        case GOPERL_PIO_SET_PTRCNT: /* b = ptr<<32 | count */
+            PerlIO_set_ptrcnt(f, (STDCHAR *)(uintptr_t)(uint32_t)(b >> 32),
+                              (SSize_t)(int32_t)(uint32_t)b);
+            return 0;
+        case GOPERL_PIO_FILL: return (uint64_t)(int64_t)PerlIO_fill(f);
+        }
+        Perl_croak(aTHX_ "goperl: unknown PerlIO call %d", fn);
     }
     case GOPERL_OP_SV_CALL: { /* a = a GOPERL_SVCALL_ selector<<32 | sv;
                  * b = the remaining argument of that API function */
@@ -4132,9 +4405,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SVCALL_2BOOL:
             return ((b & SV_GMAGIC) ? SvTRUE(sv) : SvTRUE_nomg(sv)) ? 1 : 0;
         case GOPERL_SVCALL_2IV:
-            return (uint64_t)(int64_t)((b & SV_GMAGIC) ? SvIV(sv) : SvIV_nomg(sv));
+            return goperl_sv_wide(aTHX_ sv, false, !(b & SV_GMAGIC));
         case GOPERL_SVCALL_2UV:
-            return (uint64_t)((b & SV_GMAGIC) ? SvUV(sv) : SvUV_nomg(sv));
+            return goperl_sv_wide(aTHX_ sv, true, !(b & SV_GMAGIC));
         case GOPERL_SVCALL_2NV: {
             NV nv = (b & SV_GMAGIC) ? SvNV(sv) : SvNV_nomg(sv);
             uint64_t bits;
@@ -4146,6 +4419,13 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             const char *p = SvPV_flags(sv, len, (I32)b);
             return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
         }
+        case GOPERL_SVCALL_2PVBYTE: { /* -> (linear-memory ptr << 32) | len;
+                 * dies with "Wide character" when the string has no byte form */
+            STRLEN len = 0;
+            const char *p = (b & SV_GMAGIC) ? SvPVbyte(sv, len) : SvPVbyte_nomg(sv, len);
+            return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+        }
+        case GOPERL_SVCALL_HV_KSPLIT: hv_ksplit((HV *)sv, (IV)(int64_t)b); return 0;
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
             SvOK_off(sv);
             return 0;
@@ -4245,6 +4525,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SVSTR_GET_CVN:
             return (uint64_t)(uintptr_t)(SV *)get_cvn_flags(str, len, (I32)flags);
         case GOPERL_SVSTR_WHICHSIG: return (uint64_t)(int64_t)whichsig_pvn(str, len);
+        case GOPERL_SVSTR_SETENV: { /* str = name NUL value; flags bit 0:
+                 * remove the variable */
+            const char *val = str + strlen(str) + 1;
+            my_setenv(str, (flags & 1) ? NULL : val);
+            return 0;
+        }
         case GOPERL_SVSTR_COP_HINT: /* sv slot = COP token, 0 for PL_curcop */
             return (uint64_t)(uintptr_t)cop_hints_fetch_pvn(
                 sv ? (const COP *)sv : PL_curcop, str, len, 0, flags);
