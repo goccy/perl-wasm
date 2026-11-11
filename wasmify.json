@@ -64,7 +64,9 @@
     "CustomBridgeSources": [
       "perl.cc",
       "perl_wasi.cc",
-      "perl_program.cc"
+      "perl_program.cc",
+      "perl_process.cc",
+      "perl_signal.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",

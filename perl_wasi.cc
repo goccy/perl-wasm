@@ -75,6 +75,8 @@ static PerlIO *wasi_spawn_finish(pTHX_ int parent_fd, const char *mode,
                                  pid_t pid) {
     PerlIO *fp = PerlIO_fdopen(parent_fd, mode);
     if (!fp) return NULL;
+    /* what a piped open returns: the pid of the command (my_popen's job) */
+    PL_forkprocess = pid;
     SV **svp = av_fetch(PL_fdpid, PerlIO_fileno(fp), TRUE);
     if (svp) {
         SvUPGRADE(*svp, SVt_IV);
@@ -137,26 +139,32 @@ static struct {
  * pp_open without the C frame that held it. */
 extern "C" { SSize_t wasi_open_return_sp = 0; }
 
-/* A pseudo-process has the pid the host registered it under; the first
- * process keeps libc's. */
+/* A pseudo-process has the pid the host registered it under, and the
+ * process that forked it for a parent; the first process of an instance has
+ * the ids the host gives it (perl_process.cc). */
 static pid_t wasi_self_pid = 0;
 static pid_t wasi_parent_pid = 0;
 
+extern "C" pid_t wasi_host_pid(void);
+extern "C" pid_t wasi_host_ppid(void);
+extern "C" void wasi_signal_fork_child(pTHX);
+
 extern "C" pid_t getpid(void) {
-    /* 42 is the value wasi-libc's emulated getpid reports; the first
-     * process keeps it so behaviour without fork is unchanged. */
-    return wasi_self_pid ? wasi_self_pid : 42;
+    return wasi_self_pid ? wasi_self_pid : wasi_host_pid();
 }
 
 extern "C" pid_t getppid(void) {
-    return wasi_parent_pid ? wasi_parent_pid : 1;
+    return wasi_parent_pid ? wasi_parent_pid : wasi_host_ppid();
 }
 
 extern "C" int kill(pid_t pid, int sig) {
-    if (pid == getpid()) {
-        if (sig == 0) return 0;
-        return raise(sig);
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
     }
+    /* A signal to the process itself is delivered here and now
+     * (perl_signal.cc); any other process is the host's to find. */
+    if (pid == getpid()) return raise(sig);
     int rc = wasi_host_proc_kill((int)pid, sig);
     if (rc != 0) {
         errno = rc < 0 ? -rc : rc;
@@ -229,6 +237,9 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
 
     wasi_parent_pid = getpid();
     wasi_self_pid = (pid_t)pid;
+    /* This instance is new to the host: no signal state of the parent's
+     * came along. */
+    wasi_signal_fork_child(aTHX);
 
     /* The jump environments the copied interpreter points at lived in
      * native frames this instance does not have. */

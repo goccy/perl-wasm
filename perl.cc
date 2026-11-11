@@ -250,6 +250,11 @@ static int32_t g_go_cb = 0;
  * (fn_id, CV token, item count) followed by the frame's SV tokens. */
 #define GOPERL_NATIVE_HDR_WORDS 3
 
+/* Connects this module instance to the host's signal delivery
+ * (perl_signal.cc). Every entry point that runs Perl code calls it: the
+ * instance may be a snapshot copy the host has not seen yet. */
+extern "C" void wasi_signal_attach(pTHX);
+
 /* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
  * via a plain linear-memory write (perl_interrupt_addr returns its address); no
  * wasm code runs on the instance. The interruptible run loop clears it and
@@ -1147,6 +1152,11 @@ uint64_t perl_new(const char *lib_dir) {
      * itself is never interrupted. */
     PL_runops = runops_interruptible;
     g_interrupt = 0;
+    {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        wasi_signal_attach(aTHX);
+    }
 
     /* Install the Go bridge: the named Perl->Go dispatcher (Bind's generated
      * subs call it) and the anonymous value-operation XSUBs. All C — no
@@ -1171,6 +1181,7 @@ std::string perl_eval(uint64_t h, const char *src) {
     }
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
+    wasi_signal_attach(aTHX);
 
     /* Feed the source in as an SV (no C-string escaping needed) and clear the
      * previous result/error slots. */
@@ -1288,6 +1299,7 @@ uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len)
     if (!decode_program(program, program_len, ps)) return UINT32_MAX;
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
+    wasi_signal_attach(aTHX);
     program_execute(aTHX_ ps);
     program_run_end_blocks(aTHX);
     return static_cast<uint32_t>(STATUS_EXIT) & 0xff;
@@ -1484,6 +1496,7 @@ static std::string run_glue_body(pTHX_ const GlueCall &gc) {
 }
 
 static std::string run_glue(pTHX_ const GlueCall &gc) {
+    wasi_signal_attach(aTHX);
     /* Catch a guest exit(): my_exit unwinds with JMPENV_JUMP(2), and without
      * a live JMPENV here it would fall through to the C exit() — a wasi
      * proc_exit that aborts the wasm mid-call, before PerlIO ever flushes.

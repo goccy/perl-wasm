@@ -1,0 +1,439 @@
+/* perl_signal.cc — signals for a process that cannot be interrupted.
+ *
+ * A WASI guest is ordinary code on one thread of the host: nothing can make
+ * it run a handler at an arbitrary instruction. That is not what perl needs
+ * anyway. Its own C-level handler only notes the signal and sets
+ * PL_sig_pending, and the interpreter runs the %SIG handler at its next
+ * safe point (PERL_ASYNC_CHECK). This file supplies the part of that scheme
+ * the kernel and libc normally play:
+ *
+ *   - the disposition table (sigaction, signal), the signal mask
+ *     (sigprocmask, sigsuspend, sigpending) and the signal sets;
+ *   - delivery. A signal the process sends itself (kill with its own pid,
+ *     raise) is delivered here and now. A signal from outside — another
+ *     process, the alarm timer, the embedder — is recorded by the host,
+ *     which also stores 1 into PL_sig_pending; the interpreter then calls
+ *     PL_signalhook at its next safe point, and the hook installed here
+ *     takes the recorded signals from the host and delivers them before
+ *     perl dispatches its handlers;
+ *   - the default actions: nothing for SIGCHLD, SIGURG, SIGWINCH, SIGCONT
+ *     and the stop signals (stopping has no meaning here), and the end of
+ *     the process for every other signal, reported by the host as a death
+ *     by that signal.
+ *
+ * Blocking host calls (sleep, select, waitpid, accept, reads of pipes and
+ * sockets) return EINTR when a signal is recorded, so the safe point comes.
+ *
+ * Signal masks cross to the host as 64-bit values in which signal n is bit
+ * n-1.
+ */
+/* SIG_BLOCK and friends, which wasi-libc leaves out; first, as in the perl
+ * build, which force-includes it */
+#include "scripts/wasi-posix-shim.h"
+
+#include <EXTERN.h>
+#include <perl.h>
+
+#include <signal.h>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <unistd.h>
+#include <wasi/api.h>
+
+extern "C" {
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_register")))
+int wasi_host_proc_signal_register(void *flag);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_dispositions")))
+int wasi_host_proc_signal_dispositions(uint64_t handled, uint64_t ignored, uint64_t blocked);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_take")))
+int wasi_host_proc_signal_take(uint64_t *mask);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_alarm")))
+int wasi_host_proc_alarm(unsigned int seconds, unsigned int *remaining);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
+void wasi_host_proc_terminate(int sig);
+
+} /* extern "C" */
+
+namespace {
+
+typedef void (*handler_t)(int);
+
+inline uint64_t sig_bit(int sig) { return (uint64_t)1 << (sig - 1); }
+inline bool sig_valid(int sig) { return sig >= 1 && sig < NSIG; }
+
+const uint64_t kDefaultIgnored =
+    sig_bit(SIGCHLD) | sig_bit(SIGCONT) | sig_bit(SIGSTOP) | sig_bit(SIGTSTP) |
+    sig_bit(SIGTTIN) | sig_bit(SIGTTOU) | sig_bit(SIGURG) | sig_bit(SIGWINCH);
+/* SIGKILL and SIGSTOP can be neither caught, ignored nor blocked. */
+const uint64_t kUnmaskable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+
+/* ---- signal sets ----------------------------------------------------------
+ * wasi-libc's sigset_t is a placeholder: one unsigned char. It cannot hold
+ * a set, and perl is compiled against it (struct sigaction embeds one,
+ * POSIX::SigSet stores one), so its size is fixed. The byte therefore NAMES
+ * a set: it is an index into this table of the distinct sets the process
+ * has made, 0 being the empty set. A sigset_t is still a plain value —
+ * copying it copies the set, since table entries never change — and a
+ * process gets by with a handful of distinct sets. When the table is full,
+ * the function that needed a new entry fails with ENOMEM. */
+uint64_t g_sets[256]; /* g_sets[0] == 0: the empty set */
+int g_set_count = 1;
+
+uint64_t set_mask(const sigset_t *set) {
+    const unsigned idx = (unsigned char)*set;
+    return idx < (unsigned)g_set_count ? g_sets[idx] : 0;
+}
+
+/* Stores mask in *set. Returns 0, or -1 with errno set. */
+int set_assign(sigset_t *set, uint64_t mask) {
+    for (int i = 0; i < g_set_count; i++) {
+        if (g_sets[i] == mask) {
+            *set = (sigset_t)i;
+            return 0;
+        }
+    }
+    if (g_set_count == 256) {
+        errno = ENOMEM;
+        return -1;
+    }
+    g_sets[g_set_count] = mask;
+    *set = (sigset_t)g_set_count++;
+    return 0;
+}
+
+/* ---- dispositions and mask ------------------------------------------------ */
+struct action {
+    handler_t handler; /* SIG_DFL, SIG_IGN, or the handler (either form) */
+    uint64_t mask;     /* blocked while the handler runs */
+    int flags;
+};
+action g_actions[NSIG]; /* zero-initialised: every signal at SIG_DFL */
+uint64_t g_blocked = 0; /* the signal mask */
+uint64_t g_held = 0;    /* delivered while blocked: pending until unblocked */
+/* Counts handler runs, so that pause and sigsuspend know one happened. */
+unsigned long g_handler_runs = 0;
+
+/* Tells the host which signals would be noticed, so that it neither keeps
+ * nor interrupts a blocking call for one that would not. */
+void report_dispositions() {
+    uint64_t handled = 0, ignored = 0;
+    for (int sig = 1; sig < NSIG; sig++) {
+        const handler_t h = g_actions[sig].handler;
+        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig))))
+            ignored |= sig_bit(sig);
+        else if (h != SIG_DFL)
+            handled |= sig_bit(sig);
+    }
+    wasi_host_proc_signal_dispositions(handled, ignored, g_blocked);
+}
+
+void release_held();
+
+/* Delivers a signal that is not blocked: runs its handler, or takes its
+ * default action. */
+void deliver(int sig) {
+    const action act = g_actions[sig];
+    if (act.handler == SIG_IGN) return;
+    if (act.handler == SIG_DFL) {
+        if (kDefaultIgnored & sig_bit(sig)) return;
+        wasi_host_proc_terminate(sig);
+    }
+    if (act.flags & SA_RESETHAND) {
+        g_actions[sig].handler = SIG_DFL;
+        report_dispositions();
+    }
+    /* The handler runs with its own mask added, as sigaction specifies. The
+     * host is not told about this short-lived mask: it only matters to
+     * signals the handler sends to its own process, which are delivered
+     * right here. */
+    const uint64_t saved = g_blocked;
+    g_blocked |= act.mask;
+    if (!(act.flags & SA_NODEFER)) g_blocked |= sig_bit(sig);
+    g_blocked &= ~kUnmaskable;
+    g_handler_runs++;
+    if (act.flags & SA_SIGINFO) {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        info.si_signo = sig;
+        ((void (*)(int, siginfo_t *, void *))act.handler)(sig, &info, NULL);
+    } else {
+        act.handler(sig);
+    }
+    g_blocked = saved;
+    release_held();
+}
+
+/* A signal has arrived for this process: deliver it, or hold it while it is
+ * blocked. */
+void arrive(int sig) {
+    if (g_blocked & sig_bit(sig)) {
+        const handler_t h = g_actions[sig].handler;
+        /* An ignored signal is discarded even while blocked. */
+        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig)))) return;
+        g_held |= sig_bit(sig);
+        return;
+    }
+    deliver(sig);
+}
+
+/* Delivers the held signals that are no longer blocked, lowest first. */
+void release_held() {
+    for (;;) {
+        const uint64_t ready = g_held & ~g_blocked;
+        if (!ready) return;
+        const int sig = __builtin_ctzll(ready) + 1;
+        g_held &= ~sig_bit(sig);
+        deliver(sig);
+    }
+}
+
+/* Takes the signals the host has recorded for this process and lets each
+ * arrive. */
+void absorb_posted() {
+    uint64_t posted = 0;
+    if (wasi_host_proc_signal_take(&posted) != 0) return;
+    while (posted) {
+        const int sig = __builtin_ctzll(posted) + 1;
+        posted &= posted - 1;
+        if (sig_valid(sig)) arrive(sig);
+    }
+}
+
+/* Blocks until the host reports a signal for this process. The wait is a
+ * poll on a clock, which the host ends with EINTR when it records a signal;
+ * the clock only bounds one round of the wait. */
+void wait_for_signal() {
+    for (;;) {
+        __wasi_subscription_t sub;
+        memset(&sub, 0, sizeof(sub));
+        sub.u.tag = __WASI_EVENTTYPE_CLOCK;
+        sub.u.u.clock.id = __WASI_CLOCKID_MONOTONIC;
+        sub.u.u.clock.timeout = (__wasi_timestamp_t)3600 * 1000000000ull;
+        __wasi_event_t event;
+        __wasi_size_t nevents = 0;
+        if (__wasi_poll_oneoff(&sub, &event, 1, &nevents) == __WASI_ERRNO_INTR) return;
+    }
+}
+
+/* PL_signalhook: called by the interpreter at a safe point when
+ * PL_sig_pending is set — by perl's own C-level handler, or by the host.
+ * It brings the host's recorded signals in (perl's handler, called by
+ * deliver, queues them in PL_psig_pend) and then lets perl dispatch.
+ *
+ * Perl_despatch_signals clears PL_sig_pending before it runs the handlers.
+ * A signal the host records after the take below but before that clear
+ * would sit unnoticed, its flag wiped; so the host is asked once more when
+ * the dispatch is over — also when a handler leaves it by dying, hence the
+ * save-stack destructor. Whatever that second take brings in is queued and
+ * sets PL_sig_pending again, for the next safe point. */
+void absorb_destructor(pTHX_ void *) { absorb_posted(); }
+
+void signal_hook(pTHX) {
+    ENTER;
+    SAVEDESTRUCTOR_X(absorb_destructor, NULL);
+    absorb_posted();
+    Perl_despatch_signals(aTHX);
+    LEAVE;
+}
+
+} /* namespace */
+
+extern "C" {
+
+/* SIG_IGN and SIG_ERR are the addresses of these two under
+ * _WASI_EMULATED_SIGNAL (1 and -1 are not usable function pointers in
+ * wasm). wasi-libc's emulation defines them next to its own signal() and
+ * raise(), which the definitions below replace; defining them here keeps
+ * that object file out of the link. Neither is ever called. */
+void __SIG_IGN(int) {}
+void __SIG_ERR(int) {}
+
+int sigemptyset(sigset_t *set) { return set_assign(set, 0); }
+
+int sigfillset(sigset_t *set) {
+    return set_assign(set, sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1));
+}
+
+int sigaddset(sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return set_assign(set, set_mask(set) | sig_bit(sig));
+}
+
+int sigdelset(sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return set_assign(set, set_mask(set) & ~sig_bit(sig));
+}
+
+int sigismember(const sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return (set_mask(set) & sig_bit(sig)) != 0;
+}
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const action prev = g_actions[sig];
+    if (act) {
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            errno = EINVAL;
+            return -1;
+        }
+        action next;
+        next.handler = (act->sa_flags & SA_SIGINFO) ? (handler_t)act->sa_sigaction
+                                                     : act->sa_handler;
+        next.mask = set_mask(&act->sa_mask);
+        next.flags = act->sa_flags;
+        g_actions[sig] = next;
+    }
+    if (old) {
+        memset(old, 0, sizeof(*old));
+        if (prev.flags & SA_SIGINFO)
+            old->sa_sigaction = (void (*)(int, siginfo_t *, void *))prev.handler;
+        else
+            old->sa_handler = prev.handler;
+        old->sa_flags = prev.flags;
+        if (set_assign(&old->sa_mask, prev.mask) != 0) return -1;
+    }
+    if (act) {
+        const handler_t h = g_actions[sig].handler;
+        /* Setting a signal to be ignored discards it if it is pending. */
+        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig))))
+            g_held &= ~sig_bit(sig);
+        report_dispositions();
+    }
+    return 0;
+}
+
+handler_t signal(int sig, handler_t handler) {
+    struct sigaction act, old;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+    if (sigaction(sig, &act, &old) != 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
+    const uint64_t prev = g_blocked;
+    if (set) {
+        const uint64_t mask = set_mask(set);
+        switch (how) {
+        case SIG_BLOCK:
+            g_blocked = prev | mask;
+            break;
+        case SIG_UNBLOCK:
+            g_blocked = prev & ~mask;
+            break;
+        case SIG_SETMASK:
+            g_blocked = mask;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+        g_blocked &= ~kUnmaskable;
+    }
+    if (old && set_assign(old, prev) != 0) {
+        g_blocked = prev;
+        return -1;
+    }
+    if (set && g_blocked != prev) {
+        report_dispositions();
+        /* What the host held back while it was blocked, and what was held
+         * here, is delivered before sigprocmask returns. */
+        absorb_posted();
+        release_held();
+    }
+    return 0;
+}
+
+int sigpending(sigset_t *set) {
+    absorb_posted(); /* the host holds the blocked signals it recorded */
+    return set_assign(set, g_held);
+}
+
+/* Waits, with the signal mask replaced by *mask, until a handler has run. */
+int sigsuspend(const sigset_t *mask) {
+    const uint64_t saved = g_blocked;
+    const unsigned long runs = g_handler_runs;
+    g_blocked = set_mask(mask) & ~kUnmaskable;
+    report_dispositions();
+    absorb_posted();
+    release_held();
+    while (g_handler_runs == runs) {
+        wait_for_signal();
+        absorb_posted();
+    }
+    g_blocked = saved;
+    report_dispositions();
+    release_held();
+    errno = EINTR;
+    return -1;
+}
+
+int pause(void) {
+    const unsigned long runs = g_handler_runs;
+    absorb_posted();
+    while (g_handler_runs == runs) {
+        wait_for_signal();
+        absorb_posted();
+    }
+    errno = EINTR;
+    return -1;
+}
+
+int raise(int sig) {
+    if (sig == 0) return 0;
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    arrive(sig);
+    return 0;
+}
+
+unsigned int alarm(unsigned int seconds) {
+    unsigned int remaining = 0;
+    wasi_host_proc_alarm(seconds, &remaining);
+    return remaining;
+}
+
+/* Connects the interpreter of THIS module instance to the host's signal
+ * delivery: registers PL_sig_pending as the word the host raises, installs
+ * the safe-point hook, and tells the host the dispositions. An instance
+ * may be a copy of the one that did this before — made from a snapshot of
+ * its memory, or by fork — for which the host knows none of it; so this is
+ * called whenever the interpreter is entered, and the host answers at once
+ * when it has nothing to learn. */
+void wasi_signal_attach(pTHX) {
+    PL_signalhook = signal_hook;
+    if (wasi_host_proc_signal_register((void *)&PL_sig_pending) == 0)
+        report_dispositions();
+}
+
+/* The child side of fork: signals pending for the parent are not pending
+ * for the child (the alarm is not inherited either; the host starts the
+ * child without one). */
+void wasi_signal_fork_child(pTHX) {
+    g_held = 0;
+    wasi_signal_attach(aTHX);
+}
+
+} /* extern "C" */
