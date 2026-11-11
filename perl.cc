@@ -432,6 +432,12 @@ static int runops_interruptible(pTHX) {
         }
     }
     PERL_ASYNC_CHECK();
+
+    /* The run loop ends with no taint pending, as Perl_runops_standard's
+     * does: a die that unwinds to an eval leaves PL_tainted as the failing
+     * op set it, and the code that called the loop (the parser compiling the
+     * next `use`, for a BEGIN block) must not inherit it. */
+    TAINT_NOT;
     return 0;
 }
 
