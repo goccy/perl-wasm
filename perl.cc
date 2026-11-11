@@ -228,6 +228,9 @@ static int32_t g_go_cb = 0;
  * its mirror MAGIC chain (e.g. Moose's re-export flag magic, which clears
  * itself when the glob is overwritten). */
 #define GOPERL_MG_SET_METHOD_ID (-5)
+/* `local` on an SV that carries the anchor: the payload is the anchor's
+ * host id and the token of the SV that takes the variable's place. */
+#define GOPERL_MG_LOCAL_METHOD_ID (-8)
 
 /* Reserved callback method id for PerlIO layer hooks: a host-registered
  * layer (op PERLIO_DEF_LAYER) gets its CUSTOM slots (Pushed/Fill/Popped)
@@ -2131,8 +2134,27 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
     return 0;
 }
 
+/* `local` gives the new value of a variable a copy of the variable's
+ * container magic (mg_localize). A copy of the anchor would give two SVs
+ * the same host id: writes to the new value would be reported for the old
+ * one, and the end of the scope, freeing the new value, would tear down
+ * the magic of the variable itself. So the anchor is not copied (it has
+ * svt_local, which mg_localize calls instead); the host is told, and gives
+ * the new SV what mg_localize would give it for each MAGIC of its mirror,
+ * under an anchor of its own. */
+static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
+    if (g_go_cb != 0) {
+        uint32_t req[2] = {(uint32_t)(uintptr_t)mg->mg_ptr, (uint32_t)(uintptr_t)nsv};
+        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_LOCAL_METHOD_ID,
+                                             req, sizeof(req));
+        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
+        if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+    }
+    return 0;
+}
+
 static const MGVTBL goperl_host_mg_vtbl = {
-    NULL, NULL, NULL, NULL, goperl_host_mg_free, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, goperl_host_mg_free, NULL, NULL, goperl_host_mg_local
 };
 
 /* Set-magic variant of the anchor: assigning to the SV additionally fires
@@ -2153,7 +2175,8 @@ static int goperl_host_mg_set(pTHX_ SV *sv, MAGIC *mg) {
 }
 
 static const MGVTBL goperl_host_mg_vtbl_set = {
-    NULL, goperl_host_mg_set, NULL, NULL, goperl_host_mg_free, NULL, NULL, NULL
+    NULL, goperl_host_mg_set, NULL, NULL, goperl_host_mg_free, NULL, NULL,
+    goperl_host_mg_local
 };
 
 /* ---- host-backed PerlIO layers (v7) --------------------------------------
@@ -2545,7 +2568,8 @@ enum {
     GOPERL_PIO_GET_BASE = 27,
     GOPERL_PIO_GET_BUFSIZ = 28,
     GOPERL_PIO_SET_PTRCNT = 29,
-    GOPERL_PIO_FILL = 30
+    GOPERL_PIO_FILL = 30,
+    GOPERL_PIO_APPLY_LAYERS = 31
 };
 
 /* SAVE_MISC selectors. */
@@ -2630,7 +2654,11 @@ enum {
     GOPERL_SVCALL_2PVBYTE = 51,
     GOPERL_SVCALL_HV_KSPLIT = 52,
     GOPERL_SVCALL_UNI_DISPLAY = 53,
-    GOPERL_SVCALL_TAINT_ENV = 54 /* no SV: taint_env() */
+    GOPERL_SVCALL_TAINT_ENV = 54, /* no SV: taint_env() */
+    GOPERL_SVCALL_MAGIC_IS_VALUE = 55, /* the SV slot is a magic type: whether
+                 * it is value magic, which `local` does not copy */
+    GOPERL_SVCALL_TIED = 56 /* b = the kind of tie magic: 1<<32 | the object
+                 * the SV is tied to (SvTIED_obj), or 0 when it is not tied */
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -3289,6 +3317,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                                 &goperl_host_mg_vtbl, NULL, 0);
         mg->mg_private = 0;
         mg->mg_ptr = (char *)(uintptr_t)(uint32_t)(b >> 32);
+        mg->mg_flags |= MGf_LOCAL; /* see goperl_host_mg_local */
         return 0;
     }
     case GOPERL_OP_MAGIC_ID: {
@@ -4464,6 +4493,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PIO_BINMODE: /* b = iotype<<32 | open mode, s = layers */
             return PerlIO_binmode(aTHX_ f, (int)(b >> 32), (int)(uint32_t)b,
                                   (s && *s) ? s : NULL) ? 1 : 0;
+        case GOPERL_PIO_APPLY_LAYERS: { /* s = the mode, NUL, the layers */
+            const char *mode = s ? s : "";
+            const char *names = mode + strlen(mode) + 1;
+            return (uint64_t)(int64_t)PerlIO_apply_layers(
+                aTHX_ f, *mode ? mode : NULL, names);
+        }
         case GOPERL_PIO_SETLINEBUF: PerlIO_setlinebuf(f); return 0;
         /* the read buffer of the handle; pointers are linear-memory ones */
         case GOPERL_PIO_FAST_GETS: return PerlIO_fast_gets(f) ? 1 : 0;
@@ -4572,6 +4607,13 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         case GOPERL_SVCALL_HV_KSPLIT: hv_ksplit((HV *)sv, (IV)(int64_t)b); return 0;
         case GOPERL_SVCALL_TAINT_ENV: taint_env(); return 0;
+        case GOPERL_SVCALL_TIED: {
+            MAGIC *const mg = SvTIED_mg(sv, (int)(int64_t)b);
+            if (!mg) return 0;
+            return ((uint64_t)1 << 32) | (uint32_t)(uintptr_t)SvTIED_obj(sv, mg);
+        }
+        case GOPERL_SVCALL_MAGIC_IS_VALUE:
+            return PERL_MAGIC_TYPE_IS_VALUE_MAGIC((uint32_t)a) ? 1 : 0;
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
             SvOK_off(sv);
             return 0;
