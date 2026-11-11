@@ -134,6 +134,17 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
     if (ps.taint != PROG_TAINT_OFF) {
         TAINTING_set(TRUE);
         TAINT_WARN_set(ps.taint == PROG_TAINT_WARN);
+        /* $^X and %ENV exist since perl_parse, from before tainting was
+         * on; under -T perl creates both tainted (perl.c: set_caret_X and
+         * init_postdump_symbols run inside TAINT). */
+        GV *caret_x = gv_fetchpvs("\030", GV_ADD | GV_NOTQUAL, SVt_PV);
+        if (caret_x) sv_taint(GvSV(caret_x));
+        if (PL_envgv) {
+            HV *env = GvHVn(PL_envgv);
+            HE *he;
+            hv_iterinit(env);
+            while ((he = hv_iternext(env))) sv_taint(HeVAL(he));
+        }
     }
 #endif
     PL_minus_n = cBOOL(ps.flags & PROG_LOOP);
@@ -242,7 +253,9 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
     /* init_postdump_symbols: $0, the -s variables, @ARGV */
     {
         GV *zero = gv_fetchpvs("0", GV_ADD | GV_NOTQUAL, SVt_PV);
+        TAINT;
         if (zero) sv_setpv(GvSV(zero), PL_origfilename);
+        TAINT_NOT;
     }
     for (const ProgramDefine &d : ps.defines) {
         GV *gv = gv_fetchpvn_flags(d.name.data(), d.name.size(), GV_ADD, SVt_PV);
