@@ -108,6 +108,22 @@ extern "C" {
 #endif
 
 mode_t umask(mode_t);
+/* The real-time interval timer. wasi-libc guards setitimer, getitimer and
+ * their types out of <sys/time.h> ("WASI has no getitimer") and shows ualarm
+ * only to _GNU_SOURCE code; perl_signal.cc implements all three on the timer
+ * the host keeps, the one alarm() sets. ITIMER_REAL is the only timer there
+ * is: the process CPU-time timers (ITIMER_VIRTUAL, ITIMER_PROF) have nothing
+ * to count, and stay undefined so that nothing offers them. */
+#ifndef ITIMER_REAL
+#define ITIMER_REAL 0
+struct itimerval {
+	struct timeval it_interval;
+	struct timeval it_value;
+};
+#endif
+int getitimer(int, struct itimerval *);
+int setitimer(int, const struct itimerval *, struct itimerval *);
+unsigned ualarm(unsigned, unsigned);
 /* wasi-libc keeps futimes out of <sys/time.h> and out of the library as a
  * legacy function; wasmify's host-fs shim defines it over futimens. */
 int futimes(int, const struct timeval [2]);

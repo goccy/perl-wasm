@@ -16,6 +16,8 @@
  *     PL_signalhook at its next safe point, and the hook installed here
  *     takes the recorded signals from the host and delivers them before
  *     perl dispatches its handlers;
+ *   - the real-time interval timer (alarm, ualarm, setitimer and getitimer
+ *     with ITIMER_REAL), which the host keeps and which posts SIGALRM;
  *   - the default actions: nothing for SIGCHLD, SIGURG, SIGWINCH, SIGCONT
  *     and the stop signals (stopping has no meaning here), and the end of
  *     the process for every other signal, reported by the host as a death
@@ -35,7 +37,9 @@
 #include <perl.h>
 
 #include <signal.h>
+#include <sys/time.h>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <unistd.h>
@@ -52,8 +56,18 @@ int wasi_host_proc_signal_dispositions(uint64_t handled, uint64_t ignored, uint6
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_take")))
 int wasi_host_proc_signal_take(uint64_t *mask);
 
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_alarm")))
-int wasi_host_proc_alarm(unsigned int seconds, unsigned int *remaining);
+/* The real-time interval timer. state receives what the timer was before
+ * the call: the nanoseconds until it fires next (0: not set) and its reload
+ * interval (0: it fires once). When set is non-zero the timer is replaced
+ * by one that fires value_ns from now and every interval_ns after that; a
+ * value of 0 disarms it. */
+struct wasi_timer_state {
+    uint64_t left_ns;
+    uint64_t interval_ns;
+};
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_itimer")))
+int wasi_host_proc_itimer(int set, int64_t value_ns, int64_t interval_ns,
+                          struct wasi_timer_state *state);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
 void wasi_host_proc_terminate(int sig);
@@ -242,6 +256,35 @@ void signal_hook(pTHX) {
     LEAVE;
 }
 
+/* ---- interval timer times -------------------------------------------------- */
+const uint64_t kNanosPerSecond = 1000000000ull;
+
+bool timeval_valid(const struct timeval &tv) {
+    return tv.tv_sec >= 0 && tv.tv_usec >= 0 && tv.tv_usec < 1000000;
+}
+
+/* A valid timeval in nanoseconds; a time too far off to count is the
+ * farthest one there is. */
+int64_t nanos_of(const struct timeval &tv) {
+    const int64_t limit = INT64_MAX / (int64_t)kNanosPerSecond - 1;
+    if ((int64_t)tv.tv_sec > limit) return INT64_MAX;
+    return (int64_t)tv.tv_sec * (int64_t)kNanosPerSecond + (int64_t)tv.tv_usec * 1000;
+}
+
+/* Nanoseconds as a timeval, rounded up to the microsecond. */
+struct timeval timeval_of(uint64_t nanos) {
+    struct timeval tv;
+    uint64_t seconds = nanos / kNanosPerSecond;
+    uint64_t micros = (nanos % kNanosPerSecond + 999) / 1000;
+    if (micros == 1000000) {
+        seconds++;
+        micros = 0;
+    }
+    tv.tv_sec = (time_t)seconds;
+    tv.tv_usec = (suseconds_t)micros;
+    return tv;
+}
+
 } /* namespace */
 
 extern "C" {
@@ -409,10 +452,62 @@ int raise(int sig) {
     return 0;
 }
 
+/* ---- the interval timer ---------------------------------------------------
+ * One timer, kept by the host, behind all four functions: alarm and ualarm
+ * are setitimer(ITIMER_REAL) with their own units, as POSIX describes them.
+ * Times that were left are rounded up, so a timer that is set never reads
+ * as zero. */
 unsigned int alarm(unsigned int seconds) {
-    unsigned int remaining = 0;
-    wasi_host_proc_alarm(seconds, &remaining);
-    return remaining;
+    wasi_timer_state old = {0, 0};
+    wasi_host_proc_itimer(1, (int64_t)seconds * kNanosPerSecond, 0, &old);
+    return (unsigned int)((old.left_ns + kNanosPerSecond - 1) / kNanosPerSecond);
+}
+
+unsigned ualarm(unsigned value, unsigned interval) {
+    wasi_timer_state old = {0, 0};
+    wasi_host_proc_itimer(1, (int64_t)value * 1000, (int64_t)interval * 1000, &old);
+    const uint64_t left = (old.left_ns + 999) / 1000;
+    return left > UINT_MAX ? UINT_MAX : (unsigned)left;
+}
+
+int getitimer(int which, struct itimerval *current) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+    wasi_timer_state state = {0, 0};
+    const int rc = wasi_host_proc_itimer(0, 0, 0, &state);
+    if (rc != 0) {
+        errno = -rc;
+        return -1;
+    }
+    current->it_value = timeval_of(state.left_ns);
+    current->it_interval = timeval_of(state.interval_ns);
+    return 0;
+}
+
+int setitimer(int which, const struct itimerval *next, struct itimerval *old) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (next && (!timeval_valid(next->it_value) || !timeval_valid(next->it_interval))) {
+        errno = EINVAL;
+        return -1;
+    }
+    wasi_timer_state state = {0, 0};
+    const int rc = next ? wasi_host_proc_itimer(1, nanos_of(next->it_value),
+                                                nanos_of(next->it_interval), &state)
+                        : wasi_host_proc_itimer(0, 0, 0, &state);
+    if (rc != 0) {
+        errno = -rc;
+        return -1;
+    }
+    if (old) {
+        old->it_value = timeval_of(state.left_ns);
+        old->it_interval = timeval_of(state.interval_ns);
+    }
+    return 0;
 }
 
 /* Connects the interpreter of THIS module instance to the host's signal
@@ -429,8 +524,8 @@ void wasi_signal_attach(pTHX) {
 }
 
 /* The child side of fork: signals pending for the parent are not pending
- * for the child (the alarm is not inherited either; the host starts the
- * child without one). */
+ * for the child (the interval timer is not inherited either; the host
+ * starts the child without one). */
 void wasi_signal_fork_child(pTHX) {
     g_held = 0;
     wasi_signal_attach(aTHX);

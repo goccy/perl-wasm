@@ -83,14 +83,14 @@ Filter/Util/Call Hash/Util Hash/Util/FieldHash I18N/Langinfo IO List/Util \
 Math/BigInt/FastCalc MIME/Base64 Opcode POSIX PerlIO/encoding \
 PerlIO/via SDBM_File Socket Storable Sys/Hostname Time/HiRes Time/Piece \
 Unicode/Collate Unicode/Normalize mro re"
-# Time/HiRes builds as the REAL core XS module with its clock_* and interval-
-# timer features configured off (see the d_clock_* / d_setitimer overrides
-# below): wasi's clockid_t is `const struct __clockid *` (a struct pointer,
-# CLOCK_REALTIME = &_CLOCK_REALTIME) while Time::HiRes moves clock ids through
-# Perl as integers, and setitimer/ualarm do not exist in wasi-libc. Its
-# Makefile.PL honors those Config values ("possibly set for cross-compilation")
-# and #ifdefs the incompatible XS out, leaving real gettimeofday/usleep/
-# nanosleep/sleep/time. See docs/xs-modules.md.
+# Time/HiRes builds as the REAL core XS module with its clock_* features
+# configured off (see the d_clock_* overrides below): wasi's clockid_t is
+# `const struct __clockid *` (a struct pointer, CLOCK_REALTIME =
+# &_CLOCK_REALTIME) while Time::HiRes moves clock ids through Perl as
+# integers. Its Makefile.PL honors those Config values ("possibly set for
+# cross-compilation") and #ifdefs the incompatible XS out, leaving real
+# gettimeofday/usleep/nanosleep/sleep/time and the interval timer
+# (alarm/ualarm/setitimer/getitimer). See docs/xs-modules.md.
 
 # CPAN distributions linked in on top of the core's extensions: unpacked into
 # perl5/cpan and built by the core's own extension machinery (make_ext.pl runs
@@ -193,15 +193,17 @@ d_sigsetjmp='undef'
 # Time::HiRes feature trim (dist/Time-HiRes/Makefile.PL consults these before
 # probing, exactly for cross-compilation). clock_gettime/clock_getres/
 # clock_nanosleep move clockid_t through Perl IVs — type-incompatible with
-# wasi's pointer clockid_t — and setitimer/getitimer/ualarm have no wasi-libc
-# symbols (the arm-linux base wrongly claims them). nanosleep and usleep DO
-# exist in wasi-libc; the base disables nanosleep, so re-enable it.
+# wasi's pointer clockid_t. nanosleep and usleep DO exist in wasi-libc; the
+# base disables nanosleep, so re-enable it. setitimer, getitimer and ualarm
+# have no wasi-libc symbols: perl_signal.cc defines them over the host's
+# real-time interval timer (ITIMER_REAL, the only timer there is), and
+# scripts/wasi-posix-shim.h declares them.
 d_clock_gettime='undef'
 d_clock_getres='undef'
 d_clock_nanosleep='undef'
-d_setitimer='undef'
-d_getitimer='undef'
-d_ualarm='undef'
+d_setitimer='define'
+d_getitimer='define'
+d_ualarm='define'
 d_nanosleep='define'
 # wasi-sdk emulation opt-ins for POSIX features Perl needs but wasi lacks
 # natively: process clocks (times), signals (%SIG), mman (mmap), getpid (\$\$).

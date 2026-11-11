@@ -47,13 +47,15 @@ Notes:
 - `Socket` is included because the wasm layer enables host sockets
   (`HostSockets: true`); connection *policy* is enforced on the go-perl side.
 - `Time-HiRes` is built with its `clock_gettime`/`clock_getres`/
-  `clock_nanosleep` and interval-timer (`setitimer`/`getitimer`/`ualarm`)
-  features configured off (`d_clock_*`/`d_setitimer`/`d_ualarm` overrides in
+  `clock_nanosleep` features configured off (`d_clock_*` overrides in
   `wasi-configure.sh`): wasi's `clockid_t` is a struct pointer while
-  Time::HiRes moves clock ids through Perl as integers, and the itimer
-  symbols do not exist in wasi-libc. `time`/`gettimeofday`/`tv_interval`/
-  `sleep`/`usleep`/`nanosleep` are the real implementations; the disabled
-  functions fail cleanly so feature probes fall back.
+  Time::HiRes moves clock ids through Perl as integers. `time`/
+  `gettimeofday`/`tv_interval`/`sleep`/`usleep`/`nanosleep` are the real
+  implementations; the disabled functions fail cleanly so feature probes
+  fall back. The interval timer (`alarm`/`ualarm`/`setitimer`/`getitimer`
+  with `ITIMER_REAL`) is implemented in `perl_signal.cc` over a timer the
+  host keeps; the CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) do not
+  exist.
 
 ## CPAN distributions linked in
 
