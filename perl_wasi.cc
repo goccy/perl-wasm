@@ -329,9 +329,6 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
 
     wasi_parent_pid = getpid();
     wasi_self_pid = (pid_t)pid;
-    /* This instance is new to the host: no signal state of the parent's
-     * came along. */
-    wasi_signal_fork_child(aTHX);
 
     /* The jump environments the copied interpreter points at lived in
      * native frames this instance does not have. */
@@ -340,6 +337,11 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     PL_sig_pending = 0;
     if (PL_psig_pend)
         for (int sig = 1; sig < SIG_SIZE; sig++) PL_psig_pend[sig] = 0;
+    /* This instance is new to the host: no signal state of the parent's
+     * came along. Attaching comes after the reset above — the host may
+     * already hold a signal for this child, sent the moment it was forked,
+     * and raises PL_sig_pending for it right here. */
+    wasi_signal_fork_child(aTHX);
 #ifdef PERL_USES_PL_PIDSTATUS
     hv_clear(PL_pidstatus); /* no kids, so don't wait for 'em */
 #endif
