@@ -239,6 +239,13 @@ static int32_t g_go_cb = 0;
  * the croak message bytes. */
 #define GOPERL_RESP_FAIL 0
 #define GOPERL_RESP_OK 1
+#define GOPERL_RESP_THROW 2 /* die with the SV the native code threw */
+
+/* The exception value a native XSUB ended with (croak_sv, or croak(NULL)
+ * on $@): the host hands it over with the SV_CALL THROW operation while the
+ * native code unwinds, and the thunk dies with it once the host call has
+ * returned. NULL whenever no native XSUB is ending that way. */
+static SV *goperl_thrown_sv = NULL;
 
 /* pp-hook request payload: GOPERL_PP_HOOK_HDR_WORDS u32 header words
  * (op token, op type, peek count) followed by at most
@@ -844,6 +851,14 @@ XS(XS_goperl_native_thunk) {
         Perl_croak(aTHX_ "native XS dispatch: empty response");
     unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
 
+    if (resp[0] == GOPERL_RESP_THROW) {
+        SV *thrown = goperl_thrown_sv;
+        goperl_thrown_sv = NULL;
+        free(resp);
+        if (!thrown)
+            Perl_croak(aTHX_ "native XS dispatch: the thrown value is missing");
+        croak_sv(sv_2mortal(thrown));
+    }
     if (resp[0] == GOPERL_RESP_FAIL) { /* the rest is the croak message */
         char msg[512];
         size_t n = resp_len - 1;
@@ -2472,7 +2487,8 @@ enum {
     GOPERL_SVCALL_IO_TYPE = 46,
     GOPERL_SVCALL_IO_FLAGS = 47,
     GOPERL_SVCALL_IO_LINES = 48,
-    GOPERL_SVCALL_SETPV_BUFSIZE = 49
+    GOPERL_SVCALL_SETPV_BUFSIZE = 49,
+    GOPERL_SVCALL_THROW = 50
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -4090,6 +4106,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SVCALL_IO_TYPE: return (uint64_t)(U8)IoTYPE((IO *)sv);
         case GOPERL_SVCALL_IO_FLAGS: return (uint64_t)IoFLAGS((IO *)sv);
         case GOPERL_SVCALL_IO_LINES: return (uint64_t)(int64_t)IoLINES((IO *)sv);
+        case GOPERL_SVCALL_THROW: /* the exception the running native XSUB
+                 * ends with; a copy, as die takes one */
+            SvREFCNT_dec(goperl_thrown_sv);
+            goperl_thrown_sv = newSVsv(sv);
+            return 0;
         case GOPERL_SVCALL_SETPV_BUFSIZE: /* b = cur<<32 | buffer size -> PVX */
             return (uint64_t)(uint32_t)(uintptr_t)sv_setpv_bufsize(sv, (STRLEN)hi, (STRLEN)(uint32_t)b);
         }
