@@ -127,7 +127,8 @@ own inside the `Encode` distribution and has its own `boot_*` registration.
 | `IPC-SysV` | System V IPC (`shmget` / `semget` / `msgget`) does not exist under wasi. |
 | `PerlIO-mmap` | Relies on `mmap`, which wasi implements only partially. |
 | `threads`, `threads-shared` | The interpreter is built without ithreads (`useithreads=undef`); the wasm target is single-threaded. |
-| `XS-APItest`, `XS-Typemap`, `Devel-PPPort` | Test-only / module-author tooling; not needed at runtime. |
+| `XS-APItest`, `XS-Typemap` | Test-only / module-author tooling; not needed at runtime. |
+| `Devel-PPPort` (the XS half) | The XS functions exist for the distribution's own tests. The module itself, `Devel/PPPort.pm`, is pure Perl and ships in the standard library: build tools require it to write `ppport.h`. The perl build step generates it from `PPPort_pm.PL` (see the `build` command in `wasmify.json`). |
 
 If a use case later needs one of the excluded modules, the fix is either to
 port the missing capability into the wasi host layer or
