@@ -38,6 +38,9 @@ WASI_EMU='-D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL -D_WASI_EMULAT
 # core references (dup/exec/kill/... — see the header). Absolute path, baked
 # into config.sh (regenerated per host, so CI-portable).
 POSIX_SHIM="-include $HERE/scripts/wasi-posix-shim.h"
+# Headers of system interfaces wasi-libc has no header for and this project
+# implements (<syslog.h>, see perl_syslog.cc).
+SYSTEM_HEADERS="-I$HERE/scripts/include"
 CLANG="$WASI_SDK_PATH/bin/clang"
 
 [ -d "$PERL/.git" ] || [ -f "$PERL/Configure" ] || {
@@ -230,8 +233,8 @@ d_nanosleep='define'
 # down). Upstream Perl's Configure always adds this for gcc/clang (the arm base
 # config.sh we derive from carries it); the wasi override dropped it. Restore it.
 # Applies to core .c AND every XS extension (MakeMaker reads ccflags via %Config).
-ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM -fno-strict-aliasing'
-cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM -fno-strict-aliasing'
+ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
 optimize='-O2'
 cccdlflags=' '
 ccdlflags=' '
@@ -366,13 +369,11 @@ d_getspnam='undef'
 # glibc/BSD math-error-mode switch (_LIB_VERSION=_IEEE_); wasi-libc has no
 # _LIB_VERSION. Gated by LIBM_LIB_VERSION (d_libm_lib_version).
 d_libm_lib_version='undef'
-# wasi-libc has no <syslog.h> and no syslog(3). Sys::Syslog builds without
-# them when told so: it then takes its constants from the header it carries
-# for this case (cpan/Sys-Syslog/fallback/syslog.h), and its C-library
-# transport ("native") has nothing behind it, like syslog(3) on a system
-# where no log daemon listens. The transports written in Perl (a TCP or UDP
-# log server, a socket or stream path, the console) are the module's own.
-i_syslog='undef'
+# wasi-libc has no <syslog.h> and no syslog(3); this project has both:
+# scripts/include/syslog.h, and openlog/syslog/closelog/setlogmask in
+# perl_syslog.cc, which hand each message to the host. Sys::Syslog's "native"
+# mechanism is built on them like on any libc's.
+i_syslog='define'
 # No terminal control under wasi: there is no <termios.h>. POSIX.xs guards its
 # \`#include <termios.h>\` (and the tcgetattr/tc* + Termios class) on I_TERMIOS,
 # so turn i_termios off; POSIX still builds, just without the termios interface.
@@ -584,6 +585,35 @@ patch("pp_sys.c", [
         "    ok = do_open6(gv, tmps, len, NULL, MARK+1, (SP-MARK));\n", 1),
 ])
 print("wasi-spawn source routing applied")
+PYPATCH
+
+# ---- Sys::Syslog: a native mechanism that can be unavailable ------------------
+# Sys::Syslog assumes that openlog(3) cannot fail: connect_native calls it
+# and reports the mechanism connected. Here openlog raises an exception when
+# the program has no system logger (perl_syslog.cc; the embedder has to
+# enable one). connect_native then has to answer like every other
+# connect_* function that cannot connect: record why and return false, so
+# that the module goes on to its next mechanism. Idempotent.
+python3 - <<'PYPATCH'
+path = "cpan/Sys-Syslog/Syslog.pm"
+t = open(path).read()
+marker = "no system logger"
+if marker in t:
+    print(f"native-mechanism patch already present in {path}")
+else:
+    old = ("    openlog_xs($ident, $logopt, xlate($facility));\n"
+           "    $syslog_send = \\&_syslog_send_native;\n")
+    new = ("    # openlog fails where the program has no system logger: the\n"
+           "    # mechanism is then unavailable, like one that cannot connect.\n"
+           "    if (!eval { openlog_xs($ident, $logopt, xlate($facility)); 1 }) {\n"
+           "        chomp(my $why = $@);\n"
+           "        push @$errs, \"native: $why\";\n"
+           "        return 0;\n"
+           "    }\n"
+           "    $syslog_send = \\&_syslog_send_native;\n")
+    assert t.count(old) == 1, path
+    open(path, "w").write(t.replace(old, new))
+    print(f"native-mechanism patch applied to {path}")
 PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of

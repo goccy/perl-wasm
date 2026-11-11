@@ -43,12 +43,15 @@ zlib/bzip2 sources, so no external library is required), `Digest-MD5`,
 Notes:
 - `SDBM_File` bundles its own `sdbm` implementation, so it needs no external
   DBM library and is kept.
-- `Sys-Syslog` is built without `<syslog.h>` (`i_syslog='undef'`; wasi-libc
-  has neither the header nor `syslog(3)`), from the fallback header it
-  carries. Its C-library transport (`native`) therefore delivers nothing,
-  as on a system where no log daemon listens; the transports written in
-  Perl (`tcp`, `udp`, `unix`, `stream`, `console`) work as far as the
-  sockets and files they use do.
+- `Sys-Syslog`: wasi-libc has neither `<syslog.h>` nor `syslog(3)`, so the
+  project supplies both (`scripts/include/syslog.h`, `perl_syslog.cc`).
+  `openlog`/`syslog`/`closelog` hand each message to the host as typed
+  values (the `proc_syslog*` imports); the host delivers it to a system
+  logger when the embedder enabled one, and otherwise `openlog` fails. A
+  configure-time patch makes `connect_native` report that failure as "this
+  mechanism is unavailable", so the module falls through to its other
+  mechanisms (`tcp`, `udp`, `unix`, ...) instead of dying or losing the
+  message.
 - `I18N-Langinfo` (`nl_langinfo`) and `Sys-Hostname` (`gethostname`) may need a
   small host-capability stub under wasi; they are kept as porting targets.
 - `Socket` is included because the wasm layer enables host sockets
