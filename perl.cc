@@ -1318,11 +1318,20 @@ uint64_t perl_new(const char *lib_dir) {
      * is ready to eval. lib_dir is not a -I directory: those come first in
      * @INC, ahead of PERL5LIB, and the standard library belongs behind it
      * (inc_use_stdlib, below). */
-    const char *argv[4];
+    /* perl keeps the argument vector it is started with for good
+     * (PL_origargv) and takes the strings for an area it may write to: an
+     * assignment to $0 copies the new name over them, as far as they are
+     * contiguous, and clears the other entries of the vector. So both are
+     * storage of the interpreter's lifetime, laid out the way a system
+     * lays out a process's arguments, and writable. */
+    static const char arg_template[] = "perl\0-e\0000";
+    static char arg_area[sizeof arg_template];
+    static char *argv[4];
+    memcpy(arg_area, arg_template, sizeof arg_template);
     int argc = 0;
-    argv[argc++] = "perl";
-    argv[argc++] = "-e";
-    argv[argc++] = "0";
+    argv[argc++] = arg_area;
+    argv[argc++] = arg_area + 5;
+    argv[argc++] = arg_area + 8;
     argv[argc] = nullptr;
 
     /* PERL5OPT holds switches of the perl COMMAND LINE, and the command line
@@ -1341,7 +1350,7 @@ uint64_t perl_new(const char *lib_dir) {
         unsetenv("PERL5OPT");
     }
     const int parse_failed =
-        perl_parse(g_my_perl, xs_init, argc, const_cast<char **>(argv), nullptr);
+        perl_parse(g_my_perl, xs_init, argc, argv, nullptr);
     if (had_perl5opt) setenv("PERL5OPT", perl5opt.c_str(), 1);
     if (parse_failed) {
         perl_destruct(g_my_perl);
