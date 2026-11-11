@@ -393,6 +393,39 @@ extensions='$EXTENSIONS'
 # ============================================================================
 EOF
 
+# --- Installation layout ----------------------------------------------------
+# The base describes an arm build staged under ./install_me_here. A program that
+# asks %Config where perl is installed (ExtUtils::MakeMaker, Module::Build,
+# Pod::Html, ...) must get absolute directories named after this architecture,
+# the same ones perl searches, as on any installed perl. "." is left out of
+# @INC, perl's default since 5.26, which the base predates.
+PERL_VERSION="$(sed -n "s/^version='\(.*\)'$/\1/p" "$BASE")"
+[ -n "$PERL_VERSION" ] || { echo "!! no version in $BASE" >&2; exit 1; }
+PRIVLIB="/usr/lib/perl5/$PERL_VERSION"
+SITELIB="/usr/lib/perl5/site_perl/$PERL_VERSION"
+cat >> "$CONFIG" <<EOF
+default_inc_excludes_dot='define'
+archlib='$PRIVLIB/wasm32-wasi'
+archlibexp='$PRIVLIB/wasm32-wasi'
+sitearch='$SITELIB/wasm32-wasi'
+sitearchexp='$SITELIB/wasm32-wasi'
+installstyle='lib/perl5'
+installprefix='/usr'
+installprefixexp='/usr'
+installbin='/usr/bin'
+installscript='/usr/bin'
+installsitebin='/usr/bin'
+installsitescript='/usr/bin'
+installprivlib='$PRIVLIB'
+installarchlib='$PRIVLIB/wasm32-wasi'
+installsitelib='$SITELIB'
+installsitearch='$SITELIB/wasm32-wasi'
+installman1dir='/usr/share/man/man1'
+installman3dir='/usr/share/man/man3'
+installsiteman1dir='/usr/share/man/man1'
+installsiteman3dir='/usr/share/man/man3'
+EOF
+
 echo "== wrote $CONFIG (static_ext: $(echo $STATIC_EXT | wc -w | tr -d ' ') modules)"
 
 # --- Canonicalise config.sh: keep only the LAST assignment of each key ------
