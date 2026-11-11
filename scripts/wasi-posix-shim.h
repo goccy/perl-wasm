@@ -29,10 +29,10 @@
  * CLOCK_REALTIME = &_CLOCK_REALTIME), while perl-world code moves clock ids
  * through IVs — generated constant tables (ExtUtils::Constant's const-c.inc
  * in Time::HiRes) assign the macros to IV, and feature probes assign them to
- * clockid_t. The clock_* FUNCTIONS are configured off for perl
- * (d_clock_gettime='undef' & friends in wasi-configure.sh), so nothing can
- * ever pass these ids to wasi-libc; replace the pointer macros with the
- * conventional integer ids so both idioms compile. CLOCK_REALTIME must be 0:
+ * clockid_t. Replace the pointer macros with the conventional integer ids
+ * so both idioms compile. An integer id never reaches wasi-libc: the one
+ * caller of the clock functions, Time::HiRes, finds the wasi clock of an id
+ * first (the HiRes.xs patch in wasi-configure.sh). CLOCK_REALTIME must be 0:
  * feature probes assign it to clockid_t, and 0 is the one integer that is
  * also a valid null pointer constant. */
 #include <time.h>

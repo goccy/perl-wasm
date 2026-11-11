@@ -86,14 +86,14 @@ Filter/Util/Call Hash/Util Hash/Util/FieldHash I18N/Langinfo IO List/Util \
 Math/BigInt/FastCalc MIME/Base64 Opcode POSIX PerlIO/encoding \
 PerlIO/via SDBM_File Socket Storable Sys/Hostname Sys/Syslog Time/HiRes \
 Time/Piece Unicode/Collate Unicode/Normalize mro re"
-# Time/HiRes builds as the REAL core XS module with its clock_* features
-# configured off (see the d_clock_* overrides below): wasi's clockid_t is
+# Time/HiRes builds as the REAL core XS module: gettimeofday, usleep,
+# nanosleep, sleep, time, the interval timer (alarm/ualarm/setitimer/
+# getitimer), clock_gettime and clock_getres. wasi's clockid_t is
 # `const struct __clockid *` (a struct pointer, CLOCK_REALTIME =
 # &_CLOCK_REALTIME) while Time::HiRes moves clock ids through Perl as
-# integers. Its Makefile.PL honors those Config values ("possibly set for
-# cross-compilation") and #ifdefs the incompatible XS out, leaving real
-# gettimeofday/usleep/nanosleep/sleep/time and the interval timer
-# (alarm/ualarm/setitimer/getitimer). See docs/xs-modules.md.
+# integers, so its XS is given integer clock ids over the wasi clocks (the
+# HiRes.xs patch below). clock_nanosleep stays configured off. See
+# docs/xs-modules.md.
 
 # CPAN distributions linked in on top of the core's extensions: unpacked into
 # perl5/cpan and built by the core's own extension machinery (make_ext.pl runs
@@ -193,16 +193,20 @@ libperl='libperl.a'
 # __wasm_longjmp. (Signal-mask save/restore across the jump is a no-op under the
 # single-threaded, %SIG-emulated wasi build anyway.)
 d_sigsetjmp='undef'
-# Time::HiRes feature trim (dist/Time-HiRes/Makefile.PL consults these before
-# probing, exactly for cross-compilation). clock_gettime/clock_getres/
-# clock_nanosleep move clockid_t through Perl IVs — type-incompatible with
-# wasi's pointer clockid_t. nanosleep and usleep DO exist in wasi-libc; the
-# base disables nanosleep, so re-enable it. setitimer, getitimer and ualarm
-# have no wasi-libc symbols: perl_signal.cc defines them over the host's
-# real-time interval timer (ITIMER_REAL, the only timer there is), and
-# scripts/wasi-posix-shim.h declares them.
-d_clock_gettime='undef'
-d_clock_getres='undef'
+# Time::HiRes features (dist/Time-HiRes/Makefile.PL consults these before
+# probing, exactly for cross-compilation). clock_gettime and clock_getres
+# are wasi-libc's, reached through integer clock ids (the HiRes.xs patch
+# further down): a program that finds no clock_gettime falls back to worse
+# time sources (AnyEvent's loop to POSIX::times). clock_nanosleep stays
+# off: the sleeps of this build are perl_signal.cc's, which a signal
+# interrupts, and wasi-libc's clock_nanosleep is not one of them. nanosleep
+# and usleep DO exist in wasi-libc; the base disables nanosleep, so
+# re-enable it. setitimer, getitimer and ualarm have no wasi-libc symbols:
+# perl_signal.cc defines them over the host's real-time interval timer
+# (ITIMER_REAL, the only timer there is), and scripts/wasi-posix-shim.h
+# declares them.
+d_clock_gettime='define'
+d_clock_getres='define'
 d_clock_nanosleep='undef'
 d_setitimer='define'
 d_getitimer='define'
@@ -585,6 +589,64 @@ patch("pp_sys.c", [
         "    ok = do_open6(gv, tmps, len, NULL, MARK+1, (SP-MARK));\n", 1),
 ])
 print("wasi-spawn source routing applied")
+PYPATCH
+
+# ---- Time::HiRes: clocks named by integers ------------------------------------
+# Time::HiRes passes clock ids between Perl and C as integers (its typemap
+# says clockid_t is an IV, its constants are CLOCK_REALTIME and friends).
+# wasi-libc names a clock by the address of an object. The CLOCK_ constants
+# are integers already (scripts/wasi-posix-shim.h); here the XS gets an
+# integer clockid_t, and its clock_gettime/clock_getres calls go through
+# functions that find the wasi clock of an id. The module does the same
+# kind of thing itself where a system lacks the functions (its darwin
+# emulation). Idempotent.
+python3 - <<'PYPATCH'
+path = "dist/Time-HiRes/HiRes.xs"
+t = open(path).read()
+marker = "th_wasi_clockid_t"
+if marker in t:
+    print(f"integer clock ids already present in {path}")
+else:
+    old = ("#ifndef TIME_HIRES_CLOCKID_T\n"
+           "typedef int clockid_t;\n"
+           "#endif\n")
+    new = old + r"""
+#ifdef __wasi__
+/* wasi names a clock by the address of an object; Perl code names it by a
+ * small integer, as on every other system. The integers are the ones
+ * scripts/wasi-posix-shim.h gives the CLOCK_ constants (Linux's). */
+typedef int th_wasi_clockid_t;
+static clockid_t th_wasi_clock(th_wasi_clockid_t id) {
+    switch (id) {
+    case CLOCK_REALTIME: return &_CLOCK_REALTIME;
+    case CLOCK_MONOTONIC: return &_CLOCK_MONOTONIC;
+    }
+    return NULL; /* a clock this system does not have */
+}
+static int th_wasi_clock_gettime(th_wasi_clockid_t id, struct timespec *ts) {
+    clockid_t clock = th_wasi_clock(id);
+    if (!clock) {
+        errno = EINVAL;
+        return -1;
+    }
+    return clock_gettime(clock, ts);
+}
+static int th_wasi_clock_getres(th_wasi_clockid_t id, struct timespec *ts) {
+    clockid_t clock = th_wasi_clock(id);
+    if (!clock) {
+        errno = EINVAL;
+        return -1;
+    }
+    return clock_getres(clock, ts);
+}
+#  define clockid_t th_wasi_clockid_t
+#  define clock_gettime(id, ts) th_wasi_clock_gettime((id), (ts))
+#  define clock_getres(id, ts) th_wasi_clock_getres((id), (ts))
+#endif /* __wasi__ */
+"""
+    assert t.count(old) == 1, path
+    open(path, "w").write(t.replace(old, new))
+    print(f"integer clock ids applied to {path}")
 PYPATCH
 
 # ---- Sys::Syslog: a native mechanism that can be unavailable ------------------
