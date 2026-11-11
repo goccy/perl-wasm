@@ -1098,6 +1098,147 @@ static const char *EVAL_WRAPPER =
     "  $main::__plwasm_errsv = $@;"
     "}";
 
+/* ---- @INC: the standard library takes the place of the built-in dirs ------
+ * perl_parse fills @INC the way perl.c's S_init_perllib does: the PERL5LIB
+ * directories first, then the library directories this perl was configured
+ * with (sitearch, sitelib, archlib, privlib, ...), then "." where perl
+ * still adds it. The configured directories are those of the cross-build
+ * configuration: they do not exist here, and on a host filesystem they
+ * could name an unrelated perl's files. The library this interpreter runs
+ * with lives in lib_dir, so lib_dir goes where they were: after PERL5LIB —
+ * a module found there shadows the standard library's copy, as on any
+ * perl — and before ".".
+ *
+ * The built-in entries are identified by what they are, not by how they
+ * look: the list below is S_init_perllib's (perl_inc_macro.h), in the order
+ * it pushes them, built from the same configuration constants under the
+ * same conditions. perl pushes each of them once, after the PERL5LIB
+ * directories, so each is the LAST entry with that value that precedes the
+ * one matched before it — walking the list backwards from the end of @INC.
+ * A PERL5LIB directory that happens to have the same name is therefore
+ * left alone. */
+#if defined(APPLLIB_EXP) || defined(PERL_OTHERLIBDIRS)
+#error "this configuration has built-in @INC entries inc_use_stdlib does not know"
+#endif
+/* The separator of a directory list, as perl.c defines it for itself. */
+#ifndef PERLLIB_SEP
+#define PERLLIB_SEP ':'
+#endif
+static const char *const BUILTIN_INC[] = {
+#ifdef SITEARCH_EXP
+    SITEARCH_EXP,
+#endif
+#ifdef SITELIB_EXP
+    SITELIB_EXP,
+#endif
+#ifdef PERL_VENDORARCH_EXP
+    PERL_VENDORARCH_EXP,
+#endif
+#ifdef PERL_VENDORLIB_EXP
+    PERL_VENDORLIB_EXP,
+#endif
+#ifdef ARCHLIB_EXP
+    ARCHLIB_EXP,
+#endif
+    PRIVLIB_EXP,
+#if defined(SITELIB_STEM) && defined(PERL_INC_VERSION_LIST)
+    SITELIB_STEM,
+#endif
+#if defined(PERL_VENDORLIB_STEM) && defined(PERL_INC_VERSION_LIST)
+    PERL_VENDORLIB_STEM,
+#endif
+};
+
+/* The @INC entries perl took from the environment when the interpreter
+ * started: the PERL5LIB (or PERLLIB) directories and ".". A program run
+ * under taint checks must not have them (perl -T adds neither), and by
+ * then they cannot be told from directories added since by their values —
+ * hence this record of the entries themselves. */
+static AV *g_inc_from_environment = nullptr;
+
+void program_inc_drop_environment(pTHX) {
+    if (!g_inc_from_environment) return;
+    AV *inc = GvAVn(PL_incgv);
+    AV *kept = newAV();
+    const SSize_t n = static_cast<SSize_t>(av_count(inc));
+    const SSize_t m = static_cast<SSize_t>(av_count(g_inc_from_environment));
+    for (SSize_t i = 0; i < n; i++) {
+        SV **svp = av_fetch(inc, i, FALSE);
+        if (!svp) continue;
+        bool from_environment = false;
+        for (SSize_t j = 0; j < m && !from_environment; j++) {
+            SV **envp = av_fetch(g_inc_from_environment, j, FALSE);
+            from_environment = envp && *envp == *svp;
+        }
+        if (!from_environment) av_push(kept, SvREFCNT_inc(*svp));
+    }
+    av_clear(inc);
+    const SSize_t k = static_cast<SSize_t>(av_count(kept));
+    for (SSize_t i = 0; i < k; i++) av_push(inc, SvREFCNT_inc(*av_fetch(kept, i, FALSE)));
+    SvREFCNT_dec(kept);
+}
+
+static void inc_use_stdlib(pTHX_ const char *lib_dir) {
+    AV *inc = GvAVn(PL_incgv);
+    const SSize_t n = static_cast<SSize_t>(av_count(inc));
+    std::vector<bool> builtin(static_cast<size_t>(n), false);
+
+    /* Each constant is a list in the form perl splits with PERLLIB_SEP; the
+     * entries are matched last to first. */
+    std::vector<std::string> expected;
+    for (const char *list : BUILTIN_INC) {
+        for (const char *p = list;;) {
+            const char *end = strchr(p, PERLLIB_SEP);
+            const size_t len = end ? static_cast<size_t>(end - p) : strlen(p);
+            if (len) expected.emplace_back(p, len);
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    SSize_t limit = n;        /* entries at or after this are already matched */
+    SSize_t first_builtin = -1;
+    for (size_t e = expected.size(); e-- > 0;) {
+        for (SSize_t i = limit; i-- > 0;) {
+            SV **svp = av_fetch(inc, i, FALSE);
+            if (!svp || !SvPOK(*svp)) continue;
+            STRLEN len = 0;
+            const char *dir = SvPV(*svp, len);
+            if (len == expected[e].size() && memcmp(dir, expected[e].data(), len) == 0) {
+                builtin[static_cast<size_t>(i)] = true;
+                limit = first_builtin = i;
+                break;
+            }
+        }
+    }
+
+    /* Where the library goes: where the first built-in directory was; in a
+     * list that had none, ahead of the "." perl puts last. */
+    SSize_t at = first_builtin;
+    if (at < 0) {
+        at = n;
+        if (n > 0) {
+            SV **last = av_fetch(inc, n - 1, FALSE);
+            if (last && SvPOK(*last) && SvCUR(*last) == 1 && *SvPVX_const(*last) == '.') at = n - 1;
+        }
+    }
+    AV *fresh = newAV();
+    g_inc_from_environment = newAV();
+    for (SSize_t i = 0; i <= n; i++) {
+        if (i == at) av_push(fresh, newSVpv(lib_dir, 0));
+        if (i == n || builtin[static_cast<size_t>(i)]) continue;
+        SV **svp = av_fetch(inc, i, FALSE);
+        if (!svp) continue;
+        /* everything perl_parse pushed besides the built-in directories
+         * came from the environment */
+        av_push(fresh, SvREFCNT_inc(*svp));
+        av_push(g_inc_from_environment, SvREFCNT_inc(*svp));
+    }
+    av_clear(inc);
+    const SSize_t m = static_cast<SSize_t>(av_count(fresh));
+    for (SSize_t i = 0; i < m; i++) av_push(inc, SvREFCNT_inc(*av_fetch(fresh, i, FALSE)));
+    SvREFCNT_dec(fresh);
+}
+
 /* ---- public API (pl.h) --------------------------------------------------- */
 uint64_t perl_new(const char *lib_dir) {
     if (g_my_perl) return 0; /* one interpreter per instance */
@@ -1126,25 +1267,53 @@ uint64_t perl_new(const char *lib_dir) {
     perl_construct(g_my_perl);
     PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
 
-    /* Bootstrap args: perl [-I<lib_dir>] -e 0 — parse an empty program so the
-     * interpreter is ready to eval, prepending lib_dir to @INC when given. */
-    std::string incarg;
-    const char *argv[5];
+    /* Bootstrap args: perl -e 0 — parse an empty program so the interpreter
+     * is ready to eval. lib_dir is not a -I directory: those come first in
+     * @INC, ahead of PERL5LIB, and the standard library belongs behind it
+     * (inc_use_stdlib, below). */
+    const char *argv[4];
     int argc = 0;
     argv[argc++] = "perl";
-    if (lib_dir && *lib_dir) {
-        incarg = std::string("-I") + lib_dir;
-        argv[argc++] = incarg.c_str();
-    }
     argv[argc++] = "-e";
     argv[argc++] = "0";
     argv[argc] = nullptr;
 
-    if (perl_parse(g_my_perl, xs_init, argc, const_cast<char **>(argv), nullptr)) {
+    /* PERL5OPT holds switches of the perl COMMAND LINE, and the command line
+     * is the host's to interpret: it hands a program over with what the
+     * switches mean, PERL5OPT's included (perl_run_program). This parse is
+     * the interpreter's start-up, not a program's: were it to apply the
+     * variable too, a -M module in it would be loaded here — before @INC
+     * is in order, from the wrong directory — and again by the program.
+     * So the parse does not see the variable; %ENV and the environment of
+     * child processes keep it. */
+    std::string perl5opt;
+    const char *const perl5opt_env = getenv("PERL5OPT");
+    const bool had_perl5opt = perl5opt_env != nullptr;
+    if (had_perl5opt) {
+        perl5opt = perl5opt_env;
+        unsetenv("PERL5OPT");
+    }
+    const int parse_failed =
+        perl_parse(g_my_perl, xs_init, argc, const_cast<char **>(argv), nullptr);
+    if (had_perl5opt) setenv("PERL5OPT", perl5opt.c_str(), 1);
+    if (parse_failed) {
         perl_destruct(g_my_perl);
         perl_free(g_my_perl);
         g_my_perl = nullptr;
         return 0;
+    }
+    {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        if (had_perl5opt) {
+            /* %ENV was filled while the variable was hidden */
+            SV *val = newSVpvn(perl5opt.data(), perl5opt.size());
+            if (hv_store(GvHVn(PL_envgv), "PERL5OPT", 8, val, 0))
+                SvSETMAGIC(val);
+            else
+                SvREFCNT_dec(val);
+        }
+        if (lib_dir && *lib_dir) inc_use_stdlib(aTHX_ lib_dir);
     }
     perl_run(g_my_perl); /* runs the empty program; leaves the interp live */
 
@@ -1229,6 +1398,8 @@ void perl_close(uint64_t h) {
     {
         dTHX;
         reg_clear(aTHX); /* drop registry pins so destruct sees true counts */
+        SvREFCNT_dec(g_inc_from_environment);
+        g_inc_from_environment = nullptr;
     }
     PL_perl_destruct_level = 2;
     perl_destruct(g_my_perl);

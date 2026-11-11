@@ -61,4 +61,9 @@ struct ProgramSpec {
 void program_execute(pTHX_ const ProgramSpec &ps);
 void program_run_end_blocks(pTHX);
 
+/* Removes from @INC the directories the interpreter took from the
+ * environment at start-up (PERL5LIB, "."): what perl -T leaves out.
+ * Defined next to the code that builds @INC (perl.cc). */
+void program_inc_drop_environment(pTHX);
+
 #endif /* PERL_PROGRAM_H */

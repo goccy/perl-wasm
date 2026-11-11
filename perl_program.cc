@@ -145,6 +145,8 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
             hv_iterinit(env);
             while ((he = hv_iternext(env))) sv_taint(HeVAL(he));
         }
+        /* and @INC without what the environment contributed */
+        program_inc_drop_environment(aTHX);
     }
 #endif
     PL_minus_n = cBOOL(ps.flags & PROG_LOOP);
