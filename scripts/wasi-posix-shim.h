@@ -14,6 +14,7 @@
 #define PERLWASM_WASI_POSIX_SHIM_H
 
 #include <sys/types.h> /* pid_t, uid_t, gid_t, id_t */
+#include <sys/time.h>  /* struct timeval (futimes) */
 #include <stdint.h>    /* uint32_t (netent) */
 #include <fcntl.h>     /* open + O_EXCL/O_APPEND/... (util.c uses them directly) */
 
@@ -107,6 +108,9 @@ extern "C" {
 #endif
 
 mode_t umask(mode_t);
+/* wasi-libc keeps futimes out of <sys/time.h> and out of the library as a
+ * legacy function; wasmify's host-fs shim defines it over futimens. */
+int futimes(int, const struct timeval [2]);
 pid_t getppid(void);
 int execl(const char *, const char *, ...);
 int killpg(pid_t, int);

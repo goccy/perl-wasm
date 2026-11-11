@@ -367,6 +367,10 @@ d_getpwent_r='undef'
 d_getgrnam_r='undef'
 d_getgrgid_r='undef'
 d_getgrent_r='undef'
+# futimes: the arm base answers 'undef', and wasi-libc has none. wasmify's
+# host-fs shim (bridge.HostFS in wasmify.json) defines it over futimens and
+# scripts/wasi-posix-shim.h declares it, so `utime` works on a filehandle.
+d_futimes='define'
 # wasi-libc's FILE is opaque; Perl must not poke its glibc _IO_FILE internals.
 d_stdstdio='undef'
 d_stdiobase='undef'
