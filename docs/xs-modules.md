@@ -33,7 +33,8 @@ Selection is against upstream Perl **v5.42.2**
 `Compress-Raw-Zlib`, `Compress-Raw-Bzip2` (both bundle their own
 zlib/bzip2 sources, so no external library is required), `Digest-MD5`,
 `Digest-SHA`, `Encode`, `Filter-Util-Call`, `Math-BigInt-FastCalc`,
-`MIME-Base64`, `Scalar-List-Utils`, `Socket`, `Time-Piece`, `Unicode-Collate`
+`MIME-Base64`, `Scalar-List-Utils`, `Socket`, `Sys-Syslog`, `Time-Piece`,
+`Unicode-Collate`
 
 ### dist/
 `Data-Dumper`, `IO`, `PathTools` (`Cwd` / `File::Spec`), `Storable`,
@@ -42,6 +43,12 @@ zlib/bzip2 sources, so no external library is required), `Digest-MD5`,
 Notes:
 - `SDBM_File` bundles its own `sdbm` implementation, so it needs no external
   DBM library and is kept.
+- `Sys-Syslog` is built without `<syslog.h>` (`i_syslog='undef'`; wasi-libc
+  has neither the header nor `syslog(3)`), from the fallback header it
+  carries. Its C-library transport (`native`) therefore delivers nothing,
+  as on a system where no log daemon listens; the transports written in
+  Perl (`tcp`, `udp`, `unix`, `stream`, `console`) work as far as the
+  sockets and files they use do.
 - `I18N-Langinfo` (`nl_langinfo`) and `Sys-Hostname` (`gethostname`) may need a
   small host-capability stub under wasi; they are kept as porting targets.
 - `Socket` is included because the wasm layer enables host sockets
@@ -116,11 +123,10 @@ own inside the `Encode` distribution and has its own `boot_*` registration.
 | `GDBM_File`, `NDBM_File`, `ODBM_File`, `DB_File` | Require external DBM libraries (gdbm / ndbm / Berkeley DB) that are not available in the wasi sysroot. (`SDBM_File`, which bundles its own implementation, is kept instead.) |
 | `IPC-SysV` | System V IPC (`shmget` / `semget` / `msgget`) does not exist under wasi. |
 | `PerlIO-mmap` | Relies on `mmap`, which wasi implements only partially. |
-| `Sys-Syslog` | There is no `syslog` facility under wasi. |
 | `threads`, `threads-shared` | The interpreter is built without ithreads (`useithreads=undef`); the wasm target is single-threaded. |
 | `XS-APItest`, `XS-Typemap`, `Devel-PPPort` | Test-only / module-author tooling; not needed at runtime. |
 
 If a use case later needs one of the excluded modules, the fix is either to
-port the missing capability into the wasi host layer (e.g. a `syslog` shim) or
+port the missing capability into the wasi host layer or
 to build the required third-party library for wasm32-wasi and add the module to
 `static_ext`.

@@ -71,7 +71,7 @@ BASE="$PERL/Cross/config.sh-arm-linux"
 # --- XS extension policy (docs/xs-modules.md), in config.sh directory form ----
 # usedl=undef makes every XS extension static, so `extensions` == what we link
 # into perl.wasm. Everything meaningful under wasi is IN; OS-specific /
-# external-lib / SysV-IPC / mmap / syslog / threads / test-only modules are OUT.
+# external-lib / SysV-IPC / mmap / threads / test-only modules are OUT.
 # NOTE on PerlIO::scalar: it is deliberately NOT in this XS list. In 5.42 it has
 # no .xs — the in-memory scalar-filehandle layer lives in the core perlio.c —
 # so it is a PURE-PERL module (just scalar.pm) carried by nonxs_ext, and the
@@ -81,8 +81,8 @@ STATIC_EXT="attributes B Compress/Raw/Bzip2 Compress/Raw/Zlib Cwd Data/Dumper \
 Devel/Peek Digest/MD5 Digest/SHA Encode Fcntl File/DosGlob File/Glob \
 Filter/Util/Call Hash/Util Hash/Util/FieldHash I18N/Langinfo IO List/Util \
 Math/BigInt/FastCalc MIME/Base64 Opcode POSIX PerlIO/encoding \
-PerlIO/via SDBM_File Socket Storable Sys/Hostname Time/HiRes Time/Piece \
-Unicode/Collate Unicode/Normalize mro re"
+PerlIO/via SDBM_File Socket Storable Sys/Hostname Sys/Syslog Time/HiRes \
+Time/Piece Unicode/Collate Unicode/Normalize mro re"
 # Time/HiRes builds as the REAL core XS module with its clock_* features
 # configured off (see the d_clock_* overrides below): wasi's clockid_t is
 # `const struct __clockid *` (a struct pointer, CLOCK_REALTIME =
@@ -358,6 +358,13 @@ d_getspnam='undef'
 # glibc/BSD math-error-mode switch (_LIB_VERSION=_IEEE_); wasi-libc has no
 # _LIB_VERSION. Gated by LIBM_LIB_VERSION (d_libm_lib_version).
 d_libm_lib_version='undef'
+# wasi-libc has no <syslog.h> and no syslog(3). Sys::Syslog builds without
+# them when told so: it then takes its constants from the header it carries
+# for this case (cpan/Sys-Syslog/fallback/syslog.h), and its C-library
+# transport ("native") has nothing behind it, like syslog(3) on a system
+# where no log daemon listens. The transports written in Perl (a TCP or UDP
+# log server, a socket or stream path, the console) are the module's own.
+i_syslog='undef'
 # No terminal control under wasi: there is no <termios.h>. POSIX.xs guards its
 # \`#include <termios.h>\` (and the tcgetattr/tc* + Termios class) on I_TERMIOS,
 # so turn i_termios off; POSIX still builds, just without the termios interface.

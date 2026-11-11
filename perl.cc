@@ -80,6 +80,7 @@ void boot_SDBM_File(pTHX_ CV *cv);
 void boot_Socket(pTHX_ CV *cv);
 void boot_Storable(pTHX_ CV *cv);
 void boot_Sys__Hostname(pTHX_ CV *cv);
+void boot_Sys__Syslog(pTHX_ CV *cv);
 void boot_Time__HiRes(pTHX_ CV *cv);
 void boot_Time__Piece(pTHX_ CV *cv);
 void boot_Unicode__Collate(pTHX_ CV *cv);
@@ -151,6 +152,7 @@ static void xs_init(pTHX) {
     newXS("Socket::bootstrap", boot_Socket, file);
     newXS("Storable::bootstrap", boot_Storable, file);
     newXS("Sys::Hostname::bootstrap", boot_Sys__Hostname, file);
+    newXS("Sys::Syslog::bootstrap", boot_Sys__Syslog, file);
     newXS("Time::HiRes::bootstrap", boot_Time__HiRes, file);
     newXS("Time::Piece::bootstrap", boot_Time__Piece, file);
     newXS("Unicode::Collate::bootstrap", boot_Unicode__Collate, file);
