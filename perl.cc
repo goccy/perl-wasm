@@ -652,6 +652,21 @@ static void encode_sv(pTHX_ SV *sv, std::string &out) {
         return;
     }
     if (SvIOK(sv)) {
+        /* An integer scalar holds an IV or a UV; reading a UV above IV_MAX
+         * as an IV would wrap it negative. The node carries a signed 64-bit
+         * value; a UV beyond that (possible only where UVs are 64 bits wide)
+         * crosses as the number it is, a float. */
+        if (SvIsUV(sv)) {
+            const uint64_t u = static_cast<uint64_t>(SvUV(sv));
+            if (u > static_cast<uint64_t>(INT64_MAX)) {
+                put_u8(out, NODE_FLOAT);
+                put_f64(out, static_cast<double>(u));
+                return;
+            }
+            put_u8(out, NODE_INT);
+            put_i64(out, static_cast<int64_t>(u));
+            return;
+        }
         put_u8(out, NODE_INT);
         put_i64(out, static_cast<int64_t>(SvIV(sv)));
         return;
@@ -696,8 +711,17 @@ static SV *decode_node(pTHX_ NodeReader &r, std::string &err) {
         return &PL_sv_undef;
     case NODE_BOOL:
         return boolSV(r.get_u8() != 0);
-    case NODE_INT:
-        return sv_2mortal(newSViv(static_cast<IV>(r.get_i64())));
+    case NODE_INT: {
+        /* The value keeps its magnitude whatever the width of an IV: what
+         * an IV cannot hold becomes a UV, and what neither can, an NV, the
+         * way perl's own arithmetic widens. */
+        const int64_t v = r.get_i64();
+        if (v >= static_cast<int64_t>(IV_MIN) && v <= static_cast<int64_t>(IV_MAX))
+            return sv_2mortal(newSViv(static_cast<IV>(v)));
+        if (v > 0 && static_cast<uint64_t>(v) <= static_cast<uint64_t>(UV_MAX))
+            return sv_2mortal(newSVuv(static_cast<UV>(v)));
+        return sv_2mortal(newSVnv(static_cast<NV>(v)));
+    }
     case NODE_FLOAT:
         return sv_2mortal(newSVnv(static_cast<NV>(r.get_f64())));
     case NODE_STRING: {
