@@ -2581,7 +2581,8 @@ enum {
     GOPERL_SVCALL_SETPV_BUFSIZE = 49,
     GOPERL_SVCALL_THROW = 50,
     GOPERL_SVCALL_2PVBYTE = 51,
-    GOPERL_SVCALL_HV_KSPLIT = 52
+    GOPERL_SVCALL_HV_KSPLIT = 52,
+    GOPERL_SVCALL_UNI_DISPLAY = 53
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -4433,6 +4434,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             STRLEN len = 0;
             const char *p = (b & SV_GMAGIC) ? SvPVbyte(sv, len) : SvPVbyte_nomg(sv, len);
             return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+        }
+        case GOPERL_SVCALL_UNI_DISPLAY: { /* sv = dsv; b = (pvlim<<8 | flags)<<32
+                 * | ssv -> (linear-memory ptr << 32) | len */
+            const char *p = sv_uni_display(sv, other, (STRLEN)(hi >> 8), (UV)(hi & 0xFF));
+            return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)SvCUR(sv);
         }
         case GOPERL_SVCALL_HV_KSPLIT: hv_ksplit((HV *)sv, (IV)(int64_t)b); return 0;
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
