@@ -2679,12 +2679,16 @@ enum {
     GOPERL_GVCALL_SV_SET = 13,
     GOPERL_GVCALL_AV_SET = 14,
     GOPERL_GVCALL_HV_SET = 15,
+    GOPERL_GVCALL_CVGEN_SET = 16, /* GvCVGEN(gv) = b */
+    GOPERL_GVCALL_STASH_SET = 17, /* GvSTASH(gv) = b, the plain assignment */
     GOPERL_GVCALL_FIRST_CV = 32,
     GOPERL_GVCALL_CV_GV_SET = 32,
     GOPERL_GVCALL_CV_STASH_SET = 33,
     GOPERL_GVCALL_CV_FLAGS = 34,
     GOPERL_GVCALL_CV_OUTSIDE = 35,
-    GOPERL_GVCALL_CV_PROTO = 36
+    GOPERL_GVCALL_CV_PROTO = 36,
+    GOPERL_GVCALL_CV_NATIVE = 37 /* CvXSUB(cv) = the native function the
+                 * host knows by the id b */
 };
 
 /* SV_STR selectors. */
@@ -2705,7 +2709,12 @@ enum {
     GOPERL_SVSTR_WARN = 12,
     GOPERL_SVSTR_THROW = 13,
     GOPERL_SVSTR_SETPVN = 14,
-    GOPERL_SVSTR_TAINT_PROPER = 15 /* taint_proper(NULL, s) */
+    GOPERL_SVSTR_TAINT_PROPER = 15, /* taint_proper(NULL, s) */
+    GOPERL_SVSTR_WARNER = 16 /* a warning of the category in the SV slot.
+                 * Flags bit 0: the text is UTF-8; bits 1-2: 0 warner (always
+                 * given), 1 ck_warner (when the category is enabled),
+                 * 2 ck_warner_d (when it is not disabled). Fatal when the
+                 * caller's `use warnings FATAL` makes the category so. */
 };
 
 /* v8 sub-selectors (shared with the SDK headers). */
@@ -4654,6 +4663,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return (uint64_t)GvFLAGS(gv);
         }
         case GOPERL_GVCALL_CVGEN: return (uint64_t)GvCVGEN(gv);
+        case GOPERL_GVCALL_CVGEN_SET: GvCVGEN(gv) = (U32)b; return 0;
+        case GOPERL_GVCALL_STASH_SET:
+            GvSTASH(gv) = (HV *)(uintptr_t)(uint32_t)b;
+            return 0;
         case GOPERL_GVCALL_FORM: return (uint64_t)(uintptr_t)(SV *)GvFORM(gv);
         case GOPERL_GVCALL_FULLNAME: /* b = (keepmain<<1 | effective)<<32 | sv */
             if ((b >> 32) & 1)
@@ -4685,6 +4698,13 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return ((uint64_t)(uint32_t)(uintptr_t)CvPROTO(cv) << 32) |
                    (uint32_t)CvPROTOLEN(cv);
         }
+        case GOPERL_GVCALL_CV_NATIVE: /* what `CvXSUB(cv) = fn` is for a
+                 * native function: the generic thunk, which finds the
+                 * function by its id. Whether the CV is an XSUB at all
+                 * stays the caller's to say (CvISXSUB_on), as with perl. */
+            CvXSUB(cv) = XS_goperl_native_thunk;
+            CvXSUBANY(cv).any_i32 = (I32)(int64_t)b;
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown gv call %d", fn);
     }
@@ -4734,6 +4754,17 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             SvREFCNT_dec(goperl_thrown_sv);
             goperl_thrown_sv = newSVpvn_flags(str, len, (flags & 1) ? SVf_UTF8 : 0);
             return 0;
+        case GOPERL_SVSTR_WARNER: {
+            SV *const text =
+                newSVpvn_flags(str, len, SVs_TEMP | ((flags & 1) ? SVf_UTF8 : 0));
+            const U32 category = (U32)(uintptr_t)sv;
+            switch ((flags >> 1) & 3) {
+            case 0: Perl_warner(aTHX_ category, "%" SVf, SVfARG(text)); break;
+            case 1: Perl_ck_warner(aTHX_ category, "%" SVf, SVfARG(text)); break;
+            default: Perl_ck_warner_d(aTHX_ category, "%" SVf, SVfARG(text)); break;
+            }
+            return 0;
+        }
         case GOPERL_SVSTR_TAINT_PROPER: /* dies when tainted data is in
                  * use (PL_tainted), naming the operation */
             taint_proper(NULL, str);
