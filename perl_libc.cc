@@ -21,6 +21,16 @@
 /* the prototypes perl is compiled with (struct netent and friends too) */
 #include "scripts/wasi-posix-shim.h"
 
+extern "C" {
+
+/* The path a directory descriptor was opened under, absolute and not
+ * NUL-terminated: *length receives its size, also when buf (of buf_len
+ * bytes) is too small for it, which is -ERANGE. 0 or a negative errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_path")))
+int wasi_host_fd_path(int fd, char *buf, int buf_len, int *length);
+
+} /* extern "C" */
+
 namespace {
 
 int fail(int error) {
@@ -94,19 +104,36 @@ int mkstemp(char *tmpl) {
     return -1;
 }
 
+/* ---- the working directory by descriptor ----------------------------------- */
+
+/* The working directory is a path kept by libc, so a directory that is
+ * known by its descriptor has to be named first. The host knows the path the
+ * descriptor was opened under (fd_path). That name may lead somewhere else
+ * by now — the directory was renamed, or replaced — and fchdir is about the
+ * directory, not the name: when the two no longer agree the directory
+ * cannot be named, and the call fails rather than go elsewhere. */
+int fchdir(int fd) {
+    struct stat by_descriptor;
+    if (fstat(fd, &by_descriptor) != 0) return -1;
+    if (!S_ISDIR(by_descriptor.st_mode)) return fail(ENOTDIR);
+    char path[4096];
+    int length = 0;
+    const int rc = wasi_host_fd_path(fd, path, (int)sizeof(path) - 1, &length);
+    if (rc != 0) return fail(rc == -ERANGE ? ENAMETOOLONG : -rc);
+    path[length] = '\0';
+    struct stat by_name;
+    if (stat(path, &by_name) != 0) return -1;
+    if (by_name.st_dev != by_descriptor.st_dev || by_name.st_ino != by_descriptor.st_ino)
+        return fail(ENOENT);
+    return chdir(path);
+}
+
 /* ---- what a WASI process cannot do ---------------------------------------- */
 
 /* The root of the filesystem is the host's to set. */
 int chroot(const char *path) {
     (void)path;
     return fail(EPERM);
-}
-
-/* The working directory is a path kept by libc; a directory that is only
- * known by its descriptor cannot become it. */
-int fchdir(int fd) {
-    (void)fd;
-    return fail(ENOSYS);
 }
 
 /* FIFOs cannot be created through WASI. */
