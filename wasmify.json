@@ -63,7 +63,8 @@
   "bridge": {
     "CustomBridgeSources": [
       "perl.cc",
-      "perl_wasi.cc"
+      "perl_wasi.cc",
+      "perl_program.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
@@ -95,7 +96,8 @@
       "perl_set_go_dispatcher",
       "perl_register_native_xs",
       "perl_xs_helper",
-      "perl_fork_child"
+      "perl_fork_child",
+      "perl_run_program"
     ]
   },
   "phases": {

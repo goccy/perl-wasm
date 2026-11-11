@@ -33,6 +33,8 @@ extern "C" {
 #include <perliol.h>
 }
 
+#include "perl_program.h"
+
 /* ---- static extension bootstraps ----------------------------------------
  * Mirrors the xs_init generated into perlmain.c by ExtUtils::Miniperl from the
  * static_ext list. KEEP IN SYNC with STATIC_EXT in scripts/wasi-configure.sh:
@@ -1179,7 +1181,63 @@ uint32_t perl_fork_child(uint64_t h, int32_t pid) {
     int status = 0;
     if (wasi_fork_child_run(aTHX_ static_cast<int>(pid), &status) != 0)
         return UINT32_MAX;
-    return static_cast<uint32_t>(status) & 0xff;
+    program_run_end_blocks(aTHX);
+    return static_cast<uint32_t>(STATUS_EXIT) & 0xff;
+}
+
+/* ---- whole-program execution (perl_program.cc) -------------------------- */
+static void read_str(NodeReader &r, std::string &out) {
+    uint32_t n = r.get_u32();
+    const char *p = r.get_bytes(n);
+    if (p) out.assign(p, n);
+}
+
+static void read_strlist(NodeReader &r, std::vector<std::string> &out) {
+    uint32_t n = r.get_u32();
+    for (uint32_t i = 0; i < n && !r.fail; i++) {
+        out.emplace_back();
+        read_str(r, out.back());
+    }
+}
+
+static bool decode_program(const char *buf, uint32_t len, ProgramSpec &ps) {
+    NodeReader r(buf, len);
+    ps.flags = r.get_u32();
+    ps.warnings = r.get_u8();
+    ps.taint = r.get_u8();
+    ps.unicode = r.get_u32();
+    ps.source = r.get_u8();
+    read_str(r, ps.path);
+    read_str(r, ps.code);
+    read_str(r, ps.extract_dir);
+    read_str(r, ps.rs);
+    read_str(r, ps.ors);
+    read_str(r, ps.split);
+    read_str(r, ps.inplace);
+    read_strlist(r, ps.preamble);
+    read_strlist(r, ps.inc);
+    uint32_t ndef = r.get_u32();
+    for (uint32_t i = 0; i < ndef && !r.fail; i++) {
+        ps.defines.emplace_back();
+        ProgramDefine &d = ps.defines.back();
+        read_str(r, d.name);
+        d.has_value = r.get_u8() != 0;
+        read_str(r, d.value);
+    }
+    read_strlist(r, ps.args);
+    return !r.fail && r.p == r.end && ps.warnings <= PROG_WARN_NONE &&
+           ps.taint <= PROG_TAINT_ON && ps.source <= PROG_SOURCE_STDIN;
+}
+
+uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len) {
+    if (!g_my_perl || h == 0) return UINT32_MAX;
+    ProgramSpec ps{};
+    if (!decode_program(program, program_len, ps)) return UINT32_MAX;
+    PERL_SET_CONTEXT(g_my_perl);
+    dTHX;
+    program_execute(aTHX_ ps);
+    program_run_end_blocks(aTHX);
+    return static_cast<uint32_t>(STATUS_EXIT) & 0xff;
 }
 
 uint32_t perl_interrupt_addr(uint64_t h) {

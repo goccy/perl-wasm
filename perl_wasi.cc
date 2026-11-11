@@ -15,10 +15,12 @@
 #include <spawn.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <unistd.h>
 
 /* ---- fork-free subprocess (PERL_WASI_SPAWN) ------------------------------
@@ -47,7 +49,8 @@ static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
     posix_spawn_file_actions_adddup2(&fa, child_stdout >= 0 ? child_stdout : 1, 1);
     posix_spawn_file_actions_adddup2(&fa, 2, 2);
     pid_t pid = -1;
-    int rc = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+    /* perl runs commands with execvp: a bare name is looked up on PATH. */
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
         errno = rc;
@@ -160,6 +163,28 @@ extern "C" int kill(pid_t pid, int sig) {
         return -1;
     }
     return 0;
+}
+
+/* times(2). wasi-libc's emulation reports process time in clock()'s unit,
+ * nanoseconds, while perl divides what times returns by the clock tick it
+ * established at start-up (PL_clocktick: sysconf(_SC_CLK_TCK), or its
+ * fallback). This one reports in that unit. The process time is the
+ * emulated clock's: time elapsed since the instance started, all of it
+ * accounted as user time. */
+extern "C" clock_t times(struct tms *buf) {
+    const long ticks_per_sec = PL_clocktick;
+    if (ticks_per_sec <= 0) {
+        errno = ENOSYS; /* no interpreter has set the unit yet */
+        return (clock_t)-1;
+    }
+    const clock_t user = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
+    if (buf) {
+        buf->tms_utime = user;
+        buf->tms_stime = 0;
+        buf->tms_cutime = 0;
+        buf->tms_cstime = 0;
+    }
+    return user;
 }
 
 /* Forks at the current op. Returns the child's pid, or -1 with errno set.

@@ -274,9 +274,52 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
  * child under. The call resumes the program right after the forking op,
  * with fork's result being 0, and returns when the child's program ends.
  *
- * Returns the child's exit status (0..255), or UINT32_MAX when the instance
- * is not a freshly forked child. perl_close must follow, as after an exit
- * envelope: it flushes PerlIO and runs END blocks and destructors. */
+ * Returns the child's exit status (0..255) once its END blocks have run, or
+ * UINT32_MAX when the instance is not a freshly forked child. perl_close
+ * must follow: it flushes PerlIO and runs destructors. */
 uint32_t perl_fork_child(uint64_t h, int32_t pid);
+
+/* Run a whole program, the way the perl command runs the one its command
+ * line names: compiled as the MAIN program (no caller at its top level,
+ * __END__/__DATA__ attached, the switches of its #! line honoured), then
+ * BEGIN/CHECK/INIT, the run, and END blocks. Call it at most once, on an
+ * instance that only has to be closed afterwards (perl_close flushes PerlIO
+ * and runs destructors).
+ *
+ * The host parses the command line; `program` carries what it means. All
+ * integers little-endian, str := u32 len + bytes, strlist := u32 count +
+ * str*:
+ *
+ *   flags:u32        bit 0  loop over input lines (-n)
+ *                    bit 1  ... printing each (-p)
+ *                    bit 2  split each line into @F (-a)
+ *                    bit 3  ... on `split` (-F)
+ *                    bit 4  line-ending processing (-l): chomp input, $\ = ors
+ *                    bit 5  $/ = rs        bit 6  $/ = undef
+ *                    bit 7  rs is UTF-8
+ *                    bit 8  edit files in place (-i), backup suffix `inplace`
+ *                    bit 9  compile only (-c)
+ *                    bit 10 enable the current feature bundle (-E)
+ *                    bit 11 skip to the #!perl line (-x), then chdir to
+ *                           extract_dir when non-empty
+ *                    bit 12 allow unsafe operations (-U)
+ *                    bit 13 run under the debugger (-d)
+ *                    bit 14 `unicode` is set (-C)
+ *   warnings:u8      0 as the program sets them, 1 -w, 2 -W, 3 -X
+ *   taint:u8         0 off, 1 taint warnings (-t), 2 taint checks (-T)
+ *   unicode:u32      the ${^UNICODE} flag word
+ *   source:u8        0 the file `path`, 1 the text `code` (-e), 2 standard
+ *                    input
+ *   path:str code:str extract_dir:str rs:str ors:str split:str inplace:str
+ *   preamble:strlist statements compiled ahead of the program (-M/-m)
+ *   inc:strlist      directories put in front of @INC, in order (-I)
+ *   defines:u32 count + (name:str has_value:u8 value:str)*
+ *                    main:: scalars set before the program (-s)
+ *   args:strlist     @ARGV
+ *
+ * Returns the process exit status (0..255) — an uncaught die has already
+ * been reported on STDERR, as perl does — or UINT32_MAX when `program` is
+ * malformed or there is no interpreter. */
+uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len);
 
 #endif /* PERLEMBED_H */
