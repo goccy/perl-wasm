@@ -2624,7 +2624,12 @@ enum {
     GOPERL_SVSTR_GET_CVN = 7,
     GOPERL_SVSTR_WHICHSIG = 8,
     GOPERL_SVSTR_COP_HINT = 9,
-    GOPERL_SVSTR_SETENV = 10
+    GOPERL_SVSTR_SETENV = 10,
+    /* Text with its encoding. Flags bit 0: the bytes are UTF-8. */
+    GOPERL_SVSTR_NEWPVN = 11, /* bit 1: the new SV is mortal */
+    GOPERL_SVSTR_WARN = 12,
+    GOPERL_SVSTR_THROW = 13,
+    GOPERL_SVSTR_SETPVN = 14
 };
 
 /* v8 sub-selectors (shared with the SDK headers). */
@@ -2777,6 +2782,7 @@ enum {
 #define GOPERL_PL_ERRSV 58
 #define GOPERL_PL_DEFSV 59
 #define GOPERL_PL_ERRNO 60
+#define GOPERL_PL_PID 61
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -3264,6 +3270,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_ERRSV: return (uint64_t)(uintptr_t)ERRSV;
         case GOPERL_PL_DEFSV: return (uint64_t)(uintptr_t)DEFSV;
         case GOPERL_PL_ERRNO: return (uint64_t)(int64_t)errno;
+        case GOPERL_PL_PID: /* this process, which may be a fork child */
+            return (uint64_t)(int64_t)PerlProc_getpid();
         case GOPERL_PL_DEFSTASH: return (uint64_t)(uintptr_t)(SV *)PL_defstash;
         case GOPERL_PL_INCGV: return (uint64_t)(uintptr_t)PL_incgv;
         case GOPERL_PL_STDERRGV: return (uint64_t)(uintptr_t)PL_stderrgv;
@@ -4567,6 +4575,24 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SVSTR_COP_HINT: /* sv slot = COP token, 0 for PL_curcop */
             return (uint64_t)(uintptr_t)cop_hints_fetch_pvn(
                 sv ? (const COP *)sv : PL_curcop, str, len, 0, flags);
+        case GOPERL_SVSTR_NEWPVN:
+            return (uint64_t)(uintptr_t)newSVpvn_flags(
+                str, len, ((flags & 1) ? SVf_UTF8 : 0) | ((flags & 2) ? SVs_TEMP : 0));
+        case GOPERL_SVSTR_WARN: /* warn with the text as a string of its
+                 * encoding; the place and $SIG{__WARN__} are perl's */
+            warn_sv(newSVpvn_flags(str, len, SVs_TEMP | ((flags & 1) ? SVf_UTF8 : 0)));
+            return 0;
+        case GOPERL_SVSTR_THROW: /* the message the running native XSUB
+                 * dies with (see GOPERL_SVCALL_THROW) */
+            SvREFCNT_dec(goperl_thrown_sv);
+            goperl_thrown_sv = newSVpvn_flags(str, len, (flags & 1) ? SVf_UTF8 : 0);
+            return 0;
+        case GOPERL_SVSTR_SETPVN: /* what sv_setpvf does with its formatted
+                 * text: the SV is emptied, keeping its encoding, and the
+                 * text appended as what it is */
+            SvPVCLEAR(sv);
+            sv_catpvn_flags(sv, str, len, (flags & 1) ? SV_CATUTF8 : SV_CATBYTES);
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown sv string call %d", (int)(a >> 32));
     }
