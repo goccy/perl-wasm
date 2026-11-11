@@ -2511,7 +2511,8 @@ enum {
     GOPERL_SAVE_HASH = 4,
     GOPERL_SAVE_GP = 5,
     GOPERL_SAVE_HINTS = 6,
-    GOPERL_SAVE_COMPILE_WARNINGS = 7
+    GOPERL_SAVE_COMPILE_WARNINGS = 7,
+    GOPERL_SAVE_DEFSV = 8
 };
 
 /* SV_SLOT_SET selectors. */
@@ -2774,6 +2775,8 @@ enum {
 #define GOPERL_PL_LASTGV 56
 #define GOPERL_PL_COP_SEQMAX 57
 #define GOPERL_PL_ERRSV 58
+#define GOPERL_PL_DEFSV 59
+#define GOPERL_PL_ERRNO 60
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -3259,6 +3262,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_SUB_GENERATION: return (uint64_t)PL_sub_generation;
         case GOPERL_PL_ERRGV: return (uint64_t)(uintptr_t)PL_errgv;
         case GOPERL_PL_ERRSV: return (uint64_t)(uintptr_t)ERRSV;
+        case GOPERL_PL_DEFSV: return (uint64_t)(uintptr_t)DEFSV;
+        case GOPERL_PL_ERRNO: return (uint64_t)(int64_t)errno;
         case GOPERL_PL_DEFSTASH: return (uint64_t)(uintptr_t)(SV *)PL_defstash;
         case GOPERL_PL_INCGV: return (uint64_t)(uintptr_t)PL_incgv;
         case GOPERL_PL_STDERRGV: return (uint64_t)(uintptr_t)PL_stderrgv;
@@ -3313,6 +3318,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_TAINTED: TAINT_set(cBOOL(b)); return 0;
         case GOPERL_PL_TAINTING: TAINTING_set(cBOOL(b)); return 0;
         case GOPERL_PL_ERRSV: GvSV(PL_errgv) = val; return 0;
+        case GOPERL_PL_DEFSV: DEFSV_set(val); return 0;
+        case GOPERL_PL_ERRNO: errno = (int)(int64_t)b; return 0;
         case GOPERL_PL_BEGINAV: PL_beginav = (AV *)val; return 0;
         case GOPERL_PL_UNITCHECKAV: PL_unitcheckav = (AV *)val; return 0;
         case GOPERL_PL_DESTRUCT_LEVEL: PL_perl_destruct_level = (signed char)(int64_t)b; return 0;
@@ -4163,6 +4170,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SAVE_GP: save_gp((GV *)sv, (I32)(b >> 32)); return 0;
         case GOPERL_SAVE_HINTS: SAVEHINTS(); return 0;
         case GOPERL_SAVE_COMPILE_WARNINGS: SAVECOMPILEWARNINGS(); return 0;
+        case GOPERL_SAVE_DEFSV: SAVE_DEFSV; return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown save call %d", (int)a);
     }
