@@ -55,6 +55,57 @@ Notes:
   `sleep`/`usleep`/`nanosleep` are the real implementations; the disabled
   functions fail cleanly so feature probes fall back.
 
+## CPAN distributions linked in
+
+The interpreter also links a set of XS distributions that are not part of
+perl: the ones a large share of CPAN depends on, directly or through a chain
+of dependencies. A distribution whose XS code only calls the documented API
+can be built natively against go-perl's XS SDK and loaded at run time, but
+these reach into interpreter structures (they assign through `SvCUR`-style
+macros, walk pads, ops and stashes), which only code compiled against the
+real perl headers can do. Linking them in is what makes everything that
+depends on them usable.
+
+They are listed in `scripts/bundled-cpan.txt`, one pinned archive with its
+sha256 per line: `Clone`, `Test-LeakTrace`, `Package-Stash-XS`,
+`List-MoreUtils-XS`, `Params-Util`, `HTML-Parser`, `PadWalker`, `Sub-Name`,
+`Class-XSAccessor`, `Digest-SHA1`, `Text-CSV_XS`, `YAML-LibYAML`,
+`Devel-Size`, `Want`, `Class-Load-XS`, `Sub-Identify`, `Set-Object`,
+`Cpanel-JSON-XS`.
+
+`scripts/wasi-configure.sh` downloads each archive (cached per user),
+verifies it, unpacks it into `perl5/cpan/` and adds it to `static_ext`, so
+the core's own extension machinery builds it: `make_ext.pl` runs the
+distribution's unmodified `Makefile.PL`, the objects land in
+`lib/auto/<Module>/<Module>.a`, and the modules land in `lib/` and from
+there in `perl_stdlib.zip`. `perl.cc`'s `xs_init` registers one `boot_*` per
+XS module, and the stock `XSLoader` finds it there.
+
+Two details of that build:
+
+- A `Makefile.PL` runs under the build's host miniperl, which has no XS
+  modules. One that loads XS modules to probe the compiler
+  (`List-MoreUtils-XS`, `Params-Util`: Config::AutoConf through IO::File)
+  cannot run there. Such a line carries `core-makefile` in the manifest: the
+  `Makefile.PL` is dropped and `make_ext.pl` writes its plain one, and what
+  the original would have generated is kept in
+  `scripts/bundled-cpan/<Distribution>/` (the `LMUconfig.h` of
+  `List-MoreUtils-XS` with the answers for wasi-sdk).
+- Some of these `Makefile.PL`s need the Unicode tables (`use charnames`), so
+  the build command in `wasmify.json` makes `uni.data` before the static
+  extensions.
+
+To add a distribution: add its line to the manifest, its `boot_*`
+declaration and registration to `perl.cc`, and rebuild from a clean `perl5`
+tree. Only the distribution's own modules are shipped; a distribution that
+needs other, pure-Perl distributions at run time (`HTML-Parser` needs
+`HTML-Tagset`, `Class-Load-XS` needs `Class-Load`) gets them installed the
+usual way.
+
+`Encode` is built with all of its encoding families (`Encode::Byte`, `CN`,
+`EBCDIC`, `JP`, `KR`, `Symbol`, `TW`, `Unicode`): each is an XS module of its
+own inside the `Encode` distribution and has its own `boot_*` registration.
+
 ## Excluded (NOT linked) and why
 
 | Module(s) | Reason for exclusion |

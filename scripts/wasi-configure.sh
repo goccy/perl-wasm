@@ -91,6 +91,12 @@ Unicode/Collate Unicode/Normalize mro re"
 # Makefile.PL honors those Config values ("possibly set for cross-compilation")
 # and #ifdefs the incompatible XS out, leaving real gettimeofday/usleep/
 # nanosleep/sleep/time. See docs/xs-modules.md.
+
+# CPAN distributions linked in on top of the core's extensions: unpacked into
+# perl5/cpan and built by the core's own extension machinery (make_ext.pl runs
+# each distribution's Makefile.PL), so they land in static_ext like the rest.
+BUNDLED_EXT="$(python3 "$HERE/scripts/fetch-bundled-cpan.py" "$HERE/scripts/bundled-cpan.txt" "$PERL")"
+STATIC_EXT="$STATIC_EXT $BUNDLED_EXT"
 # Collapse the line continuations / extra whitespace into single spaces.
 STATIC_EXT="$(echo $STATIC_EXT)"
 

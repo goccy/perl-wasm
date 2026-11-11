@@ -53,6 +53,14 @@ void boot_Devel__Peek(pTHX_ CV *cv);
 void boot_Digest__MD5(pTHX_ CV *cv);
 void boot_Digest__SHA(pTHX_ CV *cv);
 void boot_Encode(pTHX_ CV *cv);
+void boot_Encode__Byte(pTHX_ CV *cv);
+void boot_Encode__CN(pTHX_ CV *cv);
+void boot_Encode__EBCDIC(pTHX_ CV *cv);
+void boot_Encode__JP(pTHX_ CV *cv);
+void boot_Encode__KR(pTHX_ CV *cv);
+void boot_Encode__Symbol(pTHX_ CV *cv);
+void boot_Encode__TW(pTHX_ CV *cv);
+void boot_Encode__Unicode(pTHX_ CV *cv);
 void boot_Fcntl(pTHX_ CV *cv);
 void boot_File__DosGlob(pTHX_ CV *cv);
 void boot_File__Glob(pTHX_ CV *cv);
@@ -78,6 +86,25 @@ void boot_Unicode__Collate(pTHX_ CV *cv);
 void boot_Unicode__Normalize(pTHX_ CV *cv);
 void boot_mro(pTHX_ CV *cv);
 void boot_re(pTHX_ CV *cv);
+/* The CPAN distributions of scripts/bundled-cpan.txt. */
+void boot_Class__Load__XS(pTHX_ CV *cv);
+void boot_Class__XSAccessor(pTHX_ CV *cv);
+void boot_Clone(pTHX_ CV *cv);
+void boot_Cpanel__JSON__XS(pTHX_ CV *cv);
+void boot_Devel__Size(pTHX_ CV *cv);
+void boot_Digest__SHA1(pTHX_ CV *cv);
+void boot_HTML__Parser(pTHX_ CV *cv);
+void boot_List__MoreUtils__XS(pTHX_ CV *cv);
+void boot_Package__Stash__XS(pTHX_ CV *cv);
+void boot_PadWalker(pTHX_ CV *cv);
+void boot_Params__Util(pTHX_ CV *cv);
+void boot_Set__Object(pTHX_ CV *cv);
+void boot_Sub__Identify(pTHX_ CV *cv);
+void boot_Sub__Name(pTHX_ CV *cv);
+void boot_Test__LeakTrace(pTHX_ CV *cv);
+void boot_Text__CSV_XS(pTHX_ CV *cv);
+void boot_Want(pTHX_ CV *cv);
+void boot_YAML__XS__LibYAML(pTHX_ CV *cv);
 }
 
 static void xs_init(pTHX) {
@@ -97,6 +124,14 @@ static void xs_init(pTHX) {
     newXS("Digest::MD5::bootstrap", boot_Digest__MD5, file);
     newXS("Digest::SHA::bootstrap", boot_Digest__SHA, file);
     newXS("Encode::bootstrap", boot_Encode, file);
+    newXS("Encode::Byte::bootstrap", boot_Encode__Byte, file);
+    newXS("Encode::CN::bootstrap", boot_Encode__CN, file);
+    newXS("Encode::EBCDIC::bootstrap", boot_Encode__EBCDIC, file);
+    newXS("Encode::JP::bootstrap", boot_Encode__JP, file);
+    newXS("Encode::KR::bootstrap", boot_Encode__KR, file);
+    newXS("Encode::Symbol::bootstrap", boot_Encode__Symbol, file);
+    newXS("Encode::TW::bootstrap", boot_Encode__TW, file);
+    newXS("Encode::Unicode::bootstrap", boot_Encode__Unicode, file);
     newXS("Fcntl::bootstrap", boot_Fcntl, file);
     newXS("File::DosGlob::bootstrap", boot_File__DosGlob, file);
     newXS("File::Glob::bootstrap", boot_File__Glob, file);
@@ -122,6 +157,24 @@ static void xs_init(pTHX) {
     newXS("Unicode::Normalize::bootstrap", boot_Unicode__Normalize, file);
     newXS("mro::bootstrap", boot_mro, file);
     newXS("re::bootstrap", boot_re, file);
+    newXS("Class::Load::XS::bootstrap", boot_Class__Load__XS, file);
+    newXS("Class::XSAccessor::bootstrap", boot_Class__XSAccessor, file);
+    newXS("Clone::bootstrap", boot_Clone, file);
+    newXS("Cpanel::JSON::XS::bootstrap", boot_Cpanel__JSON__XS, file);
+    newXS("Devel::Size::bootstrap", boot_Devel__Size, file);
+    newXS("Digest::SHA1::bootstrap", boot_Digest__SHA1, file);
+    newXS("HTML::Parser::bootstrap", boot_HTML__Parser, file);
+    newXS("List::MoreUtils::XS::bootstrap", boot_List__MoreUtils__XS, file);
+    newXS("Package::Stash::XS::bootstrap", boot_Package__Stash__XS, file);
+    newXS("PadWalker::bootstrap", boot_PadWalker, file);
+    newXS("Params::Util::bootstrap", boot_Params__Util, file);
+    newXS("Set::Object::bootstrap", boot_Set__Object, file);
+    newXS("Sub::Identify::bootstrap", boot_Sub__Identify, file);
+    newXS("Sub::Name::bootstrap", boot_Sub__Name, file);
+    newXS("Test::LeakTrace::bootstrap", boot_Test__LeakTrace, file);
+    newXS("Text::CSV_XS::bootstrap", boot_Text__CSV_XS, file);
+    newXS("Want::bootstrap", boot_Want, file);
+    newXS("YAML::XS::LibYAML::bootstrap", boot_YAML__XS__LibYAML, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */

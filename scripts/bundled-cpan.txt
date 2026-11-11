@@ -1,0 +1,31 @@
+# CPAN distributions with XS code that are linked into perl.wasm.
+#
+# These are XS distributions that a large number of other CPAN distributions
+# depend on. Their C code reaches into interpreter structures directly, so it
+# is compiled here against the real perl headers, exactly like the core's own
+# XS extensions, and their modules ship in the stdlib.
+#
+# One distribution per line:
+#   <extension name> <archive path under CPAN authors/id> <sha256 of the archive>
+# The extension name is what goes into static_ext; the distribution is unpacked
+# into perl5/cpan/<name with "/" replaced by "-">. Each XS module needs a
+# matching boot_* registration in perl.cc's xs_init. A trailing "core-makefile"
+# is explained in fetch-bundled-cpan.py.
+Clone             A/AT/ATOOMIC/Clone-0.51.tar.gz              f17f66fec97dacca67ac9585701d2d079cfc80539fe6e8160c201c4e55f67507
+Test/LeakTrace    L/LE/LEEJO/Test-LeakTrace-0.17.tar.gz       777d64d2938f5ea586300eef97ef03eacb43d4c1853c9c3b1091eb3311467970
+Package/Stash/XS  E/ET/ETHER/Package-Stash-XS-0.32.tar.gz     9f961e798c01370f3834eda5f010c9d60c68a96d15c48598d8a5a25ca32f5f11
+List/MoreUtils/XS R/RE/REHSACK/List-MoreUtils-XS-0.430.tar.gz e8ce46d57c179eecd8758293e9400ff300aaf20fefe0a9d15b9fe2302b9cb242 core-makefile
+Params/Util       R/RE/REHSACK/Params-Util-1.102.tar.gz       499bb1b482db24fda277a51525596ad092c2bd51dd508fa8fec2e9f849097402 core-makefile
+HTML/Parser       O/OA/OALDERS/HTML-Parser-3.86.tar.gz        5305e1d5faa70ee0aa282d85a5c9aa93911e8c7afa590ad1ced5703a544e20f6
+PadWalker         R/RO/ROBIN/PadWalker-2.5.tar.gz             07b26abb841146af32072a8d68cb90176ffb176fd9268e6f2f7d106f817a0cd0
+Sub/Name          E/ET/ETHER/Sub-Name-0.28.tar.gz             39c53f6b3b02cbc73176564413b51d3c0f375f9760983fd579c27f558b169cfc
+Class/XSAccessor  S/SM/SMUELLER/Class-XSAccessor-1.19.tar.gz  99c56b395f1239af19901f2feeb125d9ecb4e351a0d80daa9529211a4700a6f2
+Digest/SHA1       G/GA/GAAS/Digest-SHA1-2.13.tar.gz           68c1dac2187421f0eb7abf71452a06f190181b8fc4b28ededf5b90296fb943cc
+Text/CSV_XS       H/HM/HMBRAND/Text-CSV_XS-1.65.tgz           4f0c16457c87def295a994e9c4ba397a8baafad96cefaf2d61483125f90ff974
+YAML/LibYAML      T/TI/TINITA/YAML-LibYAML-v0.910.0.tar.gz    04310e9840b918383a5b9ae9ca4b3bde1b2771ec786c758bd2fffd79d409332b
+Devel/Size        N/NW/NWCLARK/Devel-Size-0.87.tar.gz         c89fe04c9d0e5ced6c1d334311d576de609f3c8a41220919d4551e9eb0191f47
+Want              R/RO/ROBIN/Want-0.29.tar.gz                 b4e4740b8d4cb783591273c636bd68304892e28d89e88abf9273b1de17f552f7
+Class/Load/XS     E/ET/ETHER/Class-Load-XS-0.10.tar.gz        5bc22cf536ebfd2564c5bdaf42f0d8a4cee3d1930fc8b44b7d4a42038622add1
+Sub/Identify      R/RG/RGARCIA/Sub-Identify-0.14.tar.gz       068d272086514dd1e842b6a40b1bedbafee63900e5b08890ef6700039defad6f
+Set/Object        R/RU/RURBAN/Set-Object-1.43.tar.gz          e3b3c7c7ecb91ef6d20eb06bf6bff74e41c40b75bd234e107d2ecf78d3dea9d1
+Cpanel/JSON/XS    R/RU/RURBAN/Cpanel-JSON-XS-4.81.tar.gz      4536ae0c67b4be123eb59d2e2f9527eb27f3dc9ba5523a6a7f3cc34347c85e7a
