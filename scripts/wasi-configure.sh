@@ -307,6 +307,22 @@ d_pthreads_created_joinable='undef'
 d_getaddrinfo='define'
 d_getnameinfo='define'
 d_gai_strerror='define'
+# The base config predates these as well, and wasi-libc has all of them:
+# inet_pton and inet_ntop, and in <netinet/in.h> and <sys/socket.h> the
+# structures sockaddr_in6 (with sin6_scope_id), sockaddr_storage, ip_mreq,
+# ip_mreq_source and ipv6_mreq. Socket.xs compiles inet_pton/inet_ntop, the
+# sockaddr_in6 packers and the multicast-request packers only when the
+# configuration says they exist; without them they croak "not implemented on
+# this architecture", which takes down everything that formats an address
+# with them (IO::Socket::IP, and through it most networking code).
+d_inetpton='define'
+d_inetntop='define'
+d_sockaddr_in6='define'
+d_sin6_scope_id='define'
+d_sockaddr_storage='define'
+d_ip_mreq='define'
+d_ip_mreq_source='define'
+d_ipv6_mreq='define'
 
 # vfork / raw syscall / wait4: no wasmify stub. Perl falls back (fork; no
 # syscall; waitpid instead of wait4).
