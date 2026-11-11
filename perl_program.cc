@@ -346,21 +346,6 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
     PL_restartop = 0;
 }
 
-/* END blocks, the way perl_destruct runs them: an exit inside one ends that
- * block and the rest still run. The process exit status is only known once
- * they have run — an END block may assign $?. */
-void program_run_end_blocks(pTHX) {
-    dJMPENV;
-    int x = 0;
-    JMPENV_PUSH(x);
-    PERL_UNUSED_VAR(x);
-    if (PL_endav && !PL_minus_c) {
-        PERL_SET_PHASE(PERL_PHASE_END);
-        call_list(PL_scopestack_ix, PL_endav);
-    }
-    JMPENV_POP;
-}
-
 /* The JMPENV half of perl_run_program: perl_parse's and perl_run's own
  * shape, joined. ps is owned by the caller, so no C++ object lives in a
  * frame the jumps cross. */

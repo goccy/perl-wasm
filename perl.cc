@@ -1413,8 +1413,16 @@ std::string perl_eval(uint64_t h, const char *src) {
 
 extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out);
 
-void perl_close(uint64_t h) {
-    if (!g_my_perl || h == 0) return;
+/* The end of the interpreter, as perl's main() performs it: perl_destruct
+ * (the END blocks, the flush of PerlIO, global destruction) and perl_free.
+ * Returns perl_destruct's result, the status a perl process exits with: a
+ * destructor that runs during global destruction may still assign $?. A
+ * destructor that calls exit there ends the process on the spot, as it does
+ * in perl (there is no jump environment left to return to).
+ *
+ * PERL_SYS_TERM is intentionally NOT called: it is process teardown, and
+ * the instance may create a fresh interpreter afterwards. */
+static int destroy_interpreter() {
     PERL_SET_CONTEXT(g_my_perl);
     {
         dTHX;
@@ -1423,11 +1431,15 @@ void perl_close(uint64_t h) {
         g_inc_from_environment = nullptr;
     }
     PL_perl_destruct_level = 2;
-    perl_destruct(g_my_perl);
+    const int status = perl_destruct(g_my_perl);
     perl_free(g_my_perl);
     g_my_perl = nullptr;
-    /* PERL_SYS_TERM is intentionally NOT called here: it is process teardown,
-     * and the instance may create a fresh interpreter afterwards. */
+    return status;
+}
+
+void perl_close(uint64_t h) {
+    if (!g_my_perl || h == 0) return;
+    destroy_interpreter();
 }
 
 uint32_t perl_fork_child(uint64_t h, int32_t pid) {
@@ -1437,8 +1449,7 @@ uint32_t perl_fork_child(uint64_t h, int32_t pid) {
     int status = 0;
     if (wasi_fork_child_run(aTHX_ static_cast<int>(pid), &status) != 0)
         return UINT32_MAX;
-    program_run_end_blocks(aTHX);
-    return static_cast<uint32_t>(STATUS_EXIT) & 0xff;
+    return static_cast<uint32_t>(destroy_interpreter()) & 0xff;
 }
 
 /* ---- whole-program execution (perl_program.cc) -------------------------- */
@@ -1493,8 +1504,7 @@ uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len)
     dTHX;
     wasi_signal_attach(aTHX);
     program_execute(aTHX_ ps);
-    program_run_end_blocks(aTHX);
-    return static_cast<uint32_t>(STATUS_EXIT) & 0xff;
+    return static_cast<uint32_t>(destroy_interpreter()) & 0xff;
 }
 
 uint32_t perl_interrupt_addr(uint64_t h) {

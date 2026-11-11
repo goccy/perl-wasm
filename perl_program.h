@@ -56,10 +56,9 @@ struct ProgramSpec {
 };
 
 /* Compiles and runs the program to its end; an exit or an uncaught die
- * ends it like the perl command. The exit status is in the interpreter
- * (STATUS_EXIT) once program_run_end_blocks has run. */
+ * ends it like the perl command. Its END blocks have not run yet: they are
+ * perl_destruct's to run, and the exit status is perl_destruct's result. */
 void program_execute(pTHX_ const ProgramSpec &ps);
-void program_run_end_blocks(pTHX);
 
 /* Removes from @INC the directories the interpreter took from the
  * environment at start-up (PERL5LIB, "."): what perl -T leaves out.
