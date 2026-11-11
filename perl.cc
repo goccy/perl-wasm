@@ -2815,6 +2815,7 @@ enum {
 #define GOPERL_GVPTR_EGV 4     /* GV_PTR: GvEGV */
 #define GOPERL_GVPTR_SV 5      /* GV_PTR: GvSV */
 #define GOPERL_GVPTR_IO 6      /* GV_PTR: GvIO */
+#define GOPERL_GVPTR_CV 7      /* GV_PTR: GvCV */
 #define GOPERL_SI_SELF 0       /* SI_GET: the stackinfo token itself */
 #define GOPERL_SI_PREV 1       /* SI_GET: si_prev */
 #define GOPERL_SI_TYPE 2       /* SI_GET: si_type */
@@ -3530,6 +3531,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_GVPTR_EGV: return (uint64_t)(uintptr_t)(SV *)GvEGV(gv);
         case GOPERL_GVPTR_SV: return (uint64_t)(uintptr_t)GvSV(gv);
         case GOPERL_GVPTR_IO: return (uint64_t)(uintptr_t)(SV *)GvIO(gv);
+        case GOPERL_GVPTR_CV: /* also when the glob is a method-cache entry,
+                 * where GvCVu gives nothing */
+            return (uint64_t)(uintptr_t)(SV *)GvCV(gv);
         }
         return 0;
     }
@@ -3654,6 +3658,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                  * The moral equivalent of mro::get_pkg_gen($stash), read the
                  * same way Moose's mop.c reads it. */
         HV *hv = (HV *)(uintptr_t)a;
+        if (b == 1) { /* HvMROMETA, which makes the meta when there is none:
+                 * pkg_gen<<32 | cache_gen */
+            if (SvTYPE((SV *)hv) != SVt_PVHV) return 0;
+            struct mro_meta *meta = HvMROMETA(hv);
+            return ((uint64_t)meta->pkg_gen << 32) | (uint32_t)meta->cache_gen;
+        }
         if (SvTYPE((SV *)hv) != SVt_PVHV || !HvHasAUX(hv)) return 0;
         struct mro_meta *m = HvAUX(hv)->xhv_mro_meta;
         if (!m) return 0;
