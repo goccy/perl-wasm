@@ -249,6 +249,49 @@ static int32_t g_go_cb = 0;
  * returned. NULL whenever no native XSUB is ending that way. */
 static SV *goperl_thrown_sv = NULL;
 
+/* A callback of native code that did not ask for G_EVAL (CALL_SV and
+ * CALL_METHOD below). Its die cannot unwind the host's C frames, so the
+ * call is made inside an eval scope all the same; but a call with G_EVAL
+ * empties $@ when it starts and again when the callee returns, which a
+ * call without G_EVAL never does, and code relies on that: a method
+ * implemented in C that calls back into Perl must not lose the $@ of the
+ * eval before it.
+ *
+ * So the eval scope is opened with G_KEEPERR, which leaves $@ alone on the
+ * way in and on the way out, and the call goes through the XSUB below,
+ * which takes the scope out of keep-error mode again before it calls the
+ * real target: a die in the callee then sets $@ as any die does, instead
+ * of turning into an "(in cleanup)" warning. Whether the callee returned
+ * is recorded here, not read out of $@, which may hold an older error or a
+ * false exception value. */
+struct goperl_plain_call {
+    SV *target;         /* the code to call, or NULL for a method call */
+    const char *method; /* the method name then (the invocant is ST(0)) */
+    I32 flags;          /* the caller's flags, without G_DISCARD */
+    bool returned;
+};
+/* The call XS_goperl_plain_call is about to make: set right before the
+ * call_sv that enters it and taken (cleared) on entry, so a callback
+ * nested in the callee sets its own. */
+static goperl_plain_call *goperl_plain_call_pending = NULL;
+static CV *goperl_plain_call_cv = NULL;
+
+XS(XS_goperl_plain_call);
+XS(XS_goperl_plain_call) {
+    dXSARGS;
+    goperl_plain_call *call = goperl_plain_call_pending;
+    goperl_plain_call_pending = NULL;
+    if (!call) Perl_croak(aTHX_ "goperl: no native callback is pending");
+    PL_in_eval &= ~EVAL_KEEPERR;
+    /* the arguments stay where they are and become the callee's */
+    PUSHMARK(SP - items);
+    const I32 count = call->method ? call_method(call->method, call->flags)
+                                   : call_sv(call->target, call->flags);
+    call->returned = true;
+    /* the results are where the arguments were */
+    XSRETURN(count);
+}
+
 /* pp-hook request payload: GOPERL_PP_HOOK_HDR_WORDS u32 header words
  * (op token, op type, peek count) followed by at most
  * GOPERL_PP_HOOK_PEEK_MAX stack-top SV tokens. */
@@ -2464,7 +2507,10 @@ enum goperl_xs_op {
     GOPERL_OP_SV_STR = 189,
     GOPERL_OP_SV_SLOT_GET = 190,
     GOPERL_OP_CALLER_CX = 191,
-    GOPERL_OP_PERLIO = 192
+    GOPERL_OP_PERLIO = 192,
+    GOPERL_OP_MEM_FREE = 193,
+    GOPERL_OP_MEM_REALLOC = 194,
+    GOPERL_OP_DO_OPENN = 195
 };
 
 /* PERLIO selectors: the handle functions of perlio.h. */
@@ -2583,7 +2629,8 @@ enum {
     GOPERL_SVCALL_THROW = 50,
     GOPERL_SVCALL_2PVBYTE = 51,
     GOPERL_SVCALL_HV_KSPLIT = 52,
-    GOPERL_SVCALL_UNI_DISPLAY = 53
+    GOPERL_SVCALL_UNI_DISPLAY = 53,
+    GOPERL_SVCALL_TAINT_ENV = 54 /* no SV: taint_env() */
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -2629,7 +2676,8 @@ enum {
     GOPERL_SVSTR_NEWPVN = 11, /* bit 1: the new SV is mortal */
     GOPERL_SVSTR_WARN = 12,
     GOPERL_SVSTR_THROW = 13,
-    GOPERL_SVSTR_SETPVN = 14
+    GOPERL_SVSTR_SETPVN = 14,
+    GOPERL_SVSTR_TAINT_PROPER = 15 /* taint_proper(NULL, s) */
 };
 
 /* v8 sub-selectors (shared with the SDK headers). */
@@ -2783,6 +2831,7 @@ enum {
 #define GOPERL_PL_DEFSV 59
 #define GOPERL_PL_ERRNO 60
 #define GOPERL_PL_PID 61
+#define GOPERL_PL_STATUSVALUE 62
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -3157,12 +3206,31 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
          * unchanged so wantarray in the callee is honest. G_EVAL is always
          * forced: an uncaught longjmp would abandon the host callback protocol
          * mid-flight. The host re-raises when the caller did not ask for
-         * G_EVAL. */
+         * G_EVAL.
+         *
+         * A caller that did not ask for G_EVAL gets a call that treats $@
+         * as a call without G_EVAL does (see goperl_plain_call). */
         I32 count;
-        if (op == 66)
-            count = call_method(method, flags | G_EVAL);
-        else
-            count = call_sv((SV *)(uintptr_t)(uint32_t)a, flags | G_EVAL);
+        uint64_t died;
+        if (flags & G_EVAL) {
+            if (op == 66)
+                count = call_method(method, flags);
+            else
+                count = call_sv((SV *)(uintptr_t)(uint32_t)a, flags);
+            died = SvTRUE(ERRSV) ? 1u : 0u;
+        } else {
+            if (!goperl_plain_call_cv)
+                goperl_plain_call_cv = newXS(NULL, XS_goperl_plain_call, __FILE__);
+            goperl_plain_call call;
+            call.target = op == 66 ? NULL : (SV *)(uintptr_t)(uint32_t)a;
+            call.method = method;
+            call.flags = flags & ~G_DISCARD;
+            call.returned = false;
+            goperl_plain_call_pending = &call;
+            count = call_sv((SV *)goperl_plain_call_cv,
+                            (flags & (G_WANT | G_DISCARD)) | G_EVAL | G_KEEPERR);
+            died = call.returned ? 0u : 1u;
+        }
         SPAGAIN;
         AV *res = newAV();
         av_extend(res, count > 0 ? count - 1 : 0);
@@ -3170,7 +3238,6 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             av_store(res, i, SvREFCNT_inc(POPs));
         PUTBACK;
         sv_2mortal((SV *)res);
-        uint64_t died = SvTRUE(ERRSV) ? 1u : 0u;
         return (died << 63) | ((uint64_t)(uint32_t)count << 32) |
                (uint32_t)(uintptr_t)res;
     }
@@ -3270,6 +3337,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_ERRSV: return (uint64_t)(uintptr_t)ERRSV;
         case GOPERL_PL_DEFSV: return (uint64_t)(uintptr_t)DEFSV;
         case GOPERL_PL_ERRNO: return (uint64_t)(int64_t)errno;
+        case GOPERL_PL_STATUSVALUE: return (uint64_t)(int64_t)PL_statusvalue;
         case GOPERL_PL_PID: /* this process, which may be a fork child */
             return (uint64_t)(int64_t)PerlProc_getpid();
         case GOPERL_PL_DEFSTASH: return (uint64_t)(uintptr_t)(SV *)PL_defstash;
@@ -3328,6 +3396,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_ERRSV: GvSV(PL_errgv) = val; return 0;
         case GOPERL_PL_DEFSV: DEFSV_set(val); return 0;
         case GOPERL_PL_ERRNO: errno = (int)(int64_t)b; return 0;
+        case GOPERL_PL_STATUSVALUE: PL_statusvalue = (I32)(int64_t)b; return 0;
         case GOPERL_PL_BEGINAV: PL_beginav = (AV *)val; return 0;
         case GOPERL_PL_UNITCHECKAV: PL_unitcheckav = (AV *)val; return 0;
         case GOPERL_PL_DESTRUCT_LEVEL: PL_perl_destruct_level = (signed char)(int64_t)b; return 0;
@@ -4303,6 +4372,41 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         return 0;
     }
+    case GOPERL_OP_MEM_FREE: /* a = a block of the interpreter's allocator
+                 * (the string buffer a module took from an SV) */
+        Safefree((void *)(uintptr_t)a);
+        return 0;
+    case GOPERL_OP_MEM_REALLOC: { /* a = such a block, b = its new size */
+        char *block = (char *)(uintptr_t)a;
+        Renew(block, (size_t)b, char);
+        return (uint64_t)(uintptr_t)block;
+    }
+    case GOPERL_OP_DO_OPENN: { /* a = gv; s = five u32 (as_raw, rawmode,
+                 * rawperm, supplied handle, argument count), the argument
+                 * tokens, then the mode text; b = the length of all of it */
+        uint32_t head[5];
+        if (!s || b < sizeof head) Perl_croak(aTHX_ "goperl: do_openn: short request");
+        memcpy(head, s, sizeof head);
+        const size_t num = head[4];
+        if (b < sizeof head + num * 4) Perl_croak(aTHX_ "goperl: do_openn: short request");
+        SV **svs = NULL;
+        if (num) {
+            Newx(svs, num, SV *);
+            SAVEFREEPV(svs);
+            for (size_t i = 0; i < num; i++) {
+                uint32_t tok;
+                memcpy(&tok, s + sizeof head + i * 4, 4);
+                svs[i] = (SV *)(uintptr_t)tok;
+            }
+        }
+        const char *mode = s + sizeof head + num * 4;
+        const size_t mode_len = (size_t)b - sizeof head - num * 4;
+        return do_openn((GV *)(uintptr_t)a, mode, (I32)mode_len, (int)head[0],
+                        (int)head[1], (int)head[2],
+                        (PerlIO *)(uintptr_t)head[3], svs, (I32)num)
+                   ? 1
+                   : 0;
+    }
     case GOPERL_OP_PERLIO: { /* a = a GOPERL_PIO_ selector<<32 | handle (or
                  * IO sv); b and s = the remaining arguments */
         PerlIO *f = (PerlIO *)(uintptr_t)(uint32_t)a;
@@ -4467,6 +4571,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)SvCUR(sv);
         }
         case GOPERL_SVCALL_HV_KSPLIT: hv_ksplit((HV *)sv, (IV)(int64_t)b); return 0;
+        case GOPERL_SVCALL_TAINT_ENV: taint_env(); return 0;
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
             SvOK_off(sv);
             return 0;
@@ -4586,6 +4691,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                  * dies with (see GOPERL_SVCALL_THROW) */
             SvREFCNT_dec(goperl_thrown_sv);
             goperl_thrown_sv = newSVpvn_flags(str, len, (flags & 1) ? SVf_UTF8 : 0);
+            return 0;
+        case GOPERL_SVSTR_TAINT_PROPER: /* dies when tainted data is in
+                 * use (PL_tainted), naming the operation */
+            taint_proper(NULL, str);
             return 0;
         case GOPERL_SVSTR_SETPVN: /* what sv_setpvf does with its formatted
                  * text: the SV is emptied, keeping its encoding, and the
