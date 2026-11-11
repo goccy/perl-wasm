@@ -240,7 +240,15 @@ lddlflags=' '
 libs='-lm -lsetjmp -lwasi-emulated-process-clocks -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-getpid'
 libc='$SYSROOT/lib/wasm32-wasi/libc.a'
 perllibs='-lm'
-libpth='$SYSROOT/lib/wasm32-wasi'
+# libpth is not the wasi sysroot: %Config keeps this value for the life of
+# the installed perl, where it tells ExtUtils::Liblist, DynaLoader
+# (@dl_library_path) and library finders such as FFI::CheckLib where
+# libraries are — and the sysroot is a directory of the machine that built
+# perl. The libraries a program can load at run time are the host's, so
+# these are the host's conventional library directories. Nothing in this
+# build looks a library up through it: the interpreter is linked by wasmify
+# with the libraries of `libs`, found through --sysroot.
+libpth='/usr/local/lib /usr/lib /lib'
 
 # Build-host-portable fixups. These drive the BUILD machine (not the wasm
 # target), so they must be correct on EVERY host that may run configure — the
