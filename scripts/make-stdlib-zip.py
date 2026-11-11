@@ -21,11 +21,18 @@ Trim (everything that is meaningless in the embedded, statically-linked build):
     XSLoader::load short-circuits for static_ext, so the .a is never read.
   - auto/**/*.ld / auto/**/extralibs.ld — MakeMaker linker hints (build-only).
   - **/.exists — MakeMaker directory-stamp markers (build-only).
-  - *.pod and any pod/ tree — documentation (perldoc does not run under wasi).
+  - any pod/ tree — manual pages kept apart from the modules.
   - *.t and any t/ or test/ directory — module test suites.
   - *.bs — bootstrap stubs (unused for static ext).
 The unicore/ Unicode tables (*.pl / *.txt) ARE kept — required for \w, \p{...},
 case folding, and Encode.
+
+The *.pod files perl installs into its library directory next to the modules
+ARE kept (Config.pod, CORE.pod, perlfaq*.pod, ...): they are part of an
+installed perl's library, and programs look for them there (a module's
+documentation is found beside its .pm). The manual pages of the perl5/pod/
+source directory (perlfunc.pod and the rest) are not in lib/ and so are not
+shipped.
 
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
@@ -55,7 +62,7 @@ def included(rel_path: str) -> bool:
     # and the only nondeterministic byte source in the tree.
     if rel_path == "unicore/mktables.lst":
         return False
-    for ext in (".a", ".ld", ".bs", ".pod", ".t"):
+    for ext in (".a", ".ld", ".bs", ".t"):
         if rel_path.endswith(ext):
             return False
     return True
