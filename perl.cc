@@ -3535,8 +3535,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     case GOPERL_OP_NEW_XS: { /* bind the generic native thunk as sub s with fn_id a
                 * and return the CV token (newXS + XSANY, like
                 * perl_register_native_xs but with the CV surfaced so the host
-                * can model CvXSUBANY/alias dispatch). */
-        CV *cv = newXS(s ? s : "", XS_goperl_native_thunk, __FILE__);
+                * can model CvXSUBANY/alias dispatch). With b the sub has
+                * no name (newXS(NULL, ...)): it is in no glob, and the one
+                * reference to it is the caller's. */
+        CV *cv = newXS(b ? NULL : (s ? s : ""), XS_goperl_native_thunk, __FILE__);
         CvXSUBANY(cv).any_i32 = (I32)(int64_t)a;
         return (uint64_t)(uintptr_t)cv;
     }
