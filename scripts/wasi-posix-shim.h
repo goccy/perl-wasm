@@ -68,6 +68,22 @@
  * include guard and the __struct_sockaddr_un.h guard) so there is no conflicting
  * redefinition. AF_UNIX then COMPILES; whether it works is up to the host socket
  * layer (go-perl) — otherwise the call fails at runtime, which is correct. */
+/* struct sockaddr_storage: wasi-libc's has 48 bytes, less than a Unix-domain
+ * address (below) takes. POSIX has it large enough for any address, and
+ * perl sizes the buffer of getsockname and getpeername by it: with wasi's,
+ * a Unix-domain name was cut after 46 bytes and the end of the string was
+ * set past the buffer. This is Linux's: 128 bytes. wasi's definer is
+ * suppressed by its include guard before <sys/socket.h> pulls it in, which
+ * is the case for everything of perl (the header is force-included); a
+ * source that includes this header after <sys/socket.h> keeps wasi's. */
+#ifndef __wasilibc___struct_sockaddr_storage_h
+#define __wasilibc___struct_sockaddr_storage_h
+#include <__typedef_sa_family_t.h>
+struct sockaddr_storage {
+	__attribute__((aligned(__BIGGEST_ALIGNMENT__))) sa_family_t ss_family;
+	char __ss_data[128 - sizeof(sa_family_t)];
+};
+#endif
 #include <sys/socket.h>
 #ifndef _SYS_UN_H
 #define _SYS_UN_H
