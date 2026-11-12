@@ -3172,7 +3172,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvPOK(sv)) f |= GOPERL_INFO_POK;
         if (SvNIOK(sv)) f |= GOPERL_INFO_NIOK;
         if (SvUTF8(sv)) f |= GOPERL_INFO_UTF8;
-        if (sv_isobject(sv)) f |= GOPERL_INFO_ISOBJ;
+        /* Not sv_isobject, which runs the get magic of sv first: this is
+         * a look at the flags, what SvOK and SvPOK are, and a module that
+         * has fetched a tied value once must not fetch it again by asking.
+         * (The SDK's sv_isobject runs the magic itself.) */
+        if (SvROK(sv) && SvOBJECT(SvRV(sv))) f |= GOPERL_INFO_ISOBJ;
         if (SvREADONLY(sv)) f |= GOPERL_INFO_READONLY;
         if (SvTYPE(sv) == SVt_PVCV) f |= GOPERL_INFO_ISCV;
         if (SvTYPE(sv) == SVt_PVGV) f |= GOPERL_INFO_ISGV;
