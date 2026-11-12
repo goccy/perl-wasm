@@ -76,6 +76,18 @@ int wasi_host_proc_priority(int which, int who, int set, int value, int *nice_ou
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_uname")))
 int wasi_host_proc_uname(void *buf, int buf_len, uint32_t *needed);
 
+/* Reports a change of the environment: name is set to value, or removed
+ * when has_value is 0. The host process follows when the program is it. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setenv")))
+int wasi_host_proc_setenv(const char *name, int name_len, const char *value, int value_len,
+                          int has_value);
+
+int __real_setenv(const char *name, const char *value, int overwrite);
+int __real_unsetenv(const char *name);
+int __real_putenv(char *string);
+int __real_clearenv(void);
+
+extern char **environ;
 
 } /* extern "C" */
 
@@ -209,6 +221,9 @@ bool host_uname(struct utsname *out) {
     return true;
 }
 
+void report_env(const char *name, size_t name_len, const char *value) {
+    wasi_host_proc_setenv(name, (int)name_len, value ? value : "",
+                          value ? (int)strlen(value) : 0, value != NULL);
 }
 
 /* The protocols database: the entries every /etc/protocols starts with. */
@@ -245,16 +260,43 @@ int fchown(int fd, uid_t owner, gid_t group) {
     return change_owner(st, owner, group);
 }
 
-int lchown(const char *path, uid_t owner, gid_t group) {
-    struct stat st;
-    if (lstat(path, &st) != 0) return -1;
-    return change_owner(st, owner, group);
+/* ---- the environment --------------------------------------------------------
+ * The environment is libc's own table. Every change to it goes through
+ * these (the link wraps the libc functions), which pass it on to the host
+ * once libc has made it. */
+int __wrap_setenv(const char *name, const char *value, int overwrite) {
+    const int rc = __real_setenv(name, value, overwrite);
+    if (rc == 0) report_env(name, strlen(name), getenv(name));
+    return rc;
 }
 
-int fchown(int fd, uid_t owner, gid_t group) {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return -1;
-    return change_owner(st, owner, group);
+int __wrap_unsetenv(const char *name) {
+    const int rc = __real_unsetenv(name);
+    if (rc == 0) report_env(name, strlen(name), NULL);
+    return rc;
+}
+
+int __wrap_putenv(char *string) {
+    const int rc = __real_putenv(string);
+    if (rc == 0) {
+        const char *eq = strchr(string, '=');
+        if (eq)
+            report_env(string, (size_t)(eq - string), eq + 1);
+        else
+            report_env(string, strlen(string), NULL);
+    }
+    return rc;
+}
+
+int __wrap_clearenv(void) {
+    /* the names first: they are gone once libc has cleared the table */
+    if (environ) {
+        for (char **e = environ; *e; e++) {
+            const char *eq = strchr(*e, '=');
+            report_env(*e, eq ? (size_t)(eq - *e) : strlen(*e), NULL);
+        }
+    }
+    return __real_clearenv();
 }
 
 /* ---- sockets ----------------------------------------------------------------

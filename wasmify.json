@@ -59,7 +59,11 @@
   "wasm_build": {
     "extra_ldflags": [
       "-lc-printscan-long-double",
-      "-Wl,--fatal-warnings"
+      "-Wl,--fatal-warnings",
+      "-Wl,--wrap=setenv",
+      "-Wl,--wrap=unsetenv",
+      "-Wl,--wrap=putenv",
+      "-Wl,--wrap=clearenv"
     ]
   },
   "user_selection": {
