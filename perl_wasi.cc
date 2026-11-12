@@ -36,10 +36,11 @@
 
 extern char **environ;
 
-/* child_stdin / child_stdout / child_stderr name the fds of this process
- * that become the command's fds 0 / 1 / 2; a negative one stands for this
- * process's own fd of that number. */
-static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
+/* Starts the program file with the arguments argv. child_stdin /
+ * child_stdout / child_stderr name the fds of this process that become the
+ * command's fds 0 / 1 / 2; a negative one stands for this process's own fd
+ * of that number. Returns the pid, or -1 with errno set. */
+static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_stdin,
                              int child_stdout, int child_stderr = -1) {
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
@@ -53,13 +54,19 @@ static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
     posix_spawn_file_actions_adddup2(&fa, child_stderr >= 0 ? child_stderr : 2, 2);
     pid_t pid = -1;
     /* perl runs commands with execvp: a bare name is looked up on PATH. */
-    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    int rc = posix_spawnp(&pid, file, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
         errno = rc;
         return -1;
     }
     return pid;
+}
+
+/* The usual case: the program is named by the first argument. */
+static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
+                             int child_stdout, int child_stderr = -1) {
+    return wasi_spawn_file(argv[0], argv, child_stdin, child_stdout, child_stderr);
 }
 
 static pid_t wasi_spawn_shell(const char *cmd, int child_stdin,
@@ -447,6 +454,32 @@ __attribute__((noreturn)) static void wasi_become(pid_t pid) {
     if (wasi_host_proc_exec((int)pid, &status) != 0) _exit(255);
     if (WIFSIGNALED(status)) wasi_host_proc_terminate(WTERMSIG(status));
     _exit(WEXITSTATUS(status));
+}
+
+/* execv and execvp, for the callers that exec without going through
+ * pp_exec: the lexer, when the #! line of the program names another
+ * interpreter (toke.c hands the program to it), and POSIX-level code. They
+ * return only when the command could not be started, with errno set. */
+extern "C" int execv(const char *path, char *const argv[]) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, 0, 0);
+    posix_spawn_file_actions_adddup2(&fa, 1, 1);
+    posix_spawn_file_actions_adddup2(&fa, 2, 2);
+    pid_t pid = -1;
+    const int rc = posix_spawn(&pid, path, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    wasi_become(pid);
+}
+
+extern "C" int execvp(const char *file, char *const argv[]) {
+    const pid_t pid = wasi_spawn_file(file, argv, -1, -1);
+    if (pid < 0) return -1;
+    wasi_become(pid);
 }
 
 /* pp_exec (configure patch): starts the command and becomes it

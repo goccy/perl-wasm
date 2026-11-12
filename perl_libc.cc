@@ -223,14 +223,6 @@ int mkfifo(const char *path, mode_t mode) {
     return fail(ENOSYS);
 }
 
-/* A process image cannot be replaced; perl's own exec is built on spawning
- * (perl_wasi.cc). */
-int execv(const char *path, char *const argv[]) {
-    (void)path;
-    (void)argv;
-    return fail(ENOSYS);
-}
-
 /* There are no process groups, sessions or scheduling priorities. */
 pid_t getpgid(pid_t pid) {
     (void)pid;
