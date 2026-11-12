@@ -59,7 +59,16 @@ interpreter, or names none. The interpreter answers for them
 (Internals::site_directories: the %Config keys of the site directories it
 was started with and their values, see perl.cc), and the shipped Config.pm
 and Config_heavy.pl report what it says; without any, they keep the values
-of the build's configuration.
+of the build's configuration. With site directories, they are also where
+perl's own library would be installed (installprivlib, installarchlib): the
+library directory is a copy the embedding application unpacked for itself,
+which may be replaced as a whole, and what an installation writes beside the
+library (ExtUtils::MakeMaker's perllocal.pod, under installarchlib) belongs
+to the user's installations.
+
+The path of the perl command (perlpath, and startperl, the #! line for a
+program that is installed) is $^X when that is an absolute path: the
+embedding application sets $^X to what runs it as perl, if anything does.
 
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
@@ -136,11 +145,24 @@ CONFIG_HEAVY_LIBDIR = """\
 # The site directories are the ones the interpreter was started with, when
 # it was started with any: it names every key that is one of them.
 {
+    my $set = sub {
+        my ($key, $value) = @_;
+        my $quoted = $value =~ /'/ ? '"' . quotemeta($value) . '"' : "'$value'";
+        s/^\\Q$key\\E=.*$/$key=$quoted/m;
+    };
     my %site = Internals::site_directories();
     for my $key (keys %site) {
-        my $dir = $site{$key};
-        my $quoted = $dir =~ /'/ ? '"' . quotemeta($dir) . '"' : "'$dir'";
-        s/^\\Q$key\\E=.*$/$key=$quoted/m;
+        $set->($key, $site{$key});
+    }
+    # What is installed goes to the site directories, also what perl would
+    # install beside its own library: the library directory is not a place
+    # to install into.
+    $set->('installprivlib', $site{installsitelib}) if defined $site{installsitelib};
+    $set->('installarchlib', $site{installsitearch}) if defined $site{installsitearch};
+    # The perl command is the one this interpreter says it can be run by.
+    if ($^X =~ m{\\A/}) {
+        $set->('perlpath', $^X);
+        $set->('startperl', "#!$^X");
     }
 }
 """
