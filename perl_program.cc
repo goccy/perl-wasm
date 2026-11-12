@@ -106,6 +106,10 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
     PL_main_start = NULL;
     SvREFCNT_dec(PL_main_cv);
     PL_main_cv = NULL;
+    /* $^T is when the program started. The interpreter may be a copy of one
+     * that was started long before (an instance made from a snapshot of
+     * the process's first), and would otherwise keep that one's. */
+    time(&PL_basetime);
     PL_dowarn = G_WARN_OFF;
     PERL_SET_PHASE(PERL_PHASE_START);
 
