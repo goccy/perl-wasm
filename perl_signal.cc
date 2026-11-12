@@ -455,6 +455,18 @@ int raise(int sig) {
     return 0;
 }
 
+/* abort: the process ends by SIGABRT. A handler for the signal runs first;
+ * when it returns, or the signal is ignored or blocked, the process ends
+ * by the signal all the same. (wasi-libc's abort is a trap, which reaches
+ * the host as a crash of the instance and not as a process that ended.) */
+void abort(void) {
+    if (!(g_blocked & sig_bit(SIGABRT))) {
+        const handler_t h = g_actions[SIGABRT].handler;
+        if (h != SIG_IGN && h != SIG_DFL) deliver(SIGABRT);
+    }
+    wasi_host_proc_terminate(SIGABRT);
+}
+
 /* ---- the interval timer ---------------------------------------------------
  * One timer, kept by the host, behind all four functions: alarm and ualarm
  * are setitimer(ITIMER_REAL) with their own units, as POSIX describes them.
