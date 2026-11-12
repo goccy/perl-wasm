@@ -214,6 +214,17 @@ extern "C" int wasi_host_proc_kill(int pid, int sig);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_closefrom")))
 extern "C" int wasi_host_fd_closefrom(int low_fd);
 
+/* Waits for the command pid in the command's name: from here on every
+ * signal sent to this process goes to the command. Returns 0 with the
+ * command's wait status, or a negative errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exec")))
+extern "C" int wasi_host_proc_exec(int pid, int *status_out);
+
+/* Ends the process as one killed by sig (perl_signal.cc uses it for the
+ * default action of a signal). */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
+extern "C" void wasi_host_proc_terminate(int sig);
+
 enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2 };
 static struct {
     int kind;
@@ -411,12 +422,36 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     return 0;
 }
 
-/* pp_exec (configure patch). A process image cannot be replaced, so exec
- * runs the command with this process's current fds and environment, waits
- * for it, and ends the process with the command's status — through _exit,
- * because a replaced program runs neither END blocks nor destructors, and
- * nothing of the interpreter may run once its descriptors are gone.
- * Returns only when the command could not be started, with errno set. */
+/* The second half of exec. A process image cannot be replaced, so exec
+ * starts the command with this process's current fds and environment
+ * (wasi_spawn_argv and friends) and then this process stands in for it
+ * until it ends:
+ *
+ *   - It gives up every descriptor it holds, as exec does for the
+ *     close-on-exec ones (all but stdio, in perl) — the command has its own
+ *     stdio. A peer waiting for end-of-file on one of them (the status pipe
+ *     IPC::Open3 reads to learn that exec succeeded) must not wait until the
+ *     command ends.
+ *   - It waits in the host, which passes every signal this process is sent
+ *     on to the command: the pid others know is this one's, and the program
+ *     that had the handlers is gone. SIGKILL included.
+ *   - It ends the way the command ended: with its exit status, or killed by
+ *     the signal that killed it, so that whoever waits for this process
+ *     sees what happened to the command.
+ *
+ * All of it without running anything of the interpreter (_exit, not exit):
+ * a replaced program runs neither END blocks nor destructors. */
+__attribute__((noreturn)) static void wasi_become(pid_t pid) {
+    wasi_host_fd_closefrom(0);
+    int status = 0;
+    if (wasi_host_proc_exec((int)pid, &status) != 0) _exit(255);
+    if (WIFSIGNALED(status)) wasi_host_proc_terminate(WTERMSIG(status));
+    _exit(WEXITSTATUS(status));
+}
+
+/* pp_exec (configure patch): starts the command and becomes it
+ * (wasi_become). Returns only when the command could not be started, with
+ * errno set. */
 extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
     const char *what;
@@ -455,21 +490,8 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         errno = e;
         return;
     }
-    /* The program is gone from here on: only the command remains. Give up
-     * every descriptor this process holds, as exec does for the
-     * close-on-exec ones (all but stdio, in perl) — the command has its
-     * own stdio. A peer waiting for end-of-file on one of them (the status
-     * pipe IPC::Open3 reads to learn that exec succeeded) must not wait
-     * until the command ends. */
-    wasi_host_fd_closefrom(0);
-    int status = 0;
-    pid_t r;
-    do {
-        r = waitpid(pid, &status, 0);
-    } while (r == -1 && errno == EINTR);
-    if (r == -1) _exit(255);
-    /* a command killed by a signal reports the shell's 128+signal */
-    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status));
+    /* The program is gone from here on: only the command remains. */
+    wasi_become(pid);
 }
 
 extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
