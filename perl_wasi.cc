@@ -249,23 +249,7 @@ static struct {
  * pp_open without the C frame that held it. */
 extern "C" { SSize_t wasi_open_return_sp = 0; }
 
-/* A pseudo-process has the pid the host registered it under, and the
- * process that forked it for a parent; the first process of an instance has
- * the ids the host gives it (perl_process.cc). */
-static pid_t wasi_self_pid = 0;
-static pid_t wasi_parent_pid = 0;
-
-extern "C" pid_t wasi_host_pid(void);
-extern "C" pid_t wasi_host_ppid(void);
 extern "C" void wasi_signal_fork_child(pTHX);
-
-extern "C" pid_t getpid(void) {
-    return wasi_self_pid ? wasi_self_pid : wasi_host_pid();
-}
-
-extern "C" pid_t getppid(void) {
-    return wasi_parent_pid ? wasi_parent_pid : wasi_host_ppid();
-}
 
 extern "C" int kill(pid_t pid, int sig) {
     if (sig < 0 || sig >= NSIG) {
@@ -273,8 +257,9 @@ extern "C" int kill(pid_t pid, int sig) {
         return -1;
     }
     /* A signal to the process itself is delivered here and now
-     * (perl_signal.cc); any other process is the host's to find. */
-    if (pid == getpid()) return raise(sig);
+     * (perl_signal.cc); any other process, and a process group (a pid of 0
+     * or less), is the host's to find. */
+    if (pid > 0 && pid == getpid()) return raise(sig);
     int rc = wasi_host_proc_kill((int)pid, sig);
     if (rc != 0) {
         errno = rc < 0 ? -rc : rc;
@@ -344,9 +329,9 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     const int kind = wasi_fork_point.kind;
     if (kind == WASI_FORK_NONE) return -1;
     wasi_fork_point.kind = WASI_FORK_NONE;
-
-    wasi_parent_pid = getpid();
-    wasi_self_pid = (pid_t)pid;
+    /* The host knows this instance as the process pid: getpid and getppid
+     * ask it (perl_process.cc). */
+    (void)pid;
 
     /* The jump environments the copied interpreter points at lived in
      * native frames this instance does not have. */

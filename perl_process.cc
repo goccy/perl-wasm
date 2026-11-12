@@ -5,7 +5,8 @@
  * answers through imports: a guest that runs as the host process (the perl
  * command) gets the host's ids and databases, and an isolated one gets a
  * fixed identity — pid 42, parent 1, user and group 0 — and empty
- * databases.
+ * databases. A process made by fork has the pid the host forked it under,
+ * and for a parent the process that forked it, or 1 once that one is gone.
  *
  * Nothing is cached here: an instance can be a copy (a memory snapshot) of
  * one that asked a different host.
@@ -162,10 +163,8 @@ int set_ids(uid_t want_real, uid_t want_effective, int real_which, int effective
 
 extern "C" {
 
-/* getpid and getppid of the first process of an instance; perl_wasi.cc
- * overrides them for a fork child. */
-pid_t wasi_host_pid(void) { return (pid_t)process_id(ID_PID); }
-pid_t wasi_host_ppid(void) { return (pid_t)process_id(ID_PPID); }
+pid_t getpid(void) { return (pid_t)process_id(ID_PID); }
+pid_t getppid(void) { return (pid_t)process_id(ID_PPID); }
 
 uid_t getuid(void) { return (uid_t)process_id(ID_UID); }
 uid_t geteuid(void) { return (uid_t)process_id(ID_EUID); }

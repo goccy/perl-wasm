@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,19 @@ extern "C" {
  * bytes) is too small for it, which is -ERANGE. 0 or a negative errno. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_path")))
 int wasi_host_fd_path(int fd, char *buf, int buf_len, int *length);
+/* Process groups and sessions, which the host keeps: the group of process
+ * pid (0: the caller); moving pid (0: the caller, or a child of it) into
+ * group pgid (0: one of its own); starting a session. 0 or a negative
+ * errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_getpgid")))
+int wasi_host_proc_getpgid(int pid, int *pgid_out);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setpgid")))
+int wasi_host_proc_setpgid(int pid, int pgid);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setsid")))
+int wasi_host_proc_setsid(int *sid_out);
+
 
 } /* extern "C" */
 
@@ -223,24 +237,34 @@ int mkfifo(const char *path, mode_t mode) {
     return fail(ENOSYS);
 }
 
-/* There are no process groups, sessions or scheduling priorities. */
+/* ---- process groups and sessions ---------------------------------------------
+ * The host keeps them: the processes of a program are its to know. */
 pid_t getpgid(pid_t pid) {
-    (void)pid;
-    return (pid_t)fail(ENOSYS);
+    int pgid = 0;
+    const int rc = wasi_host_proc_getpgid((int)pid, &pgid);
+    if (rc != 0) return (pid_t)fail(-rc);
+    return (pid_t)pgid;
 }
+
+pid_t getpgrp(void) { return getpgid(0); }
 
 int setpgid(pid_t pid, pid_t pgid) {
-    (void)pid;
-    (void)pgid;
-    return fail(ENOSYS);
+    const int rc = wasi_host_proc_setpgid((int)pid, (int)pgid);
+    if (rc != 0) return fail(-rc);
+    return 0;
 }
 
-pid_t setsid(void) { return (pid_t)fail(ENOSYS); }
+pid_t setsid(void) {
+    int sid = 0;
+    const int rc = wasi_host_proc_setsid(&sid);
+    if (rc != 0) return (pid_t)fail(-rc);
+    return (pid_t)sid;
+}
 
 int killpg(pid_t pgrp, int sig) {
-    (void)pgrp;
-    (void)sig;
-    return fail(ENOSYS);
+    if (pgrp < 0) return fail(EINVAL);
+    /* group 0 is the caller's own, as kill has it */
+    return kill(pgrp > 1 ? -pgrp : 0, sig);
 }
 
 int getpriority(int which, id_t who) {
