@@ -9,8 +9,14 @@
 #   <extension name> <archive path under CPAN authors/id> <sha256 of the archive>
 # The extension name is what goes into static_ext; the distribution is unpacked
 # into perl5/cpan/<name with "/" replaced by "-">. Each XS module needs a
-# matching boot_* registration in perl.cc's xs_init. A trailing "core-makefile"
-# is explained in fetch-bundled-cpan.py.
+# matching entry in perl.cc's table of linked-in extensions. A trailing
+# "core-makefile" is explained in fetch-bundled-cpan.py. The external
+# symbols of every distribution here are renamed per extension
+# (scripts/ext-symbols.py).
+#
+# Devel::Caller is here because of PadWalker: it takes the address of a
+# context frame from PadWalker and reads the frame, so both have to be
+# compiled against the same interpreter structures.
 Clone             A/AT/ATOOMIC/Clone-0.51.tar.gz              f17f66fec97dacca67ac9585701d2d079cfc80539fe6e8160c201c4e55f67507
 Test/LeakTrace    L/LE/LEEJO/Test-LeakTrace-0.17.tar.gz       777d64d2938f5ea586300eef97ef03eacb43d4c1853c9c3b1091eb3311467970
 Package/Stash/XS  E/ET/ETHER/Package-Stash-XS-0.32.tar.gz     9f961e798c01370f3834eda5f010c9d60c68a96d15c48598d8a5a25ca32f5f11
@@ -29,3 +35,4 @@ Class/Load/XS     E/ET/ETHER/Class-Load-XS-0.10.tar.gz        5bc22cf536ebfd2564
 Sub/Identify      R/RG/RGARCIA/Sub-Identify-0.14.tar.gz       068d272086514dd1e842b6a40b1bedbafee63900e5b08890ef6700039defad6f
 Set/Object        R/RU/RURBAN/Set-Object-1.43.tar.gz          e3b3c7c7ecb91ef6d20eb06bf6bff74e41c40b75bd234e107d2ecf78d3dea9d1
 Cpanel/JSON/XS    R/RU/RURBAN/Cpanel-JSON-XS-4.81.tar.gz      4536ae0c67b4be123eb59d2e2f9527eb27f3dc9ba5523a6a7f3cc34347c85e7a
+Devel/Caller      R/RC/RCLAMP/Devel-Caller-2.07.tar.gz        b679a2b18034b0b720de82c3708724c364b10a6ca164cbc67cdc3af283f3503f

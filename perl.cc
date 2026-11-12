@@ -102,6 +102,7 @@ void boot_Class__Load__XS(pTHX_ CV *cv);
 void boot_Class__XSAccessor(pTHX_ CV *cv);
 void boot_Clone(pTHX_ CV *cv);
 void boot_Cpanel__JSON__XS(pTHX_ CV *cv);
+void boot_Devel__Caller(pTHX_ CV *cv);
 void boot_Devel__Size(pTHX_ CV *cv);
 void boot_Digest__SHA1(pTHX_ CV *cv);
 void boot_HTML__Parser(pTHX_ CV *cv);
@@ -174,6 +175,7 @@ const StaticExtension static_extensions[] = {
     {"Class::XSAccessor", boot_Class__XSAccessor},
     {"Clone", boot_Clone},
     {"Cpanel::JSON::XS", boot_Cpanel__JSON__XS},
+    {"Devel::Caller", boot_Devel__Caller},
     {"Devel::Size", boot_Devel__Size},
     {"Digest::SHA1", boot_Digest__SHA1},
     {"HTML::Parser", boot_HTML__Parser},
