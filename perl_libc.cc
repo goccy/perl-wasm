@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netdb.h> /* struct hostent */
 #include <sys/resource.h>
 #include <sys/utsname.h>
@@ -81,6 +82,15 @@ int wasi_host_proc_uname(void *buf, int buf_len, uint32_t *needed);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setenv")))
 int wasi_host_proc_setenv(const char *name, int name_len, const char *value, int value_len,
                           int has_value);
+
+/* An entry of the host's services database, by name (by_port 0) or by
+ * port, for the protocol proto when it is not empty: the port (u32), the
+ * name, the protocol, the number of aliases (u32) and the aliases — strings
+ * as a u32 length and the bytes. -ENOENT when there is no such service. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_service")))
+int wasi_host_sock_service(const char *name, int name_len, int port, int by_port,
+                           const char *proto, int proto_len, void *buf, int buf_len,
+                           uint32_t *needed);
 
 int __real_setenv(const char *name, const char *value, int overwrite);
 int __real_unsetenv(const char *name);
@@ -219,6 +229,52 @@ bool host_uname(struct utsname *out) {
         pos += n;
     }
     return true;
+}
+
+/* A lookup in the host's services database. */
+struct servent *find_service(const char *name, int port, int by_port, const char *proto) {
+    static struct servent ent;
+    static char rec[2048];
+    static char *aliases[32];
+    if (!proto) proto = "";
+    uint32_t needed = 0;
+    if (wasi_host_sock_service(name, (int)strlen(name), port, by_port, proto, (int)strlen(proto),
+                               rec, (int)sizeof(rec), &needed) != 0)
+        return NULL;
+    /* The record: u32 port, then strings as a u32 length and the bytes —
+     * the name, the protocol — a u32 count and the aliases. Each string is
+     * moved down onto its length, which makes room for its terminator. */
+    uint32_t pos = 0, value = 0;
+    auto number = [&](uint32_t *out) {
+        if (needed - pos < 4) return false;
+        memcpy(out, rec + pos, 4);
+        pos += 4;
+        return true;
+    };
+    auto string = [&]() -> char * {
+        uint32_t n = 0;
+        if (!number(&n) || needed - pos < n) return NULL;
+        char *s = rec + pos - 4;
+        memmove(s, rec + pos, n);
+        s[n] = '\0';
+        pos += n;
+        return s;
+    };
+    if (!number(&value)) return NULL;
+    ent.s_port = (int)htons((uint16_t)value);
+    ent.s_name = string();
+    ent.s_proto = string();
+    uint32_t count = 0;
+    if (!ent.s_name || !ent.s_proto || !number(&count)) return NULL;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        char *alias = string();
+        if (!alias) return NULL;
+        if (kept + 1 < sizeof(aliases) / sizeof(aliases[0])) aliases[kept++] = alias;
+    }
+    aliases[kept] = NULL;
+    ent.s_aliases = aliases;
+    return &ent;
 }
 
 void report_env(const char *name, size_t name_len, const char *value) {
@@ -563,19 +619,19 @@ struct netent *getnetbyaddr(uint32_t net, int type) {
     return NULL;
 }
 
-/* Services: no database. Callers name a port by number. */
+/* Services: lookups by name and by port go to the host, which has the
+ * database when the process is the host process; there is no table to
+ * walk. The result lives in static storage, as the interface has it. */
 void setservent(int stayopen) { (void)stayopen; }
 void endservent(void) {}
 struct servent *getservent(void) { return NULL; }
 struct servent *getservbyname(const char *name, const char *proto) {
-    (void)name;
-    (void)proto;
-    return NULL;
+    if (!name) return NULL;
+    return find_service(name, 0, 0, proto);
 }
 struct servent *getservbyport(int port, const char *proto) {
-    (void)port;
-    (void)proto;
-    return NULL;
+    /* the port is in network byte order, as in a sockaddr */
+    return find_service("", (int)ntohs((uint16_t)port), 1, proto);
 }
 
 /* Protocols: the table above. */
