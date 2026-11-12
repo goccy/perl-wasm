@@ -35,12 +35,22 @@ extern "C" {
 
 #include "perl_program.h"
 
-/* ---- static extension bootstraps ----------------------------------------
- * Mirrors the xs_init generated into perlmain.c by ExtUtils::Miniperl from the
- * static_ext list. KEEP IN SYNC with STATIC_EXT in scripts/wasi-configure.sh:
- * one boot_<Pkg> per statically linked XS extension. Each boot_* symbol lives
- * in the corresponding lib/auto/<Mod>/<Mod>.a archive, resolved at the
- * perl.wasm link. DynaLoader is the special first entry. */
+/* ---- linked-in extensions -------------------------------------------------
+ * The XS extensions of this build are part of perl.wasm: one boot function
+ * per extension, each in its lib/auto/<Mod>/<Mod>.a archive and resolved at
+ * the perl.wasm link. KEEP IN SYNC with STATIC_EXT in
+ * scripts/wasi-configure.sh and with scripts/bundled-cpan.txt.
+ *
+ * A statically linked perl usually registers every one of them at start-up
+ * as <Module>::bootstrap (the xs_init ExtUtils::Miniperl writes into
+ * perlmain.c). A program can see that: the package of a module it never
+ * loaded has a sub, so the module looks loaded (Class::Load's
+ * is_class_loaded and similar probes). Here nothing is registered until the
+ * module is loaded: XSLoader::load and DynaLoader::bootstrap ask
+ * DynaLoader::dl_static_boot for the module's boot function, which installs
+ * it as <Module>::bootstrap then -- the name a dynamically loading perl
+ * installs a boot function under, at the same moment. (The two loaders are
+ * taught to ask in scripts/wasi-configure.sh.) */
 extern "C" {
 void boot_DynaLoader(pTHX_ CV *cv);
 void boot_attributes(pTHX_ CV *cv);
@@ -87,7 +97,7 @@ void boot_Unicode__Collate(pTHX_ CV *cv);
 void boot_Unicode__Normalize(pTHX_ CV *cv);
 void boot_mro(pTHX_ CV *cv);
 void boot_re(pTHX_ CV *cv);
-/* The CPAN distributions of scripts/bundled-cpan.txt. */
+/* CPAN distributions bundled on top of the core (scripts/bundled-cpan.txt) */
 void boot_Class__Load__XS(pTHX_ CV *cv);
 void boot_Class__XSAccessor(pTHX_ CV *cv);
 void boot_Clone(pTHX_ CV *cv);
@@ -108,75 +118,107 @@ void boot_Want(pTHX_ CV *cv);
 void boot_YAML__XS__LibYAML(pTHX_ CV *cv);
 }
 
+namespace {
+
+struct StaticExtension {
+    const char *module;
+    XSUBADDR_t boot;
+};
+
+const StaticExtension static_extensions[] = {
+    {"attributes", boot_attributes},
+    {"B", boot_B},
+    {"Compress::Raw::Bzip2", boot_Compress__Raw__Bzip2},
+    {"Compress::Raw::Zlib", boot_Compress__Raw__Zlib},
+    {"Cwd", boot_Cwd},
+    {"Data::Dumper", boot_Data__Dumper},
+    {"Devel::Peek", boot_Devel__Peek},
+    {"Digest::MD5", boot_Digest__MD5},
+    {"Digest::SHA", boot_Digest__SHA},
+    {"Encode", boot_Encode},
+    {"Encode::Byte", boot_Encode__Byte},
+    {"Encode::CN", boot_Encode__CN},
+    {"Encode::EBCDIC", boot_Encode__EBCDIC},
+    {"Encode::JP", boot_Encode__JP},
+    {"Encode::KR", boot_Encode__KR},
+    {"Encode::Symbol", boot_Encode__Symbol},
+    {"Encode::TW", boot_Encode__TW},
+    {"Encode::Unicode", boot_Encode__Unicode},
+    {"Fcntl", boot_Fcntl},
+    {"File::DosGlob", boot_File__DosGlob},
+    {"File::Glob", boot_File__Glob},
+    {"Filter::Util::Call", boot_Filter__Util__Call},
+    {"Hash::Util", boot_Hash__Util},
+    {"Hash::Util::FieldHash", boot_Hash__Util__FieldHash},
+    {"I18N::Langinfo", boot_I18N__Langinfo},
+    {"IO", boot_IO},
+    {"List::Util", boot_List__Util},
+    {"Math::BigInt::FastCalc", boot_Math__BigInt__FastCalc},
+    {"MIME::Base64", boot_MIME__Base64},
+    {"Opcode", boot_Opcode},
+    {"POSIX", boot_POSIX},
+    {"PerlIO::encoding", boot_PerlIO__encoding},
+    {"PerlIO::via", boot_PerlIO__via},
+    {"SDBM_File", boot_SDBM_File},
+    {"Socket", boot_Socket},
+    {"Storable", boot_Storable},
+    {"Sys::Hostname", boot_Sys__Hostname},
+    {"Sys::Syslog", boot_Sys__Syslog},
+    {"Time::HiRes", boot_Time__HiRes},
+    {"Time::Piece", boot_Time__Piece},
+    {"Unicode::Collate", boot_Unicode__Collate},
+    {"Unicode::Normalize", boot_Unicode__Normalize},
+    {"mro", boot_mro},
+    {"re", boot_re},
+    {"Class::Load::XS", boot_Class__Load__XS},
+    {"Class::XSAccessor", boot_Class__XSAccessor},
+    {"Clone", boot_Clone},
+    {"Cpanel::JSON::XS", boot_Cpanel__JSON__XS},
+    {"Devel::Size", boot_Devel__Size},
+    {"Digest::SHA1", boot_Digest__SHA1},
+    {"HTML::Parser", boot_HTML__Parser},
+    {"List::MoreUtils::XS", boot_List__MoreUtils__XS},
+    {"Package::Stash::XS", boot_Package__Stash__XS},
+    {"PadWalker", boot_PadWalker},
+    {"Params::Util", boot_Params__Util},
+    {"Set::Object", boot_Set__Object},
+    {"Sub::Identify", boot_Sub__Identify},
+    {"Sub::Name", boot_Sub__Name},
+    {"Test::LeakTrace", boot_Test__LeakTrace},
+    {"Text::CSV_XS", boot_Text__CSV_XS},
+    {"Want", boot_Want},
+    {"YAML::XS::LibYAML", boot_YAML__XS__LibYAML},
+};
+
+} /* namespace */
+
+/* DynaLoader::dl_static_boot(module): the boot function of a linked-in
+ * extension, installed as <module>::bootstrap and returned as a code
+ * reference; undef for a module that is not linked in. */
+XS(XS_DynaLoader_dl_static_boot) {
+    dXSARGS;
+    if (items != 1) croak_xs_usage(cv, "module");
+    STRLEN len;
+    const char *const module = SvPV(ST(0), len);
+    for (const StaticExtension &ext : static_extensions) {
+        if (strlen(ext.module) != len || memcmp(ext.module, module, len) != 0) continue;
+        SV *const name = sv_2mortal(newSVpvf("%s::bootstrap", ext.module));
+        CV *boot = get_cv(SvPV_nolen(name), 0);
+        if (!boot) boot = newXS(SvPV_nolen(name), ext.boot, __FILE__);
+        ST(0) = sv_2mortal(newRV_inc((SV *)boot));
+        XSRETURN(1);
+    }
+    XSRETURN_UNDEF;
+}
+
 static void xs_init(pTHX) {
     static const char file[] = __FILE__;
     dXSUB_SYS;
     PERL_UNUSED_CONTEXT;
 
-    /* DynaLoader is the special case (bootstraps the loader itself). */
+    /* The loader itself, and its way to the table above. */
     newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
-    newXS("attributes::bootstrap", boot_attributes, file);
-    newXS("B::bootstrap", boot_B, file);
-    newXS("Compress::Raw::Bzip2::bootstrap", boot_Compress__Raw__Bzip2, file);
-    newXS("Compress::Raw::Zlib::bootstrap", boot_Compress__Raw__Zlib, file);
-    newXS("Cwd::bootstrap", boot_Cwd, file);
-    newXS("Data::Dumper::bootstrap", boot_Data__Dumper, file);
-    newXS("Devel::Peek::bootstrap", boot_Devel__Peek, file);
-    newXS("Digest::MD5::bootstrap", boot_Digest__MD5, file);
-    newXS("Digest::SHA::bootstrap", boot_Digest__SHA, file);
-    newXS("Encode::bootstrap", boot_Encode, file);
-    newXS("Encode::Byte::bootstrap", boot_Encode__Byte, file);
-    newXS("Encode::CN::bootstrap", boot_Encode__CN, file);
-    newXS("Encode::EBCDIC::bootstrap", boot_Encode__EBCDIC, file);
-    newXS("Encode::JP::bootstrap", boot_Encode__JP, file);
-    newXS("Encode::KR::bootstrap", boot_Encode__KR, file);
-    newXS("Encode::Symbol::bootstrap", boot_Encode__Symbol, file);
-    newXS("Encode::TW::bootstrap", boot_Encode__TW, file);
-    newXS("Encode::Unicode::bootstrap", boot_Encode__Unicode, file);
-    newXS("Fcntl::bootstrap", boot_Fcntl, file);
-    newXS("File::DosGlob::bootstrap", boot_File__DosGlob, file);
-    newXS("File::Glob::bootstrap", boot_File__Glob, file);
-    newXS("Filter::Util::Call::bootstrap", boot_Filter__Util__Call, file);
-    newXS("Hash::Util::bootstrap", boot_Hash__Util, file);
-    newXS("Hash::Util::FieldHash::bootstrap", boot_Hash__Util__FieldHash, file);
-    newXS("I18N::Langinfo::bootstrap", boot_I18N__Langinfo, file);
-    newXS("IO::bootstrap", boot_IO, file);
-    newXS("List::Util::bootstrap", boot_List__Util, file);
-    newXS("Math::BigInt::FastCalc::bootstrap", boot_Math__BigInt__FastCalc, file);
-    newXS("MIME::Base64::bootstrap", boot_MIME__Base64, file);
-    newXS("Opcode::bootstrap", boot_Opcode, file);
-    newXS("POSIX::bootstrap", boot_POSIX, file);
-    newXS("PerlIO::encoding::bootstrap", boot_PerlIO__encoding, file);
-    newXS("PerlIO::via::bootstrap", boot_PerlIO__via, file);
-    newXS("SDBM_File::bootstrap", boot_SDBM_File, file);
-    newXS("Socket::bootstrap", boot_Socket, file);
-    newXS("Storable::bootstrap", boot_Storable, file);
-    newXS("Sys::Hostname::bootstrap", boot_Sys__Hostname, file);
-    newXS("Sys::Syslog::bootstrap", boot_Sys__Syslog, file);
-    newXS("Time::HiRes::bootstrap", boot_Time__HiRes, file);
-    newXS("Time::Piece::bootstrap", boot_Time__Piece, file);
-    newXS("Unicode::Collate::bootstrap", boot_Unicode__Collate, file);
-    newXS("Unicode::Normalize::bootstrap", boot_Unicode__Normalize, file);
-    newXS("mro::bootstrap", boot_mro, file);
-    newXS("re::bootstrap", boot_re, file);
-    newXS("Class::Load::XS::bootstrap", boot_Class__Load__XS, file);
-    newXS("Class::XSAccessor::bootstrap", boot_Class__XSAccessor, file);
-    newXS("Clone::bootstrap", boot_Clone, file);
-    newXS("Cpanel::JSON::XS::bootstrap", boot_Cpanel__JSON__XS, file);
-    newXS("Devel::Size::bootstrap", boot_Devel__Size, file);
-    newXS("Digest::SHA1::bootstrap", boot_Digest__SHA1, file);
-    newXS("HTML::Parser::bootstrap", boot_HTML__Parser, file);
-    newXS("List::MoreUtils::XS::bootstrap", boot_List__MoreUtils__XS, file);
-    newXS("Package::Stash::XS::bootstrap", boot_Package__Stash__XS, file);
-    newXS("PadWalker::bootstrap", boot_PadWalker, file);
-    newXS("Params::Util::bootstrap", boot_Params__Util, file);
-    newXS("Set::Object::bootstrap", boot_Set__Object, file);
-    newXS("Sub::Identify::bootstrap", boot_Sub__Identify, file);
-    newXS("Sub::Name::bootstrap", boot_Sub__Name, file);
-    newXS("Test::LeakTrace::bootstrap", boot_Test__LeakTrace, file);
-    newXS("Text::CSV_XS::bootstrap", boot_Text__CSV_XS, file);
-    newXS("Want::bootstrap", boot_Want, file);
-    newXS("YAML::XS::LibYAML::bootstrap", boot_YAML__XS__LibYAML, file);
+    newXS("DynaLoader::dl_static_boot", XS_DynaLoader_dl_static_boot, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */

@@ -806,6 +806,45 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"native-mechanism patch applied to {path}")
 PYPATCH
+# ---- XSLoader, DynaLoader: linked-in extensions are found when loaded ---------
+# A statically linked perl registers <Module>::bootstrap for every linked-in
+# extension at start-up, and the two loaders look for that sub. This build
+# registers nothing up front (a module that was never loaded must not look
+# loaded; see "linked-in extensions" in perl.cc): the loaders ask
+# DynaLoader::dl_static_boot, which installs the boot function of a
+# linked-in extension as <Module>::bootstrap at that moment and returns it.
+# The host miniperl that runs the build has no such function and loads as
+# before. Idempotent.
+python3 - <<'PYPATCH'
+def patch(path, old, new):
+    t = open(path).read()
+    if "dl_static_boot" in t:
+        print(f"linked-in extension lookup already present in {path}")
+        return
+    assert t.count(old) == 1, path
+    open(path, "w").write(t.replace(old, new))
+    print(f"linked-in extension lookup applied to {path}")
+
+old = ("    my $boots = \"$module\\::bootstrap\";\n"
+       "    goto &$boots if defined &$boots;\n")
+patch("dist/XSLoader/XSLoader_pm.PL", old, old +
+      "\n"
+      "    # An extension linked into this perl: its boot function is installed\n"
+      "    # under that name now, the first time the module is loaded.\n"
+      "    if (defined &dl_static_boot and my $xs = dl_static_boot($module)) {\n"
+      "        goto &$xs;\n"
+      "    }\n")
+
+old = ("    # A common error on platforms which don't support dynamic loading.\n"
+       "    # Since it's fatal and potentially confusing we give a detailed message.\n")
+patch("ext/DynaLoader/DynaLoader_pm.PL", old,
+      "    # An extension linked into this perl: its boot function is installed\n"
+      "    # as ${module}::bootstrap now, the first time the module is loaded.\n"
+      "    if (defined &dl_static_boot and my $xs = dl_static_boot($module)) {\n"
+      "        return &$xs(@args);\n"
+      "    }\n"
+      "\n" + old)
+PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of
 # the core *.o files, so a flag change alone would leave stale objects that
