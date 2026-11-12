@@ -268,26 +268,43 @@ extern "C" int kill(pid_t pid, int sig) {
     return 0;
 }
 
+/* The CPU time of the process, in nanoseconds: user and system time of the
+ * process itself, then of the children it has waited for. 0 or a negative
+ * errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_times")))
+extern "C" int wasi_host_proc_times(uint64_t times[4]);
+
 /* times(2). wasi-libc's emulation reports process time in clock()'s unit,
  * nanoseconds, while perl divides what times returns by the clock tick it
  * established at start-up (PL_clocktick: sysconf(_SC_CLK_TCK), or its
- * fallback). This one reports in that unit. The process time is the
- * emulated clock's: time elapsed since the instance started, all of it
- * accounted as user time. */
+ * fallback). This one reports in that unit, and what the host accounts to
+ * the process: user and system time, its own and its children's. Where the
+ * host keeps no such account the process time is the emulated clock's:
+ * time elapsed since the instance started, all of it user time. */
 extern "C" clock_t times(struct tms *buf) {
     const long ticks_per_sec = PL_clocktick;
     if (ticks_per_sec <= 0) {
         errno = ENOSYS; /* no interpreter has set the unit yet */
         return (clock_t)-1;
     }
-    const clock_t user = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
+    const clock_t elapsed = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
+    uint64_t nanos[4] = {0, 0, 0, 0};
+    const bool accounted = wasi_host_proc_times(nanos) == 0;
     if (buf) {
-        buf->tms_utime = user;
-        buf->tms_stime = 0;
-        buf->tms_cutime = 0;
-        buf->tms_cstime = 0;
+        if (accounted) {
+            const uint64_t per_tick = 1000000000ull / (uint64_t)ticks_per_sec;
+            buf->tms_utime = (clock_t)(nanos[0] / per_tick);
+            buf->tms_stime = (clock_t)(nanos[1] / per_tick);
+            buf->tms_cutime = (clock_t)(nanos[2] / per_tick);
+            buf->tms_cstime = (clock_t)(nanos[3] / per_tick);
+        } else {
+            buf->tms_utime = elapsed;
+            buf->tms_stime = 0;
+            buf->tms_cutime = 0;
+            buf->tms_cstime = 0;
+        }
     }
-    return user;
+    return elapsed;
 }
 
 /* Forks at the current op. Returns the child's pid, or -1 with errno set.
@@ -518,7 +535,7 @@ extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
          * parent's handle and the child's stdout / stdin. */
         PERL_FLUSHALL_FOR_CHILD;
         int p[2];
-        if (pipe(p) < 0) return NULL;
+        if (Perl_PerlProc_pipe_cloexec(aTHX_ p) < 0) return NULL;
         const bool rd = (*mode == 'r');
         wasi_fork_point.child_end = rd ? p[1] : p[0];
         wasi_fork_point.parent_end = rd ? p[0] : p[1];
@@ -537,8 +554,12 @@ extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
         return wasi_spawn_finish(aTHX_ wasi_fork_point.parent_end, mode, pid);
     }
     PERL_FLUSHALL_FOR_CHILD;
+    /* Close-on-exec, as perl's own piped open makes its pipe: the command
+     * gets one end as its stdin or stdout, and must not inherit the pair
+     * under their own numbers as well — a writer that holds the read end of
+     * its own pipe never learns that the reader has gone. */
     int p[2];
-    if (pipe(p) < 0) return NULL;
+    if (Perl_PerlProc_pipe_cloexec(aTHX_ p) < 0) return NULL;
     const bool reading = (*mode == 'r');
     bool blank = false;
     pid_t pid = reading ? wasi_spawn_command(cmd, -1, p[1], &blank)
@@ -577,7 +598,7 @@ extern "C" PerlIO *wasi_spawn_popen_list(pTHX_ const char *mode, int n,
     for (int i = 0; i < n; i++) argv[i] = SvPV_nolen(args[i]);
     argv[n] = NULL;
     int p[2];
-    if (pipe(p) < 0) {
+    if (Perl_PerlProc_pipe_cloexec(aTHX_ p) < 0) {
         free(argv);
         return NULL;
     }

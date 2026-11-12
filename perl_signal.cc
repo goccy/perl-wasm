@@ -133,13 +133,16 @@ uint64_t g_held = 0;    /* delivered while blocked: pending until unblocked */
 /* Counts handler runs, so that pause and sigsuspend know one happened. */
 unsigned long g_handler_runs = 0;
 
-/* Tells the host which signals would be noticed, so that it neither keeps
- * nor interrupts a blocking call for one that would not. */
+/* Tells the host which signals have a handler and which are ignored, so
+ * that it neither keeps nor interrupts a blocking call for a signal nobody
+ * would notice (it knows the default actions), and so that it knows a
+ * process that ignores SIGCHLD: the children of one leave nothing to wait
+ * for. */
 void report_dispositions() {
     uint64_t handled = 0, ignored = 0;
     for (int sig = 1; sig < NSIG; sig++) {
         const handler_t h = g_actions[sig].handler;
-        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig))))
+        if (h == SIG_IGN)
             ignored |= sig_bit(sig);
         else if (h != SIG_DFL)
             handled |= sig_bit(sig);

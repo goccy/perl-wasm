@@ -46,6 +46,15 @@ __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_group_
 int wasi_host_proc_group_by_name(const char *name, int name_len, void *buf, int buf_len,
                                  uint32_t *needed);
 
+/* The setuid and setgid families, for a process that is the host process:
+ * request names the call (the SET_ constants below), a, b and c are its
+ * arguments. -ENOSYS when the process has no ids of the host's to change. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setids")))
+int wasi_host_proc_setids(int request, int a, int b, int c);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setgroups")))
+int wasi_host_proc_setgroups(const uint32_t *gids, int count);
+
 } /* extern "C" */
 
 namespace {
@@ -148,16 +157,34 @@ struct group *decode_group(bool found) {
     return g_group.gr_name ? &g_group : NULL;
 }
 
-/* Changing an id to the value it already has is all a process without
- * privileges may do. (uid_t)-1 leaves an id alone. */
-int set_ids(uid_t want_real, uid_t want_effective, int real_which, int effective_which) {
+/* The requests of the proc_setids import. */
+enum {
+    SET_UID, SET_EUID, SET_REUID, SET_RESUID, SET_GID, SET_EGID, SET_REGID, SET_RESGID
+};
+
+/* Changes ids of the process. A process that is the host process asks the
+ * host, which decides as it does for any process. An isolated one has no
+ * privileges: changing an id to the value it already has is all it may do.
+ * (uid_t)-1 leaves an id alone; the saved id starts out as the effective
+ * one. */
+int set_ids(int request, uid_t a, uid_t b, uid_t c, uid_t want_real, uid_t want_effective,
+            uid_t want_saved, int real_which, int effective_which) {
+    const int rc = wasi_host_proc_setids(request, (int)a, (int)b, (int)c);
+    if (rc == 0) return 0;
+    if (rc != -ENOSYS) {
+        errno = -rc;
+        return -1;
+    }
     if ((want_real != (uid_t)-1 && want_real != process_id(real_which)) ||
-        (want_effective != (uid_t)-1 && want_effective != process_id(effective_which))) {
+        (want_effective != (uid_t)-1 && want_effective != process_id(effective_which)) ||
+        (want_saved != (uid_t)-1 && want_saved != process_id(effective_which))) {
         errno = EPERM;
         return -1;
     }
     return 0;
 }
+
+const uid_t kKeep = (uid_t)-1;
 
 } /* namespace */
 
@@ -171,26 +198,29 @@ uid_t geteuid(void) { return (uid_t)process_id(ID_EUID); }
 gid_t getgid(void) { return (gid_t)process_id(ID_GID); }
 gid_t getegid(void) { return (gid_t)process_id(ID_EGID); }
 
-int setuid(uid_t uid) { return set_ids(uid, uid, ID_UID, ID_EUID); }
-int seteuid(uid_t uid) { return set_ids((uid_t)-1, uid, ID_UID, ID_EUID); }
-int setreuid(uid_t ruid, uid_t euid) { return set_ids(ruid, euid, ID_UID, ID_EUID); }
-int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
-    /* the saved id starts out as the effective one */
-    if (suid != (uid_t)-1 && suid != process_id(ID_EUID)) {
-        errno = EPERM;
-        return -1;
-    }
-    return set_ids(ruid, euid, ID_UID, ID_EUID);
+int setuid(uid_t uid) {
+    return set_ids(SET_UID, uid, kKeep, kKeep, uid, uid, kKeep, ID_UID, ID_EUID);
 }
-int setgid(gid_t gid) { return set_ids(gid, gid, ID_GID, ID_EGID); }
-int setegid(gid_t gid) { return set_ids((uid_t)-1, gid, ID_GID, ID_EGID); }
-int setregid(gid_t rgid, gid_t egid) { return set_ids(rgid, egid, ID_GID, ID_EGID); }
+int seteuid(uid_t uid) {
+    return set_ids(SET_EUID, uid, kKeep, kKeep, kKeep, uid, kKeep, ID_UID, ID_EUID);
+}
+int setreuid(uid_t ruid, uid_t euid) {
+    return set_ids(SET_REUID, ruid, euid, kKeep, ruid, euid, kKeep, ID_UID, ID_EUID);
+}
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+    return set_ids(SET_RESUID, ruid, euid, suid, ruid, euid, suid, ID_UID, ID_EUID);
+}
+int setgid(gid_t gid) {
+    return set_ids(SET_GID, gid, kKeep, kKeep, gid, gid, kKeep, ID_GID, ID_EGID);
+}
+int setegid(gid_t gid) {
+    return set_ids(SET_EGID, gid, kKeep, kKeep, kKeep, gid, kKeep, ID_GID, ID_EGID);
+}
+int setregid(gid_t rgid, gid_t egid) {
+    return set_ids(SET_REGID, rgid, egid, kKeep, rgid, egid, kKeep, ID_GID, ID_EGID);
+}
 int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
-    if (sgid != (gid_t)-1 && sgid != process_id(ID_EGID)) {
-        errno = EPERM;
-        return -1;
-    }
-    return set_ids(rgid, egid, ID_GID, ID_EGID);
+    return set_ids(SET_RESGID, rgid, egid, sgid, rgid, egid, sgid, ID_GID, ID_EGID);
 }
 
 int getgroups(int size, gid_t list[]) {
@@ -213,10 +243,14 @@ int getgroups(int size, gid_t list[]) {
 }
 
 int setgroups(size_t size, const gid_t *list) {
-    (void)size;
-    (void)list;
-    errno = EPERM;
-    return -1;
+    /* gid_t is the u32 the host reads; a process that is not the host
+     * process has no privilege to change its groups */
+    const int rc = wasi_host_proc_setgroups((const uint32_t *)list, (int)size);
+    if (rc != 0) {
+        errno = rc == -ENOSYS ? EPERM : -rc;
+        return -1;
+    }
+    return 0;
 }
 
 struct passwd *getpwuid(uid_t uid) {

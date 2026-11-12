@@ -13,10 +13,13 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <netdb.h> /* struct hostent */
+#include <sys/resource.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 #include <wasi/api.h>
@@ -31,6 +34,21 @@ extern "C" {
  * bytes) is too small for it, which is -ERANGE. 0 or a negative errno. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_path")))
 int wasi_host_fd_path(int fd, char *buf, int buf_len, int *length);
+
+/* The owner of a file, by a path relative to the root (follow 0: of a
+ * symbolic link itself) and by descriptor; an id of -1 stays as it is.
+ * 0 or a negative errno, -ENOSYS where files have no owners to change. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_chown")))
+int wasi_host_path_chown(const char *path, int len, int uid, int gid, int follow);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_chown")))
+int wasi_host_fd_chown(int fd, int uid, int gid);
+
+/* Creates a FIFO at a path relative to the root. 0 or a negative errno,
+ * -ENOSYS where the filesystem has none. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_mkfifo")))
+int wasi_host_path_mkfifo(const char *path, int len, unsigned int mode);
+
 /* Process groups and sessions, which the host keeps: the group of process
  * pid (0: the caller); moving pid (0: the caller, or a child of it) into
  * group pgid (0: one of its own); starting a session. 0 or a negative
@@ -43,6 +61,20 @@ int wasi_host_proc_setpgid(int pid, int pgid);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setsid")))
 int wasi_host_proc_setsid(int *sid_out);
+
+/* The nice value of processes: which and who as getpriority takes them.
+ * With set non-zero the value is changed first; the value then in effect is
+ * written at nice_out. 0 or a negative errno, -ENOSYS for a process that is
+ * not a process of the host. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_priority")))
+int wasi_host_proc_priority(int which, int who, int set, int value, int *nice_out);
+
+/* What uname reports, for a process that is the host process: five strings
+ * (a u32 length, then the bytes), the system's name, the node's name, the
+ * release, the version and the machine type. *needed receives the size of
+ * the record, also when buf is too small (-ERANGE). -ENOSYS otherwise. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_uname")))
+int wasi_host_proc_uname(void *buf, int buf_len, uint32_t *needed);
 
 
 } /* extern "C" */
@@ -106,13 +138,77 @@ int fail(int error) {
     return -1;
 }
 
-/* A request to change a file's owner is granted when it changes nothing —
- * each id is -1 ("leave it") or the one the file already has — and refused
- * otherwise: the process has no privilege to give files away. */
+/* Where files have no owners to change (the host says ENOSYS), a request
+ * to change a file's owner is granted when it changes nothing — each id is
+ * -1 ("leave it") or the one the file already has — and refused otherwise:
+ * the process has no privilege to give files away. */
 int change_owner(const struct stat &st, uid_t owner, gid_t group) {
     if ((owner != (uid_t)-1 && owner != st.st_uid) || (group != (gid_t)-1 && group != st.st_gid))
         return fail(EPERM);
     return 0;
+}
+
+/* A path as the host imports take it: absolute, without the leading
+ * slash. Returns NULL with errno set when the path cannot be named. */
+const char *root_relative(const char *path, char *buf, size_t size) {
+    if (!path) {
+        errno = EFAULT;
+        return NULL;
+    }
+    if (!*path) {
+        errno = ENOENT;
+        return NULL;
+    }
+    const char *p = path;
+    if (*p != '/') {
+        char cwd[3584];
+        if (!getcwd(cwd, sizeof(cwd))) return NULL;
+        if (snprintf(buf, size, "%s/%s", cwd, path) >= (int)size) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        p = buf;
+    }
+    while (*p == '/') p++;
+    return p;
+}
+
+int change_path_owner(const char *path, uid_t owner, gid_t group, int follow) {
+    char buf[4096];
+    const char *p = root_relative(path, buf, sizeof(buf));
+    if (!p) return -1;
+    const int rc = wasi_host_path_chown(p, (int)strlen(p), (int)owner, (int)group, follow);
+    if (rc == 0) return 0;
+    if (rc != -ENOSYS) return fail(-rc);
+    struct stat st;
+    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return -1;
+    return change_owner(st, owner, group);
+}
+
+/* The fields of uname as the host reports them; false when the process is
+ * a system of its own. */
+bool host_uname(struct utsname *out) {
+    char rec[2048];
+    uint32_t needed = 0;
+    if (wasi_host_proc_uname(rec, (int)sizeof(rec), &needed) != 0) return false;
+    char *fields[5] = {out->sysname, out->nodename, out->release, out->version, out->machine};
+    const size_t sizes[5] = {sizeof(out->sysname), sizeof(out->nodename), sizeof(out->release),
+                             sizeof(out->version), sizeof(out->machine)};
+    uint32_t pos = 0;
+    for (int i = 0; i < 5; i++) {
+        uint32_t n = 0;
+        if (needed - pos < 4) return false;
+        memcpy(&n, rec + pos, 4);
+        pos += 4;
+        if (needed - pos < n) return false;
+        const size_t kept = n < sizes[i] - 1 ? n : sizes[i] - 1;
+        memcpy(fields[i], rec + pos, kept);
+        fields[i][kept] = '\0';
+        pos += n;
+    }
+    return true;
+}
+
 }
 
 /* The protocols database: the entries every /etc/protocols starts with. */
@@ -133,8 +229,19 @@ extern "C" {
 
 /* ---- file ownership ------------------------------------------------------ */
 int chown(const char *path, uid_t owner, gid_t group) {
+    return change_path_owner(path, owner, group, 1);
+}
+
+int lchown(const char *path, uid_t owner, gid_t group) {
+    return change_path_owner(path, owner, group, 0);
+}
+
+int fchown(int fd, uid_t owner, gid_t group) {
+    const int rc = wasi_host_fd_chown(fd, (int)owner, (int)group);
+    if (rc == 0) return 0;
+    if (rc != -ENOSYS) return fail(-rc);
     struct stat st;
-    if (stat(path, &st) != 0) return -1;
+    if (fstat(fd, &st) != 0) return -1;
     return change_owner(st, owner, group);
 }
 
@@ -230,11 +337,14 @@ int chroot(const char *path) {
     return fail(EPERM);
 }
 
-/* FIFOs cannot be created through WASI. */
+/* FIFOs are the host filesystem's to create; WASI has no call for it. */
 int mkfifo(const char *path, mode_t mode) {
-    (void)path;
-    (void)mode;
-    return fail(ENOSYS);
+    char buf[4096];
+    const char *p = root_relative(path, buf, sizeof(buf));
+    if (!p) return -1;
+    const int rc = wasi_host_path_mkfifo(p, (int)strlen(p), (unsigned int)mode);
+    if (rc != 0) return fail(-rc);
+    return 0;
 }
 
 /* ---- process groups and sessions ---------------------------------------------
@@ -267,22 +377,48 @@ int killpg(pid_t pgrp, int sig) {
     return kill(pgrp > 1 ? -pgrp : 0, sig);
 }
 
+/* ---- scheduling priority ---------------------------------------------------
+ * A process of the host has the host process's; an isolated one has none
+ * (ENOSYS). */
 int getpriority(int which, id_t who) {
-    (void)which;
-    (void)who;
-    return fail(ENOSYS);
+    int nice_value = 0;
+    const int rc = wasi_host_proc_priority(which, (int)who, 0, 0, &nice_value);
+    if (rc != 0) return fail(-rc);
+    errno = 0; /* -1 is a legitimate value */
+    return nice_value;
 }
 
 int setpriority(int which, id_t who, int value) {
-    (void)which;
-    (void)who;
-    (void)value;
-    return fail(ENOSYS);
+    int nice_value = 0;
+    const int rc = wasi_host_proc_priority(which, (int)who, 1, value, &nice_value);
+    if (rc != 0) return fail(-rc);
+    return 0;
 }
 
 int nice(int increment) {
-    (void)increment;
-    return fail(ENOSYS);
+    const int process = 0; /* PRIO_PROCESS, which wasi-libc does not define */
+    int nice_value = 0;
+    int rc = wasi_host_proc_priority(process, 0, 0, 0, &nice_value);
+    if (rc == 0)
+        rc = wasi_host_proc_priority(process, 0, 1, nice_value + increment, &nice_value);
+    if (rc != 0) return fail(rc == -EACCES ? EPERM : -rc);
+    errno = 0; /* -1 is a legitimate value */
+    return nice_value;
+}
+
+/* ---- the system's name --------------------------------------------------------
+ * A process that is the host process is on the host's system: uname and
+ * gethostname (which libc answers from uname) report the host's. An
+ * isolated one is a system of its own, with the names wasi-libc gives. */
+int uname(struct utsname *out) {
+    if (!out) return fail(EFAULT);
+    if (host_uname(out)) return 0;
+    strcpy(out->sysname, "wasi");
+    strcpy(out->nodename, "(none)");
+    strcpy(out->release, "0.0.0");
+    strcpy(out->version, "0.0.0");
+    strcpy(out->machine, "wasm32");
+    return 0;
 }
 
 /* A terminal has no name here: the host hands over streams, not devices. */
