@@ -2778,7 +2778,8 @@ enum {
     GOPERL_OPC_STATEOP = 9,
     GOPERL_OPC_CONDOP = 10,
     GOPERL_OPC_SLICEOP = 11,
-    GOPERL_OPC_RAW = 12
+    GOPERL_OPC_RAW = 12,
+    GOPERL_OPC_ASSIGNOP = 13
 };
 enum {
     GOPERL_OPM_APPEND_ELEM = 0,
@@ -4114,6 +4115,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             o = newCONDOP(flags, first, second, (OP *)(uintptr_t)(uint32_t)k3);
             break;
         case GOPERL_OPC_SLICEOP: o = newSLICEOP(flags, first, second); break;
+        case GOPERL_OPC_ASSIGNOP:
+            /* type is the operator of an assignment operator (OP_ADD for
+             * +=), 0 for plain assignment */
+            o = newASSIGNOP(flags, first, type, second);
+            break;
         case GOPERL_OPC_RAW: {
             /* backing for a module-defined op struct: LOGOP-shaped slab
              * memory the host will type/link/hook through OP_SET */
