@@ -103,6 +103,19 @@ struct sockaddr_un {
 #define SOMAXCONN 128
 #endif
 
+/* shutdown(2)'s "how": 0 stops reads, 1 writes, 2 both, on every system
+ * perl runs on, and programs pass the numbers themselves
+ * (`shutdown($sock, 1)`, documented that way in perlfunc). wasi-libc gives
+ * the three names the bits of the WASI call instead (1, 2 and 3), so that
+ * a literal 1 stopped reads and a 0 was refused. The names get the usual
+ * numbers here, and shutdown() itself (perl_libc.cc) translates them. */
+#undef SHUT_RD
+#undef SHUT_WR
+#undef SHUT_RDWR
+#define SHUT_RD 0
+#define SHUT_WR 1
+#define SHUT_RDWR 2
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -18,6 +18,7 @@
 #include <netdb.h> /* struct hostent */
 #include <time.h>
 #include <unistd.h>
+#include <wasi/api.h>
 
 /* the prototypes perl is compiled with (struct netent and friends too) */
 #include "scripts/wasi-posix-shim.h"
@@ -133,6 +134,32 @@ int fchown(int fd, uid_t owner, gid_t group) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -1;
     return change_owner(st, owner, group);
+}
+
+/* ---- sockets ----------------------------------------------------------------
+ * shutdown: "how" is 0, 1 or 2 (SHUT_RD, SHUT_WR, SHUT_RDWR as
+ * scripts/wasi-posix-shim.h defines them, the numbers programs pass
+ * literally); the WASI call takes one bit per direction. This definition
+ * takes the place of wasi-libc's, which hands its argument over as the
+ * bits. */
+int shutdown(int fd, int how) {
+    __wasi_sdflags_t flags;
+    switch (how) {
+    case SHUT_RD:
+        flags = __WASI_SDFLAGS_RD;
+        break;
+    case SHUT_WR:
+        flags = __WASI_SDFLAGS_WR;
+        break;
+    case SHUT_RDWR:
+        flags = __WASI_SDFLAGS_RD | __WASI_SDFLAGS_WR;
+        break;
+    default:
+        return fail(EINVAL);
+    }
+    const __wasi_errno_t error = __wasi_sock_shutdown((__wasi_fd_t)fd, flags);
+    if (error != 0) return fail(error);
+    return 0;
 }
 
 /* ---- temporary files ------------------------------------------------------
