@@ -58,6 +58,7 @@
   },
   "wasm_build": {
     "extra_ldflags": [
+      "-lc-printscan-long-double",
       "-Wl,--fatal-warnings"
     ]
   },

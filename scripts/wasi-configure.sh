@@ -61,6 +61,9 @@ CLANG="$WASI_SDK_PATH/bin/clang"
 echo "== perl5:    $PERL ($(git -C "$PERL" describe --tags 2>/dev/null || echo unknown))"
 echo "== wasi-sdk: $WASI_SDK_PATH"
 echo "== clang:    $("$CLANG" --version | head -1)"
+# The compiler's version as perl records it for a gcc-compatible compiler
+# (Configure reads __VERSION__ the same way).
+GCCVERSION="$(echo __VERSION__ | "$CLANG" -E -P - 2>/dev/null | tr -d '"')"
 
 # --- Host miniperl (build-time codegen) -------------------------------------
 # Perl runs miniperl DURING the build to generate sources; the wasm miniperl
@@ -242,8 +245,8 @@ d_nanosleep='define'
 # down). Upstream Perl's Configure always adds this for gcc/clang (the arm base
 # config.sh we derive from carries it); the wasi override dropped it. Restore it.
 # Applies to core .c AND every XS extension (MakeMaker reads ccflags via %Config).
-ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
-cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
 optimize='-O2'
 cccdlflags=' '
 ccdlflags=' '
@@ -426,6 +429,127 @@ d_stdiobase='undef'
 d_stdio_ptr='undef'
 d_stdio_cnt='undef'
 d_stdio_stream_array='undef'
+
+# ---- what the base says about its own target and is not true of this one ----
+# The base describes a 2003 arm-linux system with glibc 2.2. The answers
+# below are the ones that differ on wasm32 with wasi-libc (a musl); each was
+# read off the compiler and the C library, not carried over.
+#
+# long double is IEEE 754 binary128, little-endian: 16 bytes, 113 bits of
+# precision. The base says 8 bytes next to the 16-byte images of the x86
+# extended format, and perl.h then builds PL_inf and PL_nan (the NV is a
+# double, the same size as that "long double") from the first 8 of those
+# bytes, which are zero: "inf"+0 and "nan"+0 gave 0.
+longdblsize='16'
+longdblkind='1'
+longdblmantbits='112'
+longdblinfbytes='0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x7f'
+longdblnanbytes='0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0x7f'
+d_long_double_style_ieee='define'
+d_long_double_style_ieee_std='define'
+# The printf and scanf length modifier of a long double is L; the base has
+# none (its long double was a double). sprintf("%Lf") passes one to the C
+# library with this format.
+sPRIfldbl='"Lf"'
+sPRIgldbl='"Lg"'
+sPRIeldbl='"Le"'
+sPRIFUldbl='"LF"'
+sPRIGUldbl='"LG"'
+sPRIEUldbl='"LE"'
+sSCNfldbl='"Lf"'
+# The length modifier of a 64-bit integer is ll. The base has glibc's L,
+# which this C library refuses (the whole conversion fails).
+sPRId64='"lld"'
+sPRIi64='"lli"'
+sPRIu64='"llu"'
+sPRIo64='"llo"'
+sPRIx64='"llx"'
+sPRIXU64='"llX"'
+# A double is aligned on 8 bytes.
+alignbytes='8'
+# st_dev and st_ino are unsigned 64-bit; the base says 4 bytes, and stat
+# then returned only the low half of a device number. The wide path of
+# pp_stat formats the number with snprintf.
+st_dev_size='8'
+st_ino_size='8'
+d_snprintf='define'
+# setlocale(LC_ALL, NULL) names the categories by position, separated by
+# ";" ("C.UTF-8;C;C;C;C;C"), in the order LC_CTYPE, LC_NUMERIC, LC_TIME,
+# LC_COLLATE, LC_MONETARY, LC_MESSAGES: the values 0 to 5 of the C library's
+# <locale.h>. The base says name=value pairs (glibc), with the word "define"
+# where the separator and the positions belong; locale.c then could not
+# read the string back, and a program started with LC_CTYPE differing from
+# the other categories died in a panic. Every locale name is accepted.
+d_perl_lc_all_uses_name_value_pairs='undef'
+d_perl_lc_all_separator='define'
+perl_lc_all_separator='";"'
+d_perl_lc_all_category_positions_init='define'
+perl_lc_all_category_positions_init='{ 0, 1, 2, 3, 4, 5 }'
+d_setlocale_accepts_any_locale_name='define'
+# The C library is not glibc, and the compiler is not gcc 2.95. perl.h
+# defines _GNU_SOURCE for glibc; for a musl, perl's own hints (hints/linux.sh)
+# put -D_GNU_SOURCE into ccflags instead, and so does ccflags above: perl
+# uses functions the C library declares only then (memrchr, gcvt).
+d_gnulibc='undef'
+gnulibc_version=''
+gccversion='$GCCVERSION'
+# The C99 classification macros and math functions, all in <math.h> and
+# libm. The base predates them, and POSIX.xs falls back to approximations
+# of its own (or to "not implemented") for each one it is told is missing.
+d_fpclassify='define'
+d_isfinite='define'
+d_isnormal='define'
+d_asinh='define'
+d_atanh='define'
+d_cbrt='define'
+d_copysign='define'
+d_erf='define'
+d_erfc='define'
+d_exp2='define'
+d_expm1='define'
+d_fdim='define'
+d_fma='define'
+d_fmax='define'
+d_fmin='define'
+d_hypot='define'
+d_ilogb='define'
+d_lgamma='define'
+d_lgamma_r='define'
+d_llrint='define'
+d_llrintl='define'
+d_llround='define'
+d_llroundl='define'
+d_log1p='define'
+d_log2='define'
+d_logb='define'
+d_lrint='define'
+d_lrintl='define'
+d_lround='define'
+d_lroundl='define'
+d_nan='define'
+d_nearbyint='define'
+d_nextafter='define'
+d_nexttoward='define'
+d_remainder='define'
+d_remquo='define'
+d_rint='define'
+d_round='define'
+d_scalbn='define'
+d_tgamma='define'
+d_trunc='define'
+# String functions the C library has and the base predates.
+d_memmem='define'
+d_memrchr='define'
+d_strnlen='define'
+d_strlcat='define'
+d_strlcpy='define'
+# Who configured this perl: not the author of the base, on his machine.
+cf_by='perl-wasm'
+cf_email='root@localhost'
+perladmin='root@localhost'
+myhostname='localhost'
+mydomain=''
+myuname='wasi wasm32'
 
 # Extension set (our static-ext policy).
 usedl='undef'
