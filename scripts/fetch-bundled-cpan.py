@@ -14,7 +14,9 @@ Makefile.PL is dropped and the core's extension machinery writes one. It is
 for a Makefile.PL that cannot run under the build's miniperl (one that loads
 XS modules to probe the compiler). Whatever such a Makefile.PL would have
 generated is kept in scripts/bundled-cpan/<dir>/ and copied over the unpacked
-distribution.
+distribution, as is everything else in that directory (the header that gives
+the distribution's external symbols names of their own, see
+ext-symbols.py).
 """
 import hashlib
 import os
@@ -70,9 +72,8 @@ def unpack(src, dest):
     tmp.rmdir()
 
 
-def prepare(dest, extra, options):
-    """Applies what the manifest and scripts/bundled-cpan/<dir> say about a
-    freshly unpacked distribution."""
+def prepare(dest, options):
+    """Applies what the manifest says about a freshly unpacked distribution."""
     for option in options:
         if option == "core-makefile":
             # make_ext.pl writes a plain Makefile.PL for an extension that
@@ -80,8 +81,6 @@ def prepare(dest, extra, options):
             (dest / "Makefile.PL").unlink()
         else:
             sys.exit(f"!! {dest.name}: unknown manifest option {option}")
-    if extra.is_dir():
-        shutil.copytree(extra, dest, dirs_exist_ok=True)
 
 
 def main():
@@ -96,9 +95,15 @@ def main():
         stamp = dest / STAMP
         if not (stamp.exists() and stamp.read_text().strip() == digest):
             unpack(archive(path, digest), dest)
-            prepare(dest, manifest.parent / "bundled-cpan" / dest.name, options)
+            prepare(dest, options)
             stamp.write_text(digest + "\n")
             print(f"== unpacked {path} into {dest}", file=sys.stderr)
+        # The files this project adds to the distribution (generated
+        # configuration, the header that renames its external symbols) are
+        # copied on every run: they change without the archive changing.
+        extra = manifest.parent / "bundled-cpan" / dest.name
+        if extra.is_dir():
+            shutil.copytree(extra, dest, dirs_exist_ok=True)
         names.append(name)
     print(" ".join(names))
 

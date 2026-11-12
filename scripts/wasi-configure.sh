@@ -41,6 +41,11 @@ POSIX_SHIM="-include $HERE/scripts/wasi-posix-shim.h"
 # Headers of system interfaces wasi-libc has no header for and this project
 # implements (<syslog.h>, see perl_syslog.cc).
 SYSTEM_HEADERS="-I$HERE/scripts/include"
+# Each bundled CPAN distribution renames its external symbols with a header
+# of this name in the directory it compiles in (scripts/ext-symbols.py). The
+# compiler looks for a force-included file in the working directory first and
+# on the include path after it, where scripts/include has the empty default.
+EXT_NAMES="-include perlwasm_ext_names.h"
 CLANG="$WASI_SDK_PATH/bin/clang"
 
 [ -d "$PERL/.git" ] || [ -f "$PERL/Configure" ] || {
@@ -237,8 +242,8 @@ d_nanosleep='define'
 # down). Upstream Perl's Configure always adds this for gcc/clang (the arm base
 # config.sh we derive from carries it); the wasi override dropped it. Restore it.
 # Applies to core .c AND every XS extension (MakeMaker reads ccflags via %Config).
-ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
-cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
 optimize='-O2'
 cccdlflags=' '
 ccdlflags=' '
