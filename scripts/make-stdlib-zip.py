@@ -24,8 +24,17 @@ Trim (everything that is meaningless in the embedded, statically-linked build):
   - any pod/ tree — manual pages kept apart from the modules.
   - *.t and any t/ or test/ directory — module test suites.
   - *.bs — bootstrap stubs (unused for static ext).
-The unicore/ Unicode tables (*.pl / *.txt) ARE kept — required for \w, \p{...},
-case folding, and Encode.
+Under unicore/ the archive holds what perl's own installperl installs: the
+generated tables (*.pl, *.pm, the lib/ and To/ trees) and `version`, and of
+the Unicode Character Database source files only the three a running perl
+reads (Blocks.txt, SpecialCasing.txt, NamedSequences.txt). The other source
+.txt files, the table generator and the property test script TestProp.pl
+serve the build and its tests; a program that finds a UCD source file under
+unicore/ takes that as an invitation to parse it.
+
+One manual page is shipped, as pod/perldiag.pod: the diagnostics pragma (and
+splain) read the explanations of perl's messages from that file in the
+library directory.
 
 The *.pod files perl installs into its library directory next to the modules
 ARE kept (Config.pod, CORE.pod, perlfaq*.pod, ...): they are part of an
@@ -41,11 +50,21 @@ Usage: make-stdlib-zip.py <perl5/lib dir> <output zip>
 """
 
 import os
+import re
 import sys
 import zipfile
 
 # Directory names excluded at ANY depth (with everything beneath them).
 ANYWHERE_DIR_EXCLUDES = {"t", "test", "tests", "pod"}
+
+# installperl's rules for lib/unicore: the UCD source files that are
+# installed, and the other names that are (`version`, and *.pl / *.pm except
+# the property test script).
+UNICORE_TXT = {"Blocks.txt", "SpecialCasing.txt", "NamedSequences.txt"}
+UNICORE_OTHER = re.compile(r"\A(?:version|\w+\.p[lm])\Z")
+
+# The manual page that ships, by its path under perl5/pod.
+MANUAL_PAGES = ["perldiag.pod"]
 
 # Fixed DOS timestamp (1980-01-01 00:00:00) for reproducible archives.
 FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
@@ -58,10 +77,10 @@ def included(rel_path: str) -> bool:
         return False
     if base == ".exists":
         return False
-    # Build log with an embedded generation timestamp; not needed at runtime
-    # and the only nondeterministic byte source in the tree.
-    if rel_path == "unicore/mktables.lst":
-        return False
+    if parts[0] == "unicore":
+        if base.endswith(".txt"):
+            return base in UNICORE_TXT
+        return base != "TestProp.pl" and UNICORE_OTHER.match(base) is not None
     for ext in (".a", ".ld", ".bs", ".t"):
         if rel_path.endswith(ext):
             return False
@@ -90,6 +109,13 @@ def main() -> int:
         return 1
 
     sources = {rel: lib_dir for rel in collect(lib_dir)}
+    # The manual pages live beside lib/, in the source tree's pod/.
+    perl_dir = os.path.dirname(os.path.abspath(lib_dir))
+    for page in MANUAL_PAGES:
+        if not os.path.isfile(os.path.join(perl_dir, "pod", page)):
+            sys.stderr.write(f"missing manual page: {os.path.join(perl_dir, 'pod', page)}\n")
+            return 1
+        sources["pod/" + page] = perl_dir
     rels = sorted(sources)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in rels:
