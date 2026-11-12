@@ -196,7 +196,12 @@ const StaticExtension static_extensions[] = {
 
 /* DynaLoader::dl_static_boot(module): the boot function of a linked-in
  * extension, installed as <module>::bootstrap and returned as a code
- * reference; undef for a module that is not linked in. */
+ * reference; undef for a module that is not linked in.
+ *
+ * A module the host has registered natively (go-perl's XS loader) is found
+ * the same way and at the same moment: the host keeps its boot function as
+ * DynaLoader::native::<module>::bootstrap, outside the module's package,
+ * and it becomes <module>::bootstrap here. */
 XS(XS_DynaLoader_dl_static_boot) {
     dXSARGS;
     if (items != 1) croak_xs_usage(cv, "module");
@@ -208,6 +213,16 @@ XS(XS_DynaLoader_dl_static_boot) {
         CV *boot = get_cv(SvPV_nolen(name), 0);
         if (!boot) boot = newXS(SvPV_nolen(name), ext.boot, __FILE__);
         ST(0) = sv_2mortal(newRV_inc((SV *)boot));
+        XSRETURN(1);
+    }
+    SV *const held = sv_2mortal(newSVpvf("DynaLoader::native::%" SVf "::bootstrap", SVfARG(ST(0))));
+    if (CV *const native = get_cv(SvPV_nolen(held), SvUTF8(ST(0)) ? SVf_UTF8 : 0)) {
+        SV *const name = sv_2mortal(newSVpvf("%" SVf "::bootstrap", SVfARG(ST(0))));
+        GV *const gv = gv_fetchsv(name, GV_ADD, SVt_PVCV);
+        SV *const ref = sv_2mortal(newRV_inc((SV *)native));
+        /* assigning a code reference to the glob installs the sub */
+        if (!GvCV(gv)) sv_setsv((SV *)gv, ref);
+        ST(0) = ref;
         XSRETURN(1);
     }
     XSRETURN_UNDEF;
