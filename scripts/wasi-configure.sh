@@ -845,6 +845,33 @@ patch("ext/DynaLoader/DynaLoader_pm.PL", old,
       "    }\n"
       "\n" + old)
 PYPATCH
+# ---- Socket: Unix-domain addresses have Linux's lengths -----------------------
+# unpack_sockaddr_un takes an address of exactly sizeof(struct sockaddr_un)
+# bytes and reads its path up to the first NUL, except on the systems it
+# knows to return shorter addresses. The host sockets return Linux's: an
+# abstract name (one that starts with a NUL, and may hold more) ends where
+# the address does, and a socket without a name has an address that ends
+# before the path. The two places that single out Linux take this system
+# with it. Idempotent.
+python3 - <<'PYPATCH'
+path = "cpan/Socket/Socket.xs"
+t = open(path).read()
+if "defined(__wasi__)" in t:
+    print(f"Unix-domain address lengths already present in {path}")
+else:
+    for old, new in [
+        ("#   if defined(__linux__) || defined(__CYGWIN__) || defined(sun) || defined(HAS_SOCKADDR_SA_LEN)\n",
+         "#   if defined(__linux__) || defined(__wasi__) || defined(__CYGWIN__) || defined(sun) || defined(HAS_SOCKADDR_SA_LEN)\n"),
+        ("#   ifdef __linux__\n"
+         "        if (addr.sun_path[0] == '\\0') {\n",
+         "#   if defined(__linux__) || defined(__wasi__)\n"
+         "        if (addr.sun_path[0] == '\\0') {\n"),
+    ]:
+        assert t.count(old) == 1, (path, old)
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"Unix-domain address lengths applied to {path}")
+PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of
 # the core *.o files, so a flag change alone would leave stale objects that
