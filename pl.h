@@ -31,7 +31,7 @@
  *   node   := tag:u8 payload
  *     0 undef      —
  *     1 bool       u8 (0/1)
- *     2 int        i64
+ *     2 int        i64 — an integer that fits a signed 64-bit one
  *     3 float      f64 (IEEE 754 bits)
  *     4 string     u8 utf8_flag, u32 len, len bytes (the raw PV; utf8_flag
  *                  mirrors SvUTF8 so the encoding round-trips)
@@ -45,6 +45,8 @@
  *                  handle's ARRAY/HASH dereferences and its CONTENTS are
  *                  pushed onto the argument list (Perl's own list-flattening
  *                  calling convention)
+ *     8 uint       u64 — an integer above the signed 64-bit range (a UV
+ *                  beyond IV_MAX); every smaller one is an int node
  *
  *   list   := count:u32 node*
  *

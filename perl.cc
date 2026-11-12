@@ -634,6 +634,7 @@ enum : uint8_t {
     NODE_REF      = 5,
     NODE_HOSTFUNC = 6,
     NODE_FLATTEN  = 7,
+    NODE_UINT     = 8,
 };
 
 enum : uint8_t {
@@ -825,14 +826,13 @@ static void encode_sv(pTHX_ SV *sv, std::string &out) {
     }
     if (SvIOK(sv)) {
         /* An integer scalar holds an IV or a UV; reading a UV above IV_MAX
-         * as an IV would wrap it negative. The node carries a signed 64-bit
-         * value; a UV beyond that (possible only where UVs are 64 bits wide)
-         * crosses as the number it is, a float. */
+         * as an IV would wrap it negative. The int node carries a signed
+         * 64-bit value; a UV beyond that has a node of its own. */
         if (SvIsUV(sv)) {
             const uint64_t u = static_cast<uint64_t>(SvUV(sv));
             if (u > static_cast<uint64_t>(INT64_MAX)) {
-                put_u8(out, NODE_FLOAT);
-                put_f64(out, static_cast<double>(u));
+                put_u8(out, NODE_UINT);
+                put_u64(out, u);
                 return;
             }
             put_u8(out, NODE_INT);
@@ -883,17 +883,10 @@ static SV *decode_node(pTHX_ NodeReader &r, std::string &err) {
         return &PL_sv_undef;
     case NODE_BOOL:
         return boolSV(r.get_u8() != 0);
-    case NODE_INT: {
-        /* The value keeps its magnitude whatever the width of an IV: what
-         * an IV cannot hold becomes a UV, and what neither can, an NV, the
-         * way perl's own arithmetic widens. */
-        const int64_t v = r.get_i64();
-        if (v >= static_cast<int64_t>(IV_MIN) && v <= static_cast<int64_t>(IV_MAX))
-            return sv_2mortal(newSViv(static_cast<IV>(v)));
-        if (v > 0 && static_cast<uint64_t>(v) <= static_cast<uint64_t>(UV_MAX))
-            return sv_2mortal(newSVuv(static_cast<UV>(v)));
-        return sv_2mortal(newSVnv(static_cast<NV>(v)));
-    }
+    case NODE_INT:
+        return sv_2mortal(newSViv(static_cast<IV>(r.get_i64())));
+    case NODE_UINT:
+        return sv_2mortal(newSVuv(static_cast<UV>(r.get_u64())));
     case NODE_FLOAT:
         return sv_2mortal(newSVnv(static_cast<NV>(r.get_f64())));
     case NODE_STRING: {
@@ -3069,69 +3062,16 @@ enum {
 /* CX_FIELDS result when the context index is out of range. */
 #define GOPERL_CX_TYPE_NONE 0xFFFFFFFFu
 
-/* The IV and UV of native code are 64 bits wide; this interpreter's are 32.
- * An integer outside the range of both is held the way perl itself holds
- * one it computes: in the NV, which is exact up to 2**53. */
-static void goperl_sv_set_wide_iv(pTHX_ SV *sv, int64_t v) {
-    if (v >= (int64_t)IV_MIN && v <= (int64_t)IV_MAX)
-        sv_setiv(sv, (IV)v);
-    else if (v > 0 && (uint64_t)v <= (uint64_t)UV_MAX)
-        sv_setuv(sv, (UV)v);
-    else
-        sv_setnv(sv, (NV)v);
-}
+/* The IV and UV of native code and this interpreter's are the same 64 bits:
+ * an integer crosses as it is, in both directions, and the flags native code
+ * sees are the interpreter's own. */
+static_assert(sizeof(IV) == sizeof(int64_t) && sizeof(UV) == sizeof(uint64_t),
+              "the XS helper carries IVs and UVs as 64-bit operands");
 
-static void goperl_sv_set_wide_uv(pTHX_ SV *sv, uint64_t v) {
-    if (v <= (uint64_t)UV_MAX)
-        sv_setuv(sv, (UV)v);
-    else
-        sv_setnv(sv, (NV)v);
-}
-
-/* Whether sv holds an integer of the native width that this interpreter
- * could only store as an NV (see goperl_sv_set_wide_iv): 1 when it is in the
- * range of a 64-bit IV, 2 when only in that of a 64-bit UV, 0 otherwise.
- * Native code sees such a value as the integer it is on a perl with 64-bit
- * IVs: SvIOK is true for it, so that a module which tests the flag before
- * taking a pointer or a counter out of an SV finds it. */
-static int goperl_sv_wide_int(pTHX_ SV *sv) {
-    if (!SvNOK(sv) || SvIOK(sv) || SvTYPE(sv) >= SVt_PVAV) return 0;
-    const NV nv = SvNVX(sv);
-    if (nv != nv || __builtin_floor(nv) != nv) return 0;
-    if (nv >= (NV)IV_MIN && nv <= (NV)UV_MAX) return 0; /* fits: a real NV */
-    if (nv >= -9223372036854775808.0 && nv < 9223372036854775808.0) return 1;
-    if (nv >= 0.0 && nv < 18446744073709551616.0) return 2;
-    return 0;
-}
-
-/* The integer value of sv at the native width: what SvIV (or SvUV, for
- * want_uv) gives on a perl whose IV has 64 bits. Get magic runs once unless
- * nomg. */
-static uint64_t goperl_sv_wide(pTHX_ SV *sv, bool want_uv, bool nomg) {
-    if (!nomg) SvGETMAGIC(sv);
-    const IV iv = SvIV_nomg(sv);
-    /* A reference numifies to its address or through its overloading, and
-     * an undefined value to zero: both are what the interpreter gave. */
-    if (SvROK(sv) || !SvOK(sv))
-        return want_uv ? (uint64_t)(UV)iv : (uint64_t)(int64_t)iv;
-    if (SvIOK(sv))
-        return SvIsUV(sv) ? (uint64_t)SvUVX(sv) : (uint64_t)(int64_t)SvIVX(sv);
-    /* Not an integer this interpreter's IV holds exactly. */
-    const NV nv = SvNV_nomg(sv);
-    if (nv != nv) return 0;
-    if (want_uv) {
-        if (nv < 0.0)
-            return nv <= -9223372036854775808.0
-                       ? (uint64_t)INT64_MIN
-                       : (uint64_t)(int64_t)nv;
-        return nv >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)nv;
-    }
-    if (nv < 9223372036854775808.0)
-        return nv <= -9223372036854775808.0 ? (uint64_t)INT64_MIN
-                                            : (uint64_t)(int64_t)nv;
-    /* Beyond the signed range the value wraps as an unsigned one does, as
-     * perl's own cast of an NV to an IV has it. */
-    return nv >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)nv;
+/* SvIV (or SvUV, for want_uv) of sv; get magic runs unless nomg. */
+static uint64_t goperl_sv_integer(pTHX_ SV *sv, bool want_uv, bool nomg) {
+    if (want_uv) return (uint64_t)(nomg ? SvUV_nomg(sv) : SvUV(sv));
+    return (uint64_t)(int64_t)(nomg ? SvIV_nomg(sv) : SvIV(sv));
 }
 
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s) {
@@ -3140,26 +3080,20 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     dTHX;
     switch (op) {
     case GOPERL_OP_SV_IV: /* b bit 0: as an unsigned value; bit 1: no get magic */
-        return goperl_sv_wide(aTHX_ (SV *)(uintptr_t)a, cBOOL(b & 1), cBOOL(b & 2));
+        return goperl_sv_integer(aTHX_ (SV *)(uintptr_t)a, cBOOL(b & 1), cBOOL(b & 2));
     case GOPERL_OP_SV_PV: { /* (linear-memory ptr << 32) | len */
         STRLEN len = 0;
         const char *p = SvPV((SV *)(uintptr_t)a, len);
         return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
     }
-    case GOPERL_OP_NEW_IV: {
-        SV *sv = newSV(0);
-        goperl_sv_set_wide_iv(aTHX_ sv, (int64_t)a);
-        return (uint64_t)(uintptr_t)sv;
-    }
+    case GOPERL_OP_NEW_IV:
+        return (uint64_t)(uintptr_t)newSViv((IV)(int64_t)a);
     case GOPERL_OP_NEW_PVN:
         return (uint64_t)(uintptr_t)newSVpvn(s ? s : "", (STRLEN)b);
     case GOPERL_OP_SV_MORTAL:
         return (uint64_t)(uintptr_t)sv_2mortal((SV *)(uintptr_t)a);
-    case GOPERL_OP_NEW_UV: {
-        SV *sv = newSV(0);
-        goperl_sv_set_wide_uv(aTHX_ sv, a);
-        return (uint64_t)(uintptr_t)sv;
-    }
+    case GOPERL_OP_NEW_UV:
+        return (uint64_t)(uintptr_t)newSVuv((UV)a);
     case GOPERL_OP_NEW_AV:
         return (uint64_t)(uintptr_t)(SV *)newAV();
     case GOPERL_OP_NEW_HV:
@@ -3206,7 +3140,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     case GOPERL_OP_SETREF_IV: /* bless rv `a` as class s pointing at IV b */
     {
         SV *rv = (SV *)(uintptr_t)a;
-        goperl_sv_set_wide_iv(aTHX_ newSVrv(rv, s ? s : ""), (int64_t)b);
+        sv_setiv(newSVrv(rv, s ? s : ""), (IV)(int64_t)b);
         return (uint64_t)(uintptr_t)rv;
     }
 
@@ -3224,10 +3158,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         sv_setsv_mg((SV *)(uintptr_t)a, (SV *)(uintptr_t)b);
         return 0;
     case GOPERL_OP_SV_SETIV:
-        goperl_sv_set_wide_iv(aTHX_ (SV *)(uintptr_t)a, (int64_t)b);
+        sv_setiv((SV *)(uintptr_t)a, (IV)(int64_t)b);
         return 0;
     case GOPERL_OP_SV_SETUV:
-        goperl_sv_set_wide_uv(aTHX_ (SV *)(uintptr_t)a, b);
+        sv_setuv((SV *)(uintptr_t)a, (UV)b);
         return 0;
     case GOPERL_OP_SV_SETNV: { /* b = IEEE bits */
         union { uint64_t u; double d; } cvt;
@@ -3290,10 +3224,6 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         if (SvAMAGIC(sv)) f |= 65536;           /* GOPERL_INFO_AMAGIC */
         if (SvIOKp(sv)) f |= 131072;            /* GOPERL_INFO_IOKp */
         if (SvNOKp(sv)) f |= 262144;            /* GOPERL_INFO_NOKp */
-        if (const int wide = goperl_sv_wide_int(aTHX_ sv)) {
-            f |= GOPERL_INFO_IOK | 131072;
-            if (wide == 2) f |= GOPERL_INFO_ISUV;
-        }
         return f;
     }
     case GOPERL_OP_SV_CUR_SET:
@@ -4478,12 +4408,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         SV *sv = (SV *)(uintptr_t)a;
         U32 clear = (U32)(b >> 32), set = (U32)b;
         if (clear || set) SvFLAGS(sv) = (SvFLAGS(sv) & ~clear) | set;
-        U32 flags = SvFLAGS(sv);
-        if (const int wide = goperl_sv_wide_int(aTHX_ sv)) {
-            flags |= SVf_IOK | SVp_IOK;
-            if (wide == 2) flags |= SVf_IVisUV;
-        }
-        return (uint64_t)flags;
+        return (uint64_t)SvFLAGS(sv);
     }
     case GOPERL_OP_SV_SLOT_SET: { /* a = a GOPERL_SVSLOT_ selector<<32 | sv;
                  * b = the value: the SvXXX_set macros of sv.h */
@@ -4747,9 +4672,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_SVCALL_2BOOL:
             return ((b & SV_GMAGIC) ? SvTRUE(sv) : SvTRUE_nomg(sv)) ? 1 : 0;
         case GOPERL_SVCALL_2IV:
-            return goperl_sv_wide(aTHX_ sv, false, !(b & SV_GMAGIC));
+            return goperl_sv_integer(aTHX_ sv, false, !(b & SV_GMAGIC));
         case GOPERL_SVCALL_2UV:
-            return goperl_sv_wide(aTHX_ sv, true, !(b & SV_GMAGIC));
+            return goperl_sv_integer(aTHX_ sv, true, !(b & SV_GMAGIC));
         case GOPERL_SVCALL_2NV: {
             NV nv = (b & SV_GMAGIC) ? SvNV(sv) : SvNV_nomg(sv);
             uint64_t bits;

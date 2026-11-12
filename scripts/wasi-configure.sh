@@ -13,8 +13,9 @@
 #   we hand Configure a ready-made config.sh and let it do variable substitution
 #   only (`Configure -S`), which emits config.h and Makefile without probing.
 #   The base is perl5/Cross/config.sh-arm-linux: it is the SAME Perl (5.42.2)
-#   and is 32-bit little-endian (longsize=ptrsize=4, byteorder=1234) — i.e. the
-#   integer/pointer model already matches wasm32. We overwrite only what differs
+#   and is 32-bit little-endian (longsize=ptrsize=4) — i.e. the C integer and
+#   pointer model already matches wasm32. Perl's own integers are 64 bits wide
+#   all the same (use64bitint, see below). We overwrite only what differs
 #   for wasi: the toolchain (-> wasi-sdk), a few host capabilities Perl must not
 #   assume (fork/dynamic-loading/threads), and the extension set (our static-ext
 #   policy; see docs/xs-modules.md).
@@ -467,6 +468,38 @@ sPRIx64='"llx"'
 sPRIXU64='"llX"'
 # A double is aligned on 8 bytes.
 alignbytes='8'
+
+# ---- 64-bit integers -----------------------------------------------------------
+# IV and UV are 64 bits wide (long long), pointers and long stay 32: the
+# configuration perl has on a 32-bit platform with -Duse64bitint. A program
+# then computes with integers up to 2**64 as on the 64-bit perls it was
+# written on (~0, 1 << 40, pack "Q", a file offset beyond 4 GiB), and a host
+# pointer fits an IV. These are the answers Configure derives from that
+# choice, each one from the rule Configure has for it:
+#   - the types and their sizes: quadtype and uquadtype (the base has them);
+#   - the printf formats of an IV and a UV: the ones of a 64-bit integer
+#     (sPRId64 and its siblings, above);
+#   - an NV (a double, 53 bits of mantissa) no longer holds every UV;
+#   - byteorder is the order of the bytes of a UV, so it has eight digits.
+# What Configure also does and this build does not: it appends "-64int" to
+# archname, to keep extensions compiled for the two integer widths apart in
+# the directories named after the architecture. Extensions for this
+# interpreter are native code compiled against the SDK of the embedder,
+# which has its own compatibility check; the name stays 'wasm32-wasi'.
+# uidformat and gidformat stay: a uid_t has the size of a long, not of a UV.
+use64bitint='define'
+ivtype='long long'
+uvtype='unsigned long long'
+ivsize='8'
+uvsize='8'
+ivdformat='"lld"'
+uvuformat='"llu"'
+uvoformat='"llo"'
+uvxformat='"llx"'
+uvXUformat='"llX"'
+d_nv_preserves_uv='undef'
+nv_preserves_uv_bits='53'
+byteorder='12345678'
 # st_dev and st_ino are unsigned 64-bit; the base says 4 bytes, and stat
 # then returned only the low half of a device number. The wide path of
 # pp_stat formats the number with snprintf.
