@@ -2718,8 +2718,15 @@ enum {
     GOPERL_SVCALL_TAINT_ENV = 54, /* no SV: taint_env() */
     GOPERL_SVCALL_MAGIC_IS_VALUE = 55, /* the SV slot is a magic type: whether
                  * it is value magic, which `local` does not copy */
-    GOPERL_SVCALL_TIED = 56 /* b = the kind of tie magic: 1<<32 | the object
+    GOPERL_SVCALL_TIED = 56, /* b = the kind of tie magic: 1<<32 | the object
                  * the SV is tied to (SvTIED_obj), or 0 when it is not tied */
+    GOPERL_SVCALL_PV_AS = 57, /* the string of the SV in an encoding:
+                 * b = how<<32 | SV_GMAGIC or 0, how = 1 UTF-8, 2 bytes, plus
+                 * 0x100 for "or null" (an undefined value has no string)
+                 * -> (linear-memory ptr << 32) | len, ptr 0 for no string */
+    GOPERL_SVCALL_PV_FORCE_AS = 58 /* the SV made a string of its own, to be
+                 * written to: b = how<<32 | SV_GMAGIC or 0, how = 0 as it
+                 * is, 1 UTF-8, 2 bytes -> (linear-memory ptr << 32) | len */
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -4681,6 +4688,34 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                  * dies with "Wide character" when the string has no byte form */
             STRLEN len = 0;
             const char *p = (b & SV_GMAGIC) ? SvPVbyte(sv, len) : SvPVbyte_nomg(sv, len);
+            return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+        }
+        case GOPERL_SVCALL_PV_AS: {
+            STRLEN len = 0;
+            const bool mg = (b & SV_GMAGIC) != 0;
+            const char *p;
+            switch (hi) {
+            case 1: p = mg ? SvPVutf8(sv, len) : SvPVutf8_nomg(sv, len); break;
+            case 2: p = mg ? SvPVbyte(sv, len) : SvPVbyte_nomg(sv, len); break;
+            case 0x101:
+                p = mg ? SvPVutf8_or_null(sv, len) : SvPVutf8_or_null_nomg(sv, len);
+                break;
+            case 0x102:
+                p = mg ? SvPVbyte_or_null(sv, len) : SvPVbyte_or_null_nomg(sv, len);
+                break;
+            default: Perl_croak(aTHX_ "goperl: unknown string form %u", (unsigned)hi);
+            }
+            return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
+        }
+        case GOPERL_SVCALL_PV_FORCE_AS: {
+            STRLEN len = 0;
+            char *p;
+            switch (hi) {
+            case 0: p = SvPV_force_flags(sv, len, (U32)(uint32_t)b); break;
+            case 1: p = SvPVutf8_force(sv, len); break;
+            case 2: p = SvPVbyte_force(sv, len); break;
+            default: Perl_croak(aTHX_ "goperl: unknown string form %u", (unsigned)hi);
+            }
             return ((uint64_t)(uint32_t)(uintptr_t)p << 32) | (uint32_t)len;
         }
         case GOPERL_SVCALL_UNI_DISPLAY: { /* sv = dsv; b = (pvlim<<8 | flags)<<32
