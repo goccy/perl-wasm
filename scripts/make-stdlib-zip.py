@@ -43,6 +43,16 @@ documentation is found beside its .pm). The manual pages of the perl5/pod/
 source directory (perlfunc.pod and the rest) are not in lib/ and so are not
 shipped.
 
+%Config names the library directory the library is in at run time. The
+build configures perl for a library under /usr/lib/perl5, where nothing is:
+the archive is unpacked wherever the embedding application puts it, on a
+host filesystem or an in-memory one. So the shipped Config.pm takes the
+directory it was loaded from for the library directory (privlibexp and
+archlibexp: the archive holds both kinds of file in one tree), and the
+shipped Config_heavy.pl gives the same answer for every spelling of the two
+(privlib, privlibexp, installprivlib, archlib, archlibexp, installarchlib).
+See relocate_config. The site directories are left as configured.
+
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
 
@@ -87,6 +97,71 @@ def included(rel_path: str) -> bool:
     return True
 
 
+# What Config.pm computes before it ties %Config: the directory it was
+# loaded from.
+CONFIG_PM_LIBDIR = """\
+# The library is unpacked wherever the embedding application puts it: the
+# library directories are the directory this file was loaded from.
+my $libdir = __FILE__;
+$libdir =~ s{/+[^/]*\\z}{} or $libdir = '.';
+$libdir = '/' if $libdir eq '';
+
+"""
+
+# What Config_heavy.pl does to the text of config.sh it holds in $_, right
+# after it has it: the library directories become the one Config.pm found.
+# A value is written in the form the text has for it — in single quotes, or,
+# for a directory with a single quote in its name, in double quotes, which
+# the reader of the text evaluates as a Perl string.
+CONFIG_HEAVY_LIBDIR = """\
+# The library directories are where the library is at run time: the answer
+# Config.pm found when it was loaded.
+{
+    my $libdir = $Config::Config{privlibexp};
+    my $quoted = $libdir =~ /'/ ? '"' . quotemeta($libdir) . '"' : "'$libdir'";
+    s/^((?:install)?(?:priv|arch)lib(?:exp)?)=.*$/$1=$quoted/mg;
+}
+"""
+
+LIBDIR_KEYS = ("archlibexp", "privlibexp")
+
+
+def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
+    """Replaces the one match of pattern; anything but one match is an error:
+    the generated file is not the one this script knows."""
+    result, count = re.subn(pattern, lambda _m: replacement, text, flags=re.M)
+    if count != 1:
+        raise SystemExit(f"make-stdlib-zip: {what}: {count} matches, expected 1")
+    return result
+
+
+def relocate_config(rel_path: str, data: bytes) -> bytes:
+    """Returns the content to ship for a file of lib/: Config.pm and
+    Config_heavy.pl with the library directories taken from where the
+    library is (see the module docstring), every other file as it is."""
+    if rel_path == "Config.pm":
+        text = data.decode("utf-8")
+        text = replace_once(text, r"^tie %Config, 'Config', \{$",
+                            CONFIG_PM_LIBDIR + "tie %Config, 'Config', {", "Config.pm: the tie")
+        for key in LIBDIR_KEYS:
+            text = replace_once(text, rf"^    {key} => '[^'\n]*',$", f"    {key} => $libdir,",
+                                f"Config.pm: {key}")
+        return text.encode("utf-8")
+    if rel_path == "Config_heavy.pl":
+        text = data.decode("utf-8")
+        # The text of config.sh is the here-document assigned to $_ through
+        # the alias made just before it.
+        start = text.find("local *_ = \\my $a;\n$_ = <<'!END!';\n")
+        if start < 0 or text.find("local *_ = \\my $a;", start + 1) >= 0:
+            raise SystemExit("make-stdlib-zip: Config_heavy.pl: the config.sh text was not found")
+        end = text.find("\n!END!\n", start)
+        if end < 0:
+            raise SystemExit("make-stdlib-zip: Config_heavy.pl: the config.sh text does not end")
+        end += len("\n!END!\n")
+        return (text[:end] + CONFIG_HEAVY_LIBDIR + text[end:]).encode("utf-8")
+    return data
+
+
 def collect(lib_dir: str) -> list[str]:
     out = []
     for root, _dirs, files in os.walk(lib_dir):
@@ -123,7 +198,10 @@ def main() -> int:
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16  # regular file, rw-r--r--
             with open(os.path.join(sources[rel], rel), "rb") as fh:
-                zf.writestr(info, fh.read())
+                data = fh.read()
+            if sources[rel] == lib_dir:
+                data = relocate_config(rel, data)
+            zf.writestr(info, data)
     sys.stderr.write(f"wrote {out_path}: {len(rels)} files\n")
     return 0
 
