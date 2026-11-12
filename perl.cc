@@ -368,6 +368,9 @@ XS(XS_goperl_plain_call) {
  * (perl_signal.cc). Every entry point that runs Perl code calls it: the
  * instance may be a snapshot copy the host has not seen yet. */
 extern "C" void wasi_signal_attach(pTHX);
+/* Ends the process by a signal, as the signal's default action does
+ * (perl_signal.cc). Does not return. */
+extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
 
 /* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
  * via a plain linear-memory write (perl_interrupt_addr returns its address); no
@@ -524,8 +527,9 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
  *
  * A flag value with GOPERL_INTERRUPT_SIGNAL set is a terminating signal
  * delivered to this (pseudo-)process: its low bits are the signal number.
- * Unlike an interruption it cannot be caught by eval — the program ends as
- * the shell would report a signal death, exit status 128+signal. */
+ * Unlike an interruption it cannot be caught by eval, and the process ends
+ * where it stands, as one killed by a signal does: no END block and no
+ * destructor runs. */
 #define GOPERL_INTERRUPT_SIGNAL 0x100u
 static int runops_interruptible(pTHX) {
     OP *op = PL_op;
@@ -534,7 +538,7 @@ static int runops_interruptible(pTHX) {
             const uint32_t flag = g_interrupt;
             g_interrupt = 0;
             if (flag & GOPERL_INTERRUPT_SIGNAL)
-                my_exit(128 + (int)(flag & 0x7f));
+                wasi_signal_die((int)(flag & 0x7f));
             Perl_croak(aTHX_ "Perl execution interrupted");
         }
     }

@@ -455,6 +455,10 @@ int raise(int sig) {
     return 0;
 }
 
+/* The process ends by sig, where it stands: the end of one that was sent a
+ * signal it cannot catch. */
+void wasi_signal_die(int sig) { wasi_host_proc_terminate(sig); }
+
 /* abort: the process ends by SIGABRT. A handler for the signal runs first;
  * when it returns, or the signal is ignored or blocked, the process ends
  * by the signal all the same. (wasi-libc's abort is a trap, which reaches
