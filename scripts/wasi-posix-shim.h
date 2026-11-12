@@ -116,6 +116,30 @@ struct sockaddr_un {
 #define SHUT_WR 1
 #define SHUT_RDWR 2
 
+/* poll(2) event bits wasi-libc leaves out. Programs name them when they
+ * build an event mask (POE's IO::Poll loop asks for POLLRDBAND with every
+ * read), so the names have to exist; the bits are free ones of this C
+ * library's numbering. No descriptor here has out-of-band or priority-band
+ * data, so poll never reports them. POLLNORM is the historical name of
+ * POLLRDNORM. */
+#include <poll.h>
+#ifndef POLLRDBAND
+#define POLLRDBAND 0x0080
+#endif
+#ifndef POLLWRBAND
+#define POLLWRBAND 0x0100
+#endif
+#ifndef POLLNORM
+#define POLLNORM POLLRDNORM
+#endif
+
+/* SO_ACCEPTCONN ("is this socket listening?", read only). wasi-libc has no
+ * number for it; the host socket layer answers it (wasmify's socket shim
+ * uses this number when the C library has none). */
+#ifndef SO_ACCEPTCONN
+#define SO_ACCEPTCONN 30
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
