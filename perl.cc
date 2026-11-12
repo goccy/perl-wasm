@@ -228,6 +228,66 @@ XS(XS_DynaLoader_dl_static_boot) {
     XSRETURN_UNDEF;
 }
 
+/* ---- site directories ------------------------------------------------------
+ * The build configures the site directories under /usr/lib/perl5, where
+ * nothing is. The embedder names the directory they are under at run time
+ * (perl_new's site_dir); they are laid out below it here, by the one who
+ * knows the interpreter's version. g_site_config holds every %Config key
+ * that names one of them with its value — empty when the interpreter was
+ * started without a site_dir — and is what the shipped Config.pm and
+ * Config_heavy.pl ask for (Internals::site_directories, next to the
+ * Internals::V they ask for the build options). It has to be kept: nothing
+ * else in the interpreter records what it was started with. */
+static std::vector<std::pair<const char *, std::string>> g_site_config;
+/* sitearch and sitelib, the two that are in @INC; empty without a site_dir. */
+static std::string g_site_arch_dir, g_site_lib_dir;
+
+static void site_configure(const char *site_dir, const char *site_arch) {
+    g_site_config.clear();
+    g_site_arch_dir.clear();
+    g_site_lib_dir.clear();
+    if (!site_dir || !*site_dir) return;
+    std::string root(site_dir);
+    while (root.size() > 1 && root.back() == '/') root.pop_back();
+    const std::string under = root == "/" ? "" : root;
+    const std::string stem = under + "/site_perl";
+    g_site_lib_dir = stem + "/" PERL_VERSION_STRING;
+    g_site_arch_dir = g_site_lib_dir + "/" + (site_arch && *site_arch ? site_arch : ARCHNAME);
+    const std::string bin = under + "/bin";
+    const std::string man1 = under + "/man/man1";
+    const std::string man3 = under + "/man/man3";
+    static const struct {
+        const char *key;
+        int dir;
+    } keys[] = {
+        {"siteprefix", 0},     {"siteprefixexp", 0},
+        {"sitelib_stem", 1},
+        {"sitelib", 2},        {"sitelibexp", 2},        {"installsitelib", 2},
+        {"sitearch", 3},       {"sitearchexp", 3},       {"installsitearch", 3},
+        {"sitebin", 4},        {"sitebinexp", 4},        {"installsitebin", 4},
+        {"sitescript", 4},     {"sitescriptexp", 4},     {"installsitescript", 4},
+        {"siteman1dir", 5},    {"siteman1direxp", 5},    {"installsiteman1dir", 5},
+        {"siteman3dir", 6},    {"siteman3direxp", 6},    {"installsiteman3dir", 6},
+    };
+    const std::string *const dirs[] = {&root, &stem, &g_site_lib_dir, &g_site_arch_dir, &bin, &man1, &man3};
+    for (const auto &k : keys) g_site_config.emplace_back(k.key, *dirs[k.dir]);
+}
+
+/* Internals::site_directories(): the %Config keys of the site directories
+ * this interpreter was started with, each followed by its value; an empty
+ * list when it was started with none. */
+XS(XS_Internals_site_directories) {
+    dXSARGS;
+    if (items != 0) croak_xs_usage(cv, "");
+    SP -= items;
+    EXTEND(SP, static_cast<SSize_t>(2 * g_site_config.size()));
+    for (const auto &entry : g_site_config) {
+        mPUSHs(newSVpv(entry.first, 0));
+        mPUSHs(newSVpvn(entry.second.data(), entry.second.size()));
+    }
+    PUTBACK;
+}
+
 static void xs_init(pTHX) {
     static const char file[] = __FILE__;
     dXSUB_SYS;
@@ -236,6 +296,7 @@ static void xs_init(pTHX) {
     /* The loader itself, and its way to the table above. */
     newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
     newXS("DynaLoader::dl_static_boot", XS_DynaLoader_dl_static_boot, file);
+    newXS("Internals::site_directories", XS_Internals_site_directories, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */
@@ -1263,7 +1324,9 @@ static const char *EVAL_WRAPPER =
  * could name an unrelated perl's files. The library this interpreter runs
  * with lives in lib_dir, so lib_dir goes where they were: after PERL5LIB —
  * a module found there shadows the standard library's copy, as on any
- * perl — and before ".".
+ * perl — and before ".". The site directories the interpreter was started
+ * with (site_configure) go there too, in perl's order: sitearch, sitelib,
+ * then the library.
  *
  * The built-in entries are identified by what they are, not by how they
  * look: the list below is S_init_perllib's (perl_inc_macro.h), in the order
@@ -1335,6 +1398,14 @@ void program_inc_drop_environment(pTHX) {
 }
 
 static void inc_use_stdlib(pTHX_ const char *lib_dir) {
+    /* What takes the place of the built-in directories. */
+    std::vector<std::string> own;
+    if (!g_site_lib_dir.empty()) {
+        own.push_back(g_site_arch_dir);
+        own.push_back(g_site_lib_dir);
+    }
+    if (lib_dir && *lib_dir) own.emplace_back(lib_dir);
+
     AV *inc = GvAVn(PL_incgv);
     const SSize_t n = static_cast<SSize_t>(av_count(inc));
     std::vector<bool> builtin(static_cast<size_t>(n), false);
@@ -1380,7 +1451,8 @@ static void inc_use_stdlib(pTHX_ const char *lib_dir) {
     AV *fresh = newAV();
     g_inc_from_environment = newAV();
     for (SSize_t i = 0; i <= n; i++) {
-        if (i == at) av_push(fresh, newSVpv(lib_dir, 0));
+        if (i == at)
+            for (const std::string &dir : own) av_push(fresh, newSVpvn(dir.data(), dir.size()));
         if (i == n || builtin[static_cast<size_t>(i)]) continue;
         SV **svp = av_fetch(inc, i, FALSE);
         if (!svp) continue;
@@ -1396,8 +1468,9 @@ static void inc_use_stdlib(pTHX_ const char *lib_dir) {
 }
 
 /* ---- public API (pl.h) --------------------------------------------------- */
-uint64_t perl_new(const char *lib_dir) {
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch) {
     if (g_my_perl) return 0; /* one interpreter per instance */
+    site_configure(site_dir, site_arch);
 
     /* Pin the C locale before the interpreter initialises its own. wasi-libc's
      * setlocale(LC_ALL, "") returns a positional composite (e.g.
@@ -1478,7 +1551,7 @@ uint64_t perl_new(const char *lib_dir) {
             else
                 SvREFCNT_dec(val);
         }
-        if (lib_dir && *lib_dir) inc_use_stdlib(aTHX_ lib_dir);
+        if ((lib_dir && *lib_dir) || !g_site_lib_dir.empty()) inc_use_stdlib(aTHX_ lib_dir);
     }
     perl_run(g_my_perl); /* runs the empty program; leaves the interp live */
 

@@ -78,8 +78,26 @@
  * eval, then installs the interruptible run loop (see below) by overwriting
  * PL_runops. `lib_dir`, when non-empty, is prepended to @INC so pure-Perl
  * modules can be found on the runtime's WASI filesystem mount; pass NULL/empty
- * to run with only the built-in @INC. */
-uint64_t perl_new(const char *lib_dir);
+ * to run with only the built-in @INC.
+ *
+ * `site_dir`, when non-empty, is the directory the site directories are
+ * under: where modules installed for this interpreter go and are found.
+ *
+ *   <site_dir>/site_perl/<version>               sitelib
+ *   <site_dir>/site_perl/<version>/<site_arch>   sitearch
+ *   <site_dir>/bin                               sitebin, sitescript
+ *   <site_dir>/man/man1, <site_dir>/man/man3     siteman1dir, siteman3dir
+ *
+ * <version> is this interpreter's. `site_arch` names the kind of machine
+ * the architecture-specific files there are for (the host's, when native
+ * extensions are loaded into the host process); empty stands for the
+ * interpreter's own architecture name. %Config reports the directories
+ * under every key that names one of them, and sitearch and sitelib are in
+ * @INC where perl has them: after the PERL5LIB directories and before the
+ * standard library. None of them is created. Without a site_dir %Config
+ * keeps the values of the build's configuration and @INC has no site
+ * directory. */
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch);
 
 /* Evaluate `src` (a string eval in scalar context, REPL-like state
  * persistence). ok payload:

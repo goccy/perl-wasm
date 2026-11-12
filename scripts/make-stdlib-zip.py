@@ -51,7 +51,15 @@ directory it was loaded from for the library directory (privlibexp and
 archlibexp: the archive holds both kinds of file in one tree), and the
 shipped Config_heavy.pl gives the same answer for every spelling of the two
 (privlib, privlibexp, installprivlib, archlib, archlibexp, installarchlib).
-See relocate_config. The site directories are left as configured.
+See relocate_config.
+
+The site directories are not known before run time either: the embedding
+application names the directory they are under when it starts the
+interpreter, or names none. The interpreter answers for them
+(Internals::site_directories: the %Config keys of the site directories it
+was started with and their values, see perl.cc), and the shipped Config.pm
+and Config_heavy.pl report what it says; without any, they keep the values
+of the build's configuration.
 
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
@@ -106,6 +114,10 @@ my $libdir = __FILE__;
 $libdir =~ s{/+[^/]*\\z}{} or $libdir = '.';
 $libdir = '/' if $libdir eq '';
 
+# The site directories are the ones the interpreter was started with, when
+# it was started with any.
+my %site = Internals::site_directories();
+
 """
 
 # What Config_heavy.pl does to the text of config.sh it holds in $_, right
@@ -121,9 +133,21 @@ CONFIG_HEAVY_LIBDIR = """\
     my $quoted = $libdir =~ /'/ ? '"' . quotemeta($libdir) . '"' : "'$libdir'";
     s/^((?:install)?(?:priv|arch)lib(?:exp)?)=.*$/$1=$quoted/mg;
 }
+# The site directories are the ones the interpreter was started with, when
+# it was started with any: it names every key that is one of them.
+{
+    my %site = Internals::site_directories();
+    for my $key (keys %site) {
+        my $dir = $site{$key};
+        my $quoted = $dir =~ /'/ ? '"' . quotemeta($dir) . '"' : "'$dir'";
+        s/^\\Q$key\\E=.*$/$key=$quoted/m;
+    }
+}
 """
 
 LIBDIR_KEYS = ("archlibexp", "privlibexp")
+# The site directories among the values Config.pm holds itself.
+SITE_KEYS = ("sitearchexp", "sitelibexp")
 
 
 def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
@@ -146,6 +170,12 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
         for key in LIBDIR_KEYS:
             text = replace_once(text, rf"^    {key} => '[^'\n]*',$", f"    {key} => $libdir,",
                                 f"Config.pm: {key}")
+        for key in SITE_KEYS:
+            match = re.search(rf"^    {key} => ('[^'\n]*'),$", text, flags=re.M)
+            if match is None:
+                raise SystemExit(f"make-stdlib-zip: Config.pm: {key} was not found")
+            text = replace_once(text, rf"^    {key} => '[^'\n]*',$",
+                                f"    {key} => $site{{{key}}} // {match.group(1)},", f"Config.pm: {key}")
         return text.encode("utf-8")
     if rel_path == "Config_heavy.pl":
         text = data.decode("utf-8")
