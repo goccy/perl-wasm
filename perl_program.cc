@@ -203,10 +203,11 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
 
     /* The command line as perl remembers it (PL_origargv). The lexer reads
      * it when the #! line of the program names another interpreter: the
-     * program is handed to that interpreter, with these arguments. The
-     * interpreter was started without a program, so the vector is put
-     * together here from what the host said: perl, the program, its
-     * arguments. (The switches the host interpreted are not in it.) As when
+     * program is handed to that interpreter, with these arguments — perl's
+     * own switches among them, as they were typed. The interpreter was
+     * started without a program, so the vector is put together here from
+     * what the host said: perl, then the words of the command line when the
+     * host has one, and otherwise the program and its arguments. As when
      * perl_parse itself runs a second time, the vector is not the process's
      * real argument area, and assigning to $0 must not write into it:
      * PL_origalen is 1. The storage is this function's own: perl keeps the
@@ -218,19 +219,23 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
         const std::string name(PL_origargv && PL_origargv[0] ? PL_origargv[0] : "perl");
         words.clear();
         words.push_back(name);
-        switch (ps.source) {
-        case PROG_SOURCE_TEXT:
-            words.emplace_back("-e");
-            words.push_back(ps.code);
-            break;
-        case PROG_SOURCE_STDIN:
-            words.emplace_back("-");
-            break;
-        default:
-            words.push_back(ps.path);
-            break;
+        if (ps.has_command_line) {
+            for (const std::string &w : ps.command_line) words.push_back(w);
+        } else {
+            switch (ps.source) {
+            case PROG_SOURCE_TEXT:
+                words.emplace_back("-e");
+                words.push_back(ps.code);
+                break;
+            case PROG_SOURCE_STDIN:
+                words.emplace_back("-");
+                break;
+            default:
+                words.push_back(ps.path);
+                break;
+            }
+            for (const std::string &a : ps.args) words.push_back(a);
         }
-        for (const std::string &a : ps.args) words.push_back(a);
         argv.clear();
         for (std::string &w : words) argv.push_back(&w[0]);
         argv.push_back(NULL);

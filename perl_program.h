@@ -53,6 +53,10 @@ struct ProgramSpec {
     std::vector<std::string> inc;
     std::vector<ProgramDefine> defines;
     std::vector<std::string> args;
+    /* The words of the command line after the command's name, as they were
+     * given, when the host has a command line to report. */
+    bool has_command_line;
+    std::vector<std::string> command_line;
 };
 
 /* Compiles and runs the program to its end; an exit or an uncaught die

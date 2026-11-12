@@ -1617,6 +1617,8 @@ static bool decode_program(const char *buf, uint32_t len, ProgramSpec &ps) {
         read_str(r, d.value);
     }
     read_strlist(r, ps.args);
+    ps.has_command_line = r.get_u8() != 0;
+    read_strlist(r, ps.command_line);
     return !r.fail && r.p == r.end && ps.warnings <= PROG_WARN_NONE &&
            ps.taint <= PROG_TAINT_ON && ps.source <= PROG_SOURCE_STDIN;
 }
