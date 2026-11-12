@@ -63,7 +63,8 @@
       "-Wl,--wrap=setenv",
       "-Wl,--wrap=unsetenv",
       "-Wl,--wrap=putenv",
-      "-Wl,--wrap=clearenv"
+      "-Wl,--wrap=clearenv",
+      "-Wl,--wrap=setlocale"
     ]
   },
   "user_selection": {

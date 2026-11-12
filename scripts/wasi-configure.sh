@@ -512,13 +512,14 @@ d_snprintf='define'
 # <locale.h>. The base says name=value pairs (glibc), with the word "define"
 # where the separator and the positions belong; locale.c then could not
 # read the string back, and a program started with LC_CTYPE differing from
-# the other categories died in a panic. Every locale name is accepted.
+# the other categories died in a panic. A locale has to be one the C library
+# has data for (perl_libc.cc), so not every name is accepted.
 d_perl_lc_all_uses_name_value_pairs='undef'
 d_perl_lc_all_separator='define'
 perl_lc_all_separator='";"'
 d_perl_lc_all_category_positions_init='define'
 perl_lc_all_category_positions_init='{ 0, 1, 2, 3, 4, 5 }'
-d_setlocale_accepts_any_locale_name='define'
+d_setlocale_accepts_any_locale_name='undef'
 # The C library is not glibc, and the compiler is not gcc 2.95. perl.h
 # defines _GNU_SOURCE for glibc; for a musl, perl's own hints (hints/linux.sh)
 # put -D_GNU_SOURCE into ccflags instead, and so does ccflags above: perl

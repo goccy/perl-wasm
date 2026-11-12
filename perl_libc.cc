@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <locale.h>
+#include <string>
+#include <strings.h>
 #include <arpa/inet.h>
 #include <netdb.h> /* struct hostent */
 #include <sys/resource.h>
@@ -96,6 +99,7 @@ int __real_setenv(const char *name, const char *value, int overwrite);
 int __real_unsetenv(const char *name);
 int __real_putenv(char *string);
 int __real_clearenv(void);
+char *__real_setlocale(int category, const char *name);
 
 extern char **environ;
 
@@ -353,6 +357,102 @@ int __wrap_clearenv(void) {
         }
     }
     return __real_clearenv();
+}
+
+/* ---- locales ----------------------------------------------------------------
+ * The C library has the data of two locales: "C" (also named "POSIX") and
+ * "C.UTF-8", which is "C" with UTF-8 as the character encoding. Its
+ * setlocale nevertheless accepts every name, keeps it, and behaves as
+ * "C.UTF-8": a program that asked for "de_DE" was told it had it, and then
+ * found the decimal point and the currency of "C". Here a locale that is
+ * asked for by name is one of the two, or the call fails, as it does on a
+ * system where the locale is not installed.
+ *
+ * The empty name asks for the locale of the environment (LC_ALL, the
+ * category's own variable, LANG, in that order). What the user's
+ * environment names is not a request the program made for the conventions
+ * of that locale: the nearest locale there is data for is taken, which is
+ * the one with the character encoding the environment names — "C.UTF-8"
+ * for a name whose codeset is UTF-8, "C" for any other — and that is the
+ * name the call reports. An environment that names no locale means "C". */
+
+/* Whether the codeset of a locale name (language[_territory][.codeset]
+ * [@modifier], the form of X/Open) is UTF-8, in either of its spellings. */
+static bool locale_codeset_is_utf8(const char *name) {
+    const char *dot = strchr(name, '.');
+    if (!dot) return false;
+    const char *codeset = dot + 1;
+    const size_t len = strcspn(codeset, "@");
+    return (len == 5 && strncasecmp(codeset, "UTF-8", 5) == 0) ||
+           (len == 4 && strncasecmp(codeset, "UTF8", 4) == 0);
+}
+
+/* The name the C library knows a locale it has data for by, given one name
+ * (of len characters) a program may use for it; NULL for every other
+ * locale. */
+static const char *locale_with_data(const char *name, size_t len) {
+    static const struct {
+        const char *name;
+        const char *known_as;
+    } locales[] = {
+        {"C", "C"},           {"POSIX", "POSIX"},   {"C.UTF-8", "C.UTF-8"},
+        {"C.utf8", "C.UTF-8"}, {"C.UTF8", "C.UTF-8"}, {"C.utf-8", "C.UTF-8"},
+    };
+    for (const auto &l : locales)
+        if (strlen(l.name) == len && memcmp(l.name, name, len) == 0) return l.known_as;
+    return NULL;
+}
+
+/* The six categories setlocale(LC_ALL) stands for, with the environment
+ * variable of each. */
+static const struct {
+    int category;
+    const char *variable;
+} locale_categories[] = {
+    {LC_CTYPE, "LC_CTYPE"},       {LC_NUMERIC, "LC_NUMERIC"},   {LC_TIME, "LC_TIME"},
+    {LC_COLLATE, "LC_COLLATE"},   {LC_MONETARY, "LC_MONETARY"}, {LC_MESSAGES, "LC_MESSAGES"},
+};
+
+/* Sets one category from the environment. */
+static char *setlocale_from_environment(int category, const char *variable) {
+    const char *name = getenv("LC_ALL");
+    if (!name || !*name) name = getenv(variable);
+    if (!name || !*name) name = getenv("LANG");
+    if (!name || !*name) name = "C";
+    const char *known = locale_with_data(name, strlen(name));
+    if (!known) known = locale_codeset_is_utf8(name) ? "C.UTF-8" : "C";
+    return __real_setlocale(category, known);
+}
+
+char *__wrap_setlocale(int category, const char *name) {
+    if (!name) return __real_setlocale(category, NULL);
+    if (!*name) {
+        if (category != LC_ALL) {
+            for (const auto &c : locale_categories)
+                if (c.category == category) return setlocale_from_environment(category, c.variable);
+            return __real_setlocale(category, name);
+        }
+        for (const auto &c : locale_categories)
+            if (!setlocale_from_environment(c.category, c.variable)) return NULL;
+        return __real_setlocale(LC_ALL, NULL);
+    }
+    /* A name, or for LC_ALL also one name per category separated by ";"
+     * (the form setlocale(LC_ALL, NULL) reports them in): every one has to
+     * be a locale there is data for. */
+    std::string known;
+    for (const char *part = name;;) {
+        const size_t len = category == LC_ALL ? strcspn(part, ";") : strlen(part);
+        const char *locale = locale_with_data(part, len);
+        if (!locale) {
+            errno = ENOENT;
+            return NULL;
+        }
+        if (!known.empty()) known += ';';
+        known += locale;
+        if (!part[len]) break;
+        part += len + 1;
+    }
+    return __real_setlocale(category, known.c_str());
 }
 
 /* ---- sockets ----------------------------------------------------------------

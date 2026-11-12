@@ -1465,15 +1465,6 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_ar
     if (g_my_perl) return 0; /* one interpreter per instance */
     site_configure(site_dir, site_arch);
 
-    /* Pin the C locale before the interpreter initialises its own. wasi-libc's
-     * setlocale(LC_ALL, "") returns a positional composite (e.g.
-     * "C.UTF-8;C;C;C;C;C") that Perl's LC_ALL parser rejects — it treats the
-     * ';'-joined values as name=value pairs and panics ("needs an '=' to split
-     * name=value") during construct. Forcing LC_ALL=C makes every category
-     * uniform so the query returns a single "C". overwrite=0 respects a locale
-     * the host deliberately put in the guest environment. */
-    setenv("LC_ALL", "C", 0);
-
     static bool sys_inited = false;
     if (!sys_inited) {
         int sargc = 0;
