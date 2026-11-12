@@ -720,6 +720,33 @@ patch("pp_sys.c", [
 print("wasi-spawn source routing applied")
 PYPATCH
 
+# ---- Hash::Util: the object keeps the name the compiler gives it ---------------
+# ext/Hash-Util/Makefile.PL has a rule of its own for a static build: it
+# compiles the extension as HashUtil.c and renames HashUtil.o to Util.o
+# afterwards, for platforms whose static libraries hold one object per name
+# and compare the names without regard to case (the top-level util.o). The
+# capture of this build records what the compiler and the archiver are
+# called with, not a rename between the two: the archiver's Util.o was an
+# object no recorded compilation had written, the archive of the extension
+# was never made again, and the link went on using whatever archive an
+# earlier build had left — code compiled for another configuration. Nothing
+# here needs the rule (every extension has an archive of its own), so the
+# extension is built by the standard rules like the others. Idempotent.
+python3 - <<'PYPATCH'
+path = "ext/Hash-Util/Makefile.PL"
+t = open(path).read()
+marker = "perl-wasm: standard rules"
+if marker in t:
+    print(f"standard rules already selected in {path}")
+else:
+    old = "    unless (defined $Config{usedl}) {\n"
+    assert t.count(old) == 1, path
+    t = t.replace(old, "    # " + marker + " (see scripts/wasi-configure.sh)\n"
+                       "    unless (defined $Config{usedl} || $Config{osname} eq 'wasi') {\n")
+    open(path, "w").write(t)
+    print(f"standard rules selected in {path}")
+PYPATCH
+
 # ---- Time::HiRes: clocks named by integers ------------------------------------
 # Time::HiRes passes clock ids between Perl and C as integers (its typemap
 # says clockid_t is an IV, its constants are CLOCK_REALTIME and friends).
