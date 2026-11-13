@@ -11,10 +11,10 @@
  *   - $! and the status of a die (three calls in mg.c and perl.c, see the
  *     patch in scripts/wasi-configure.sh): host_errno_of, guest_errno_of;
  *   - the constants of the linked-in extensions (Fcntl, POSIX, Socket,
- *     IO::Poll, ...): when an extension has booted, every constant in its
- *     package that names a number of a family gets the host's number
- *     (numbers_show_constants); Errno.pm asks for the host's whole table
- *     (Internals::host_numbers);
+ *     IO::Poll, ...): when an extension has booted, the value of every
+ *     constant in its packages that names a number of a family becomes the
+ *     host's number (show_constants_of); Errno.pm asks for the host's whole
+ *     table (Internals::host_numbers);
  *   - the built-in functions and the XSUBs that take or return such
  *     numbers: each is entered through a routine that turns the program's
  *     numbers into the C library's and the results back
@@ -799,23 +799,34 @@ const struct {
     {"Socket::getnameinfo", xsub_getnameinfo},
 };
 
-/* ---- constants ------------------------------------------------------------------ */
+/* ---- constants ------------------------------------------------------------------
+ * An extension makes each of its constants once, in its boot function: a
+ * value, held either by a constant sub or by the reference that stands in
+ * the package for one until the name is first looked up. Everything a
+ * program can reach the constant by leads to that one value: the sub under
+ * its name (which may be older than the extension's boot: a call compiled
+ * before a `require`, a \&Fcntl::O_CREAT taken early), the same sub
+ * imported into another package, a reference to it, ->can, and the copy
+ * the compiler puts in place of a call.
+ *
+ * The invariant: a program that is shown the host's numbers never sees the
+ * C library's number in such a value. It holds because the value itself is
+ * given the host's number, in place, in the step that follows the
+ * extension's boot function and before any code of the program or of the
+ * module can run (XS_static_extension_bootstrap is the only way a boot
+ * function is entered). Nothing is replaced, so nothing that already holds
+ * the sub or the value is left with the other number. */
 
 /* The value of the constant a package has under a name, if it has one:
- * a constant sub, or the reference to a value that stands for one until
- * it is called. */
-bool constant_value(pTHX_ HV *stash, const char *name, STRLEN len, long long *value) {
+ * that of a constant sub, or the value a reference stands for until the
+ * name is looked up. */
+SV *constant_of(pTHX_ HV *stash, const char *name, STRLEN len) {
     SV **const entry = hv_fetch(stash, name, (I32)len, 0);
-    if (!entry) return false;
-    SV *constant = NULL;
-    if (SvROK(*entry) && SvTYPE(SvRV(*entry)) < SVt_PVAV) {
-        constant = SvRV(*entry);
-    } else if (isGV(*entry) && GvCV((GV *)*entry) && CvCONST(GvCV((GV *)*entry))) {
-        constant = cv_const_sv(GvCV((GV *)*entry));
-    }
-    if (!constant || !(SvIOK(constant) || SvNOK(constant))) return false;
-    *value = SvIsUV(constant) ? (long long)SvUV(constant) : (long long)SvIV(constant);
-    return true;
+    if (!entry) return NULL;
+    if (SvROK(*entry) && SvTYPE(SvRV(*entry)) < SVt_PVAV) return SvRV(*entry);
+    if (isGV(*entry) && GvCV((GV *)*entry) && CvCONST(GvCV((GV *)*entry)))
+        return cv_const_sv(GvCV((GV *)*entry));
+    return NULL;
 }
 
 /* The number the program is to see for one of this C library's names. */
@@ -840,27 +851,28 @@ const struct {
 };
 
 /* Gives the constant a package has under a name the number the program is
- * to see, when the constant is the number g. */
-bool show_constant(pTHX_ HV *stash, const char *name, const GuestNumber &g) {
-    const STRLEN len = strlen(name);
-    long long now;
-    if (!constant_value(aTHX_ stash, name, len, &now) || now != g.value) return false;
+ * to see, when the constant is the number g: the value is changed where it
+ * is (see the invariant above). The truth values are no numbers an
+ * extension made. */
+void show_constant(pTHX_ HV *stash, const char *name, const GuestNumber &g) {
+    SV *const constant = constant_of(aTHX_ stash, name, strlen(name));
+    if (!constant || SvIMMORTAL(constant) || !(SvIOK(constant) || SvNOK(constant))) return;
+    const long long now = SvIsUV(constant) ? (long long)SvUV(constant) : (long long)SvIV(constant);
+    if (now != g.value) return;
     const long long shown = shown_number(g);
-    if (shown == now) return false;
-    (void)hv_delete(stash, name, (I32)len, G_DISCARD);
-    newCONSTSUB(stash, name, newSViv((IV)shown));
-    return true;
+    if (shown == now) return;
+    const bool readonly = SvREADONLY(constant);
+    SvREADONLY_off(constant);
+    sv_setiv(constant, (IV)shown);
+    if (readonly) SvREADONLY_on(constant);
 }
 
 void show_constants_of(pTHX_ HV *stash) {
-    bool changed = false;
     for (const GuestNumber &g : guest_numbers) {
-        if (show_constant(aTHX_ stash, g.name, g)) changed = true;
+        show_constant(aTHX_ stash, g.name, g);
         for (const auto &alias : constant_aliases)
-            if (strcmp(alias.known_as, g.name) == 0 && show_constant(aTHX_ stash, alias.name, g))
-                changed = true;
+            if (strcmp(alias.known_as, g.name) == 0) show_constant(aTHX_ stash, alias.name, g);
     }
-    if (changed) mro_method_changed_in(stash);
 }
 
 /* The packages an extension puts constants into, other than its own. */
