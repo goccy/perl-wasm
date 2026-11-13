@@ -215,9 +215,60 @@ XS(XS_static_extension_bootstrap) {
     numbers_extension_booted(aTHX_ ext->module);
 }
 
+/* The directory the interpreter's own library is in (perl_new's lib_dir),
+ * empty when it was started without one. It is kept because @INC, where it
+ * was put, is the program's to change. */
+static std::string g_lib_dir;
+
+/* Whether a shared object for the module takes the place of the linked-in
+ * extension. A linked-in extension belongs to the interpreter's own
+ * library: it is found where a shared object in that directory would be.
+ * On a perl that loads dynamically, a module that was upgraded from CPAN
+ * has its files in a directory ahead of the library in @INC, and both the
+ * module file and auto/<Module>/<Name>.<dlext> are taken from there. So
+ * when the interpreter can load shared objects (the host defined
+ * DynaLoader::dl_load_file), an @INC directory ahead of the library that
+ * holds the module's shared object wins: the loaders are told that the
+ * module is not linked in, and find that file the way they find any. The
+ * path is the one XSLoader and DynaLoader build (dlext is "so" in this
+ * configuration, and there is no mod2fname). */
+static bool static_extension_shadowed(pTHX_ const char *module) {
+    if (!get_cv("DynaLoader::dl_load_file", 0)) return false;
+    std::string rel = "/auto/";
+    const char *last = module;
+    for (const char *p = module; *p;) {
+        if (p[0] == ':' && p[1] == ':') {
+            rel.push_back('/');
+            p += 2;
+            last = p;
+        } else {
+            rel.push_back(*p++);
+        }
+    }
+    rel.push_back('/');
+    rel += last;
+    rel += ".so";
+    AV *const inc = GvAVn(PL_incgv);
+    const SSize_t n = static_cast<SSize_t>(av_count(inc));
+    for (SSize_t i = 0; i < n; i++) {
+        SV **const svp = av_fetch(inc, i, FALSE);
+        /* a hook in @INC holds no files */
+        if (!svp || !SvOK(*svp) || SvROK(*svp)) continue;
+        STRLEN len = 0;
+        const char *const dir = SvPV(*svp, len);
+        if (!g_lib_dir.empty() && len == g_lib_dir.size() && memcmp(dir, g_lib_dir.data(), len) == 0)
+            return false;
+        const std::string path = std::string(dir, len) + rel;
+        Stat_t st;
+        if (PerlLIO_stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return true;
+    }
+    return false;
+}
+
 /* DynaLoader::dl_static_boot(module): the boot function of a linked-in
  * extension, installed as <module>::bootstrap and returned as a code
- * reference; undef for a module that is not linked in.
+ * reference; undef for a module that is not linked in, or whose place a
+ * shared object has taken (static_extension_shadowed).
  *
  * A module the host has registered natively (go-perl's XS loader) is found
  * the same way and at the same moment: the host keeps its boot function as
@@ -230,6 +281,7 @@ XS(XS_DynaLoader_dl_static_boot) {
     const char *const module = SvPV(ST(0), len);
     for (const StaticExtension &ext : static_extensions) {
         if (strlen(ext.module) != len || memcmp(ext.module, module, len) != 0) continue;
+        if (static_extension_shadowed(aTHX_ ext.module)) break;
         SV *const name = sv_2mortal(newSVpvf("%s::bootstrap", ext.module));
         CV *boot = get_cv(SvPV_nolen(name), 0);
         if (!boot) {
@@ -1779,6 +1831,7 @@ static void inc_use_stdlib(pTHX_ const char *lib_dir) {
 uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch) {
     if (g_my_perl) return 0; /* one interpreter per instance */
     site_configure(site_dir, site_arch);
+    g_lib_dir = lib_dir ? lib_dir : "";
 
     static bool sys_inited = false;
     if (!sys_inited) {
