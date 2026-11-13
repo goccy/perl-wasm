@@ -537,6 +537,7 @@ XS(XS_goperl_plain_call) {
  * (perl_signal.cc). Every entry point that runs Perl code calls it: the
  * instance may be a snapshot copy the host has not seen yet. */
 extern "C" void wasi_signal_attach(pTHX);
+extern "C" void perl_wasm_locale_start_up(int on);
 /* Ends the process by a signal, as the signal's default action does
  * (perl_signal.cc). Does not return. */
 extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
@@ -1856,7 +1857,11 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_ar
     g_my_perl = perl_alloc();
     if (!g_my_perl) return 0;
     PERL_SET_CONTEXT(g_my_perl);
+    /* the locale of the environment, as the interpreter's own start-up
+     * takes it (perl_libc.cc) */
+    perl_wasm_locale_start_up(1);
     perl_construct(g_my_perl);
+    perl_wasm_locale_start_up(0);
     PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
 
     /* Bootstrap args: perl -e 0 — parse an empty program so the interpreter

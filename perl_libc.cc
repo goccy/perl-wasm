@@ -369,12 +369,27 @@ int __wrap_clearenv(void) {
  * system where the locale is not installed.
  *
  * The empty name asks for the locale of the environment (LC_ALL, the
- * category's own variable, LANG, in that order). What the user's
- * environment names is not a request the program made for the conventions
- * of that locale: the nearest locale there is data for is taken, which is
- * the one with the character encoding the environment names — "C.UTF-8"
- * for a name whose codeset is UTF-8, "C" for any other — and that is the
- * name the call reports. An environment that names no locale means "C". */
+ * category's own variable, LANG, in that order; an environment that names
+ * no locale means "C"). A program that asks for it is answered like one
+ * that asks by name: when the environment names a locale there is no data
+ * for, the call fails and the locale stays as it was. (A program finds out
+ * that way whether the user's locale is there: `setlocale(LC_ALL, "") or
+ * skip`.)
+ *
+ * The interpreter asks the same question when it starts, and there a
+ * failure would be a complaint on standard error at every start for a user
+ * whose environment names, say, "ja_JP.UTF-8". What the user's environment
+ * names is not a request the program made for the conventions of that
+ * locale: at start-up the nearest locale there is data for is taken, which
+ * is the one with the character encoding the environment names: "C.UTF-8"
+ * for a name whose codeset is UTF-8, "C" for any other. */
+
+/* Set while the interpreter sets its locale up when it is constructed. The
+ * C library cannot tell that call of setlocale(LC_ALL, "") from a
+ * program's. */
+static bool locale_start_up;
+
+void perl_wasm_locale_start_up(int on) { locale_start_up = on != 0; }
 
 /* Whether the codeset of a locale name (language[_territory][.codeset]
  * [@modifier], the form of X/Open) is UTF-8, in either of its spellings. */
@@ -413,28 +428,35 @@ static const struct {
     {LC_COLLATE, "LC_COLLATE"},   {LC_MONETARY, "LC_MONETARY"}, {LC_MESSAGES, "LC_MESSAGES"},
 };
 
-/* Sets one category from the environment. */
-static char *setlocale_from_environment(int category, const char *variable) {
+/* The locale the environment names for one category, as the C library
+ * knows it; NULL when there is no data for it. */
+static const char *locale_of_environment(const char *variable) {
     const char *name = getenv("LC_ALL");
     if (!name || !*name) name = getenv(variable);
     if (!name || !*name) name = getenv("LANG");
     if (!name || !*name) name = "C";
     const char *known = locale_with_data(name, strlen(name));
-    if (!known) known = locale_codeset_is_utf8(name) ? "C.UTF-8" : "C";
-    return __real_setlocale(category, known);
+    if (!known && locale_start_up) known = locale_codeset_is_utf8(name) ? "C.UTF-8" : "C";
+    return known;
 }
 
 char *__wrap_setlocale(int category, const char *name) {
     if (!name) return __real_setlocale(category, NULL);
     if (!*name) {
-        if (category != LC_ALL) {
-            for (const auto &c : locale_categories)
-                if (c.category == category) return setlocale_from_environment(category, c.variable);
-            return __real_setlocale(category, name);
-        }
+        /* every category asked for has to be there before one is set */
         for (const auto &c : locale_categories)
-            if (!setlocale_from_environment(c.category, c.variable)) return NULL;
-        return __real_setlocale(LC_ALL, NULL);
+            if ((category == LC_ALL || c.category == category) && !locale_of_environment(c.variable)) {
+                errno = ENOENT;
+                return NULL;
+            }
+        bool one_of_the_six = false;
+        for (const auto &c : locale_categories) {
+            if (category != LC_ALL && c.category != category) continue;
+            one_of_the_six = true;
+            if (!__real_setlocale(c.category, locale_of_environment(c.variable))) return NULL;
+        }
+        if (!one_of_the_six) return __real_setlocale(category, name);
+        return __real_setlocale(category, NULL);
     }
     /* A name, or for LC_ALL also one name per category separated by ";"
      * (the form setlocale(LC_ALL, NULL) reports them in): every one has to
