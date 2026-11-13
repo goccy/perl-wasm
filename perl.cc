@@ -4687,9 +4687,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     case GOPERL_OP_HV_CLEAR:
         hv_clear((HV *)(uintptr_t)a);
         return 0;
-    case GOPERL_OP_HV_DELETE: { /* (s = key, b = flags) */
-        SV *r = hv_delete((HV *)(uintptr_t)a, s ? s : "",
-                          (I32)strlen(s ? s : ""), (I32)(int64_t)b);
+    case GOPERL_OP_HV_DELETE: { /* a = key length<<32 | hv, s = the key's
+                 * bytes, b = flags */
+        SV *r = hv_delete((HV *)(uintptr_t)(uint32_t)a, s ? s : "",
+                          (I32)(uint32_t)(a >> 32), (I32)(int64_t)b);
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_EXISTS:
@@ -4809,20 +4810,22 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         return (SvTYPE((SV *)(uintptr_t)a) < SVt_PV)
                    ? 0
                    : (uint64_t)SvLEN((SV *)(uintptr_t)a);
-    case GOPERL_OP_HV_STORE_KLEN: { /* b = utf8<<32 | value token, s+len =
-                 * key bytes; takes over the value ref -> stored SV token.
-                 * hv_common with JUST_SV returns the SLOT (SV**). */
+    case GOPERL_OP_HV_STORE_KLEN: { /* a = key length<<32 | hv, b = utf8<<32 |
+                 * value token, s = the key's bytes; takes over the value
+                 * ref -> stored SV token. hv_common with JUST_SV returns
+                 * the SLOT (SV**). */
         SV *val = (SV *)(uintptr_t)(uint32_t)b;
-        SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
-                                    strlen(s ? s : ""),
+        SV **svp = (SV **)hv_common((HV *)(uintptr_t)(uint32_t)a, NULL, s ? s : "",
+                                    (STRLEN)(uint32_t)(a >> 32),
                                     (b >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val,
                                     0);
         return svp ? (uint64_t)(uintptr_t)*svp : 0;
     }
-    case GOPERL_OP_HV_FETCH_KLEN: { /* b = utf8<<32 | lval, s+len = key */
-        SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
-                                    strlen(s ? s : ""),
+    case GOPERL_OP_HV_FETCH_KLEN: { /* a = key length<<32 | hv, b = utf8<<32 |
+                 * lval, s = the key's bytes */
+        SV **svp = (SV **)hv_common((HV *)(uintptr_t)(uint32_t)a, NULL, s ? s : "",
+                                    (STRLEN)(uint32_t)(a >> 32),
                                     (b >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_JUST_SV |
                                         ((uint32_t)b ? HV_FETCH_LVALUE : 0),
