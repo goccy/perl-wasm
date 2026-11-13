@@ -472,6 +472,20 @@ enum {
  * returned. NULL whenever no native XSUB is ending that way. */
 static SV *goperl_thrown_sv = NULL;
 
+/* The host answered that the native code it ran ended by throwing a value
+ * (GOPERL_RESP_THROW): the interpreter dies with that value — the object
+ * itself, or the whole text with its encoding. Whatever ran the native
+ * code calls this on the response first: an XSUB, a keyword plugin, a pp
+ * function, a hook. The response is freed when it does not return. */
+static void goperl_die_if_thrown(pTHX_ unsigned char *resp) {
+    if (resp[0] != GOPERL_RESP_THROW) return;
+    SV *thrown = goperl_thrown_sv;
+    goperl_thrown_sv = NULL;
+    free(resp);
+    if (!thrown) Perl_croak(aTHX_ "native code: the thrown value is missing");
+    croak_sv(sv_2mortal(thrown));
+}
+
 /* A callback of native code that did not ask for G_EVAL (CALL_SV and
  * CALL_METHOD below). Its die cannot unwind the host's C frames, so the
  * call is made inside an eval scope all the same; but a call with G_EVAL
@@ -567,6 +581,7 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
         uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
         if (resp_ptr != 0 && resp_len >= 1) {
             unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+            goperl_die_if_thrown(aTHX_ resp);
             if (resp[0] == GOPERL_RESP_FAIL) {
                 char msg[512];
                 size_t ml = resp_len - 1;
@@ -603,6 +618,7 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
         uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
         if (resp_ptr != 0 && resp_len >= 1) {
             unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+            goperl_die_if_thrown(aTHX_ resp);
             if (resp[0] == GOPERL_RESP_FAIL) {
                 char msg[512];
                 size_t ml = resp_len - 1;
@@ -677,6 +693,7 @@ static unsigned char *goperl_host_call(pTHX_ uint32_t kind, const uint32_t *word
     if (resp_ptr == 0 || resp_len < 1)
         Perl_croak(aTHX_ "goperl: host call %u: empty response", (unsigned)kind);
     unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+    goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) {
         char msg[512];
         size_t ml = resp_len - 1;
@@ -854,6 +871,7 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     if (resp_ptr == 0 || resp_len < 1)
         Perl_croak(aTHX_ "pp hook: empty response");
     unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+    goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) {
         char msg[512];
         size_t ml = resp_len - 1;
@@ -1413,14 +1431,7 @@ XS(XS_goperl_native_thunk) {
         Perl_croak(aTHX_ "native XS dispatch: empty response");
     unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
 
-    if (resp[0] == GOPERL_RESP_THROW) {
-        SV *thrown = goperl_thrown_sv;
-        goperl_thrown_sv = NULL;
-        free(resp);
-        if (!thrown)
-            Perl_croak(aTHX_ "native XS dispatch: the thrown value is missing");
-        croak_sv(sv_2mortal(thrown));
-    }
+    goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) { /* the rest is the croak message */
         char msg[512];
         size_t n = resp_len - 1;
