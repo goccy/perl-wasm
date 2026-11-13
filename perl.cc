@@ -391,6 +391,22 @@ __attribute__((import_module("wasmify"), import_name("callback_invoke")))
 extern "C" int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_id,
                                            void *req, size_t req_len);
 
+/* What the import returns when the host ended the callback by a non-local
+ * exit of this interpreter: native code asked for an operation, the
+ * interpreter died (or exited) inside it, and the jump to the place that
+ * catches it was held on the host while the native frames were left (see
+ * go-perl's guestJump). The host has put the exception back when the import
+ * returns, and the transpiled code sees it only where a function that may
+ * raise one returns to its caller: everything up to there runs as if
+ * nothing had happened. So the code after the import does nothing but
+ * return, at once — no response to read (there is none), nothing that
+ * dies (a die would run halfway and leave what it had made by then). Every
+ * function that makes the call is one that may raise (it croaks on a bad
+ * response, or is called through a pointer of a type that croaking
+ * functions have), so its caller goes on unwinding right after it returns.
+ * The host answers this value for nothing else. */
+#define GOPERL_CALLBACK_JUMPED ((int64_t)-1)
+
 /* The Go-side callback id every Perl->Go call from this instance dispatches
  * to. 0 = no dispatcher registered (perl_set_go_dispatcher not called). */
 static int32_t g_go_cb = 0;
@@ -578,6 +594,7 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 4 + (uint32_t)keyword_len);
         goperl_native_leave();
+        if (rc == GOPERL_CALLBACK_JUMPED) return KEYWORD_PLUGIN_DECLINE;
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
         uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
         if (resp_ptr != 0 && resp_len >= 1) {
@@ -615,6 +632,7 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
         memcpy(buf + 4, opname, oplen);
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 4 + (uint32_t)oplen);
+        if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
         uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
         if (resp_ptr != 0 && resp_len >= 1) {
@@ -689,6 +707,10 @@ static unsigned char *goperl_host_call(pTHX_ uint32_t kind, const uint32_t *word
     int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_HOST_METHOD_ID, buf,
                                          sizeof(uint32_t) * (1 + nwords));
     goperl_native_leave();
+    if (rc == GOPERL_CALLBACK_JUMPED) {
+        *rlen = 0;
+        return NULL;
+    }
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
     uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
     if (resp_ptr == 0 || resp_len < 1)
@@ -867,6 +889,7 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     goperl_native_leave();
     /* nothing with a destructor may be alive across a croak */
     std::vector<uint32_t>().swap(buf);
+    if (rc == GOPERL_CALLBACK_JUMPED) return NULL;
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
     uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
     if (resp_ptr == 0 || resp_len < 1)
@@ -933,6 +956,7 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
     if (g_go_cb == 0) return;
     int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_DTOR_METHOD_ID, &id,
                                          sizeof(id));
+    if (rc == GOPERL_CALLBACK_JUMPED) return;
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
     if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
 }
@@ -1327,6 +1351,7 @@ static void goperl_go_dispatch(pTHX_ int32_t func_id, SV **args, I32 nargs,
 
     int64_t rc = wasmify_callback_invoke(g_go_cb, func_id,
                                          const_cast<char *>(req.data()), req.size());
+    if (rc == GOPERL_CALLBACK_JUMPED) return;
     uint32_t resp_ptr = static_cast<uint32_t>(static_cast<uint64_t>(rc) >> 32);
     uint32_t resp_len = static_cast<uint32_t>(static_cast<uint64_t>(rc) & 0xFFFFFFFFu);
     if (resp_ptr == 0 || resp_len < 1)
@@ -1425,6 +1450,7 @@ XS(XS_goperl_native_thunk) {
                                          payload, payload_len);
     goperl_native_leave();
     free(payload);
+    if (rc == GOPERL_CALLBACK_JUMPED) return;
 
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
     uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
@@ -2636,7 +2662,8 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_FREE_METHOD_ID,
                                              &id, sizeof(id));
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+        if (rc != GOPERL_CALLBACK_JUMPED && resp_ptr != 0)
+            free((void *)(uintptr_t)resp_ptr);
     }
     mg->mg_ptr = NULL; /* not a real pointer; never let core touch it */
     return 0;
@@ -2655,6 +2682,7 @@ static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
         uint32_t req[2] = {(uint32_t)(uintptr_t)mg->mg_ptr, (uint32_t)(uintptr_t)nsv};
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_LOCAL_METHOD_ID,
                                              req, sizeof(req));
+        if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
         if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
     }
@@ -2669,6 +2697,7 @@ static int goperl_host_mg_set(pTHX_ SV *sv, MAGIC *mg) {
         uint32_t id = (uint32_t)(uintptr_t)mg->mg_ptr;
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_SET_METHOD_ID,
                                              &id, sizeof(id));
+        if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
         if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
     }
@@ -2830,6 +2859,10 @@ static unsigned char *goperlio_call(pTHX_ U32 hook, GoperlIOL *l, PerlIO *f,
     int64_t rc =
         wasmify_callback_invoke(g_go_cb, GOPERL_PERLIO_METHOD_ID, buf, n);
     free(buf);
+    if (rc == GOPERL_CALLBACK_JUMPED) {
+        *resplen = 0;
+        return NULL;
+    }
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
     uint32_t rlen = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
     if (resp_ptr == 0 || rlen < 1)
