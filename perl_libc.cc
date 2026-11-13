@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <cerrno>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <netdb.h> /* struct hostent */
 #include <sys/resource.h>
 #include <sys/utsname.h>
+#include "scripts/include/termios.h"
 #include <time.h>
 #include <unistd.h>
 #include <wasi/api.h>
@@ -65,6 +67,35 @@ int wasi_host_proc_setpgid(int pid, int pgid);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_setsid")))
 int wasi_host_proc_setsid(int *sid_out);
+
+/* Terminals, which are the host's: the settings of the terminal fd, read
+ * into a struct termios and set from one (actions: the host's TCSANOW,
+ * TCSADRAIN or TCSAFLUSH); the input (output 0) or output speed of
+ * settings, written at was and, with set non-zero, then made speed;
+ * tcdrain, tcflow, tcflush and tcsendbreak (what 0, 1, 2, 3, arg being the
+ * action, the queue or the duration); the foreground process group of the
+ * terminal, written at was and, with set non-zero, then made pgrp; and the
+ * path of the terminal (len bytes of it at buf, which holds cap; -ERANGE
+ * when it does not fit). All in the host's numbers; 0 or a negative errno,
+ * -ENOTTY for a descriptor that is no terminal of the host's. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_getattr")))
+int wasi_host_tty_getattr(int fd, struct termios *settings);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_setattr")))
+int wasi_host_tty_setattr(int fd, int actions, const struct termios *settings);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_speed")))
+int wasi_host_tty_speed(struct termios *settings, int output, int set, unsigned int speed,
+                        unsigned int *was);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_control")))
+int wasi_host_tty_control(int fd, int what, int arg);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_pgrp")))
+int wasi_host_tty_pgrp(int fd, int set, int pgrp, int *was);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_name")))
+int wasi_host_tty_name(int fd, char *buf, int cap, int *len);
 
 /* The nice value of processes: which and who as getpriority takes them.
  * With set non-zero the value is changed first; the value then in effect is
@@ -641,10 +672,88 @@ int uname(struct utsname *out) {
     return 0;
 }
 
-/* A terminal has no name here: the host hands over streams, not devices. */
+/* ---- terminals ----------------------------------------------------------------
+ * A terminal is a device of the host: its name, its settings and what is
+ * done to it are the host's. The structure the settings are kept in is this
+ * C library's (scripts/include/termios.h); what is in it, and the selectors
+ * the functions take, are in the host's numbers and are passed on as they
+ * are. A descriptor that is not one of the host's is no terminal here. */
+
+/* The layout the host reads and writes. */
+static_assert(sizeof(struct termios) == 60, "struct termios is what the host fills");
+static_assert(offsetof(struct termios, c_cc) == 17, "struct termios is what the host fills");
+static_assert(offsetof(struct termios, __c_ispeed) == 52, "struct termios is what the host fills");
+
 char *ttyname(int fd) {
-    errno = isatty(fd) ? ENODEV : ENOTTY;
-    return NULL;
+    static char name[256];
+    int len = 0;
+    const int rc = wasi_host_tty_name(fd, name, (int)sizeof(name) - 1, &len);
+    if (rc != 0) {
+        /* a stream the host handed over that is a terminal has no name */
+        errno = rc == -ENOTTY && isatty(fd) ? ENODEV : -rc;
+        return NULL;
+    }
+    name[len] = '\0';
+    return name;
+}
+
+/* The controlling terminal has one name for every process. */
+char *ctermid(char *buf) {
+    static char name[L_ctermid];
+    if (!buf) buf = name;
+    strcpy(buf, "/dev/tty");
+    return buf;
+}
+
+int tcgetattr(int fd, struct termios *settings) {
+    const int rc = wasi_host_tty_getattr(fd, settings);
+    return rc != 0 ? fail(-rc) : 0;
+}
+
+int tcsetattr(int fd, int actions, const struct termios *settings) {
+    const int rc = wasi_host_tty_setattr(fd, actions, settings);
+    return rc != 0 ? fail(-rc) : 0;
+}
+
+/* Where the speed is kept in the settings is the host's own. */
+static speed_t terminal_speed(const struct termios *settings, int output) {
+    unsigned int speed = 0;
+    struct termios copy = *settings;
+    wasi_host_tty_speed(&copy, output, 0, 0, &speed);
+    return (speed_t)speed;
+}
+
+static int set_terminal_speed(struct termios *settings, int output, speed_t speed) {
+    unsigned int was = 0;
+    const int rc = wasi_host_tty_speed(settings, output, 1, (unsigned int)speed, &was);
+    return rc != 0 ? fail(-rc) : 0;
+}
+
+speed_t cfgetispeed(const struct termios *settings) { return terminal_speed(settings, 0); }
+speed_t cfgetospeed(const struct termios *settings) { return terminal_speed(settings, 1); }
+int cfsetispeed(struct termios *settings, speed_t speed) { return set_terminal_speed(settings, 0, speed); }
+int cfsetospeed(struct termios *settings, speed_t speed) { return set_terminal_speed(settings, 1, speed); }
+
+static int terminal_control(int fd, int what, int arg) {
+    const int rc = wasi_host_tty_control(fd, what, arg);
+    return rc != 0 ? fail(-rc) : 0;
+}
+
+int tcdrain(int fd) { return terminal_control(fd, 0, 0); }
+int tcflow(int fd, int action) { return terminal_control(fd, 1, action); }
+int tcflush(int fd, int queue) { return terminal_control(fd, 2, queue); }
+int tcsendbreak(int fd, int duration) { return terminal_control(fd, 3, duration); }
+
+pid_t tcgetpgrp(int fd) {
+    int pgrp = 0;
+    const int rc = wasi_host_tty_pgrp(fd, 0, 0, &pgrp);
+    return rc != 0 ? (pid_t)fail(-rc) : (pid_t)pgrp;
+}
+
+int tcsetpgrp(int fd, pid_t pgrp) {
+    int was = 0;
+    const int rc = wasi_host_tty_pgrp(fd, 1, (int)pgrp, &was);
+    return rc != 0 ? fail(-rc) : 0;
 }
 
 /* The login name, as getlogin has it (perl_process.cc). */

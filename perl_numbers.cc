@@ -48,6 +48,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include "scripts/include/termios.h"
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +68,16 @@ int wasi_host_numbering(void);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("host_number_at")))
 int wasi_host_number_at(int family, int index, char *name, int name_cap, int *name_len,
                         long long *value);
+
+/* A request of ioctl that this C library does not answer, made of the host:
+ * request is the host's number, and the argument is a number (buffer 0:
+ * arg is it) or memory the request reads and writes (arg_len bytes at arg,
+ * in the host's layout). What the call returned is written at result. 0,
+ * or a negative errno: EINVAL for a request that is not one of a
+ * terminal's. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_ioctl")))
+int wasi_host_fd_ioctl(int fd, unsigned int request, int buffer, uintptr_t arg,
+                       unsigned int arg_len, int *result);
 
 /* the C library's waitpid and strerror: the link gives the names to
  * __wrap_waitpid and __wrap_strerror, below */
@@ -396,13 +407,77 @@ OP *builtin_fcntl(pTHX) {
     return next;
 }
 
-/* ioctl FILEHANDLE, FUNCTION, SCALAR: the number of the request, for the
- * requests this C library answers. */
+/* ioctl FILEHANDLE, FUNCTION, SCALAR. A request this C library answers
+ * (perl_numbers.inc) goes to it, under its number. Every other request is
+ * the host's: one of a terminal's, say, whose number the program has from
+ * a native module or a header of the host. It goes to the host as it is,
+ * and what pp_ioctl does around the call is done here: the third argument
+ * is a number, or a buffer the request reads and writes, which is at least
+ * as long as a request takes (IOCPARM_LEN, 256 where the system does not
+ * say) and guarded against a request that writes more. */
 OP *builtin_ioctl(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
-    slot_to_guest(aTHX_ SP - 1, FAMILY_ioctl);
-    return behind(aTHX);
+    SV *const function = SP[-1];
+    SvGETMAGIC(function);
+    const long long request = SvOK(function) ? (long long)SvUV_nomg(function) : 0;
+    const Family &requests = family(FAMILY_ioctl);
+    if (requests.host.empty()) return behind(aTHX);
+    for (const Pair &p : requests.pairs) {
+        if (p.host == request) {
+            SP[-1] = sv_2mortal(newSViv((IV)p.guest));
+            return behind(aTHX);
+        }
+    }
+
+    dTARGET;
+    SV *const argsv = POPs;
+    (void)POPs;
+    GV *const gv = MUTABLE_GV(POPs);
+    IO *const io = GvIOn(gv);
+    if (!IoIFP(io)) {
+        Perl_report_evil_fh(aTHX_ gv);
+        SETERRNO(EBADF, RMS_IFI);
+        RETPUSHUNDEF;
+    }
+    const bool buffer = SvPOK(argsv) || !SvNIOK(argsv);
+    char *s = NULL;
+    IV value = 0;
+    if (buffer) {
+        const STRLEN need = 256;
+        STRLEN len;
+        s = SvPV_force(argsv, len);
+        if (len < need) {
+            s = Sv_Grow(argsv, need + 1);
+            SvCUR_set(argsv, need);
+        }
+        s[SvCUR(argsv)] = 17; /* the guard pp_ioctl puts behind the buffer */
+    } else {
+        value = SvIV(argsv);
+    }
+    TAINT_PROPER(PL_op_desc[OP_IOCTL]);
+    int result = 0;
+    const int rc = wasi_host_fd_ioctl(PerlIO_fileno(IoIFP(io)), (unsigned int)request, buffer,
+                                      buffer ? (uintptr_t)s : (uintptr_t)value,
+                                      buffer ? (unsigned int)SvCUR(argsv) : 0, &result);
+    IV retval = result;
+    if (rc != 0) {
+        errno = -rc;
+        retval = -1;
+    }
+    if (SvPOK(argsv)) {
+        if (s[SvCUR(argsv)] != 17)
+            DIE(aTHX_ "Possible memory corruption: %s overflowed 3rd argument", OP_NAME(PL_op));
+        s[SvCUR(argsv)] = 0;
+        SvSETMAGIC(argsv);
+    }
+    if (retval == -1) RETPUSHUNDEF;
+    if (retval != 0) {
+        PUSHi(retval);
+    } else {
+        PUSHp("0 but true", 10);
+    }
+    RETURN;
 }
 
 /* socket SOCKET, DOMAIN, TYPE, PROTOCOL and socketpair SOCKET1, SOCKET2,

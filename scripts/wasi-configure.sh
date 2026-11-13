@@ -387,12 +387,14 @@ d_libm_lib_version='undef'
 # perl_syslog.cc, which hand each message to the host. Sys::Syslog's "native"
 # mechanism is built on them like on any libc's.
 i_syslog='define'
-# No terminal control under wasi: there is no <termios.h>. POSIX.xs guards its
-# \`#include <termios.h>\` (and the tcgetattr/tc* + Termios class) on I_TERMIOS,
-# so turn i_termios off; POSIX still builds, just without the termios interface.
-i_termios='undef'
-d_tcgetpgrp='undef'
-d_tcsetpgrp='undef'
+# wasi-libc has no <termios.h> and no terminal control; this project has
+# both: scripts/include/termios.h, and tcgetattr and its companions in
+# perl_libc.cc, which ask the host. POSIX is built with POSIX::Termios and
+# the tc* functions like on any libc.
+i_termios='define'
+d_tcgetpgrp='define'
+d_tcsetpgrp='define'
+d_ctermid='define'
 # (sockets, gethostbyname/addr, sigaction, dup/dup2 come from wasmify's stubs +
 # host shims — left enabled.) The netdb functions have system prototypes now
 # (wasmify's netdb.h for gethostby*, scripts/wasi-posix-shim.h for the *ent /

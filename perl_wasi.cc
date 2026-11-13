@@ -227,6 +227,14 @@ extern "C" int wasi_host_fd_closefrom(int low_fd);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exec")))
 extern "C" int wasi_host_proc_exec(int pid, int *status_out);
 
+/* Says (on 1) that the next command this process starts is the one it
+ * becomes: the host then starts it with what the process made of its
+ * session (a process that leads a session of its own is replaced by a
+ * command that leads one, with its controlling terminal). on 0 takes it
+ * back, for a command that could not be started. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exec_next")))
+extern "C" int wasi_host_proc_exec_next(int on);
+
 /* Ends the process as one killed by sig (perl_signal.cc uses it for the
  * default action of a signal). */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
@@ -469,9 +477,11 @@ extern "C" int execv(const char *path, char *const argv[]) {
     posix_spawn_file_actions_adddup2(&fa, 1, 1);
     posix_spawn_file_actions_adddup2(&fa, 2, 2);
     pid_t pid = -1;
+    wasi_host_proc_exec_next(1);
     const int rc = posix_spawn(&pid, path, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
+        wasi_host_proc_exec_next(0);
         errno = rc;
         return -1;
     }
@@ -479,8 +489,14 @@ extern "C" int execv(const char *path, char *const argv[]) {
 }
 
 extern "C" int execvp(const char *file, char *const argv[]) {
+    wasi_host_proc_exec_next(1);
     const pid_t pid = wasi_spawn_file(file, argv, -1, -1);
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        const int e = errno;
+        wasi_host_proc_exec_next(0);
+        errno = e;
+        return -1;
+    }
     wasi_become(pid);
 }
 
@@ -494,8 +510,12 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         /* exec STRING */
         bool blank = false;
         what = SvPV_nolen(*sp);
+        wasi_host_proc_exec_next(1);
         pid = wasi_spawn_command(what, -1, -1, &blank);
-        if (blank) return; /* nothing to run: exec fails, as perl's does */
+        if (blank) {
+            wasi_host_proc_exec_next(0);
+            return; /* nothing to run: exec fails, as perl's does */
+        }
     } else {
         SV *really = NULL;
         if (stacked) really = *++mark;
@@ -515,11 +535,13 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
         what = argv[0];
+        wasi_host_proc_exec_next(1);
         pid = wasi_spawn_argv(argv, -1, -1);
         free(argv);
     }
     if (pid < 0) {
         const int e = errno;
+        wasi_host_proc_exec_next(0);
         Perl_ck_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s",
                        what, Strerror(e));
         errno = e;

@@ -211,6 +211,8 @@ void tzset(void);
 int nice(int);
 int mkfifo(const char *, mode_t);
 char *ttyname(int);
+pid_t tcgetpgrp(int);
+int tcsetpgrp(int, pid_t);
 int lchown(const char *, uid_t, gid_t);
 
 /* The netdb ITERATION / by-net / by-serv / by-proto lookups: wasmify's netdb.h
