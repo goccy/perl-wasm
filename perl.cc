@@ -3105,10 +3105,16 @@ enum {
     GOPERL_TREE_NEWPVOP = 20,       /* [type][flags], then the string */
     GOPERL_TREE_NEWLOOPEX = 21,     /* [type][label op] */
     GOPERL_TREE_NEWLOOPOP = 22,     /* [flags][debuggable][expr][block] */
-    GOPERL_TREE_NEWUNOP_AUX = 23    /* [type][flags][first][kind] and the aux:
+    GOPERL_TREE_NEWUNOP_AUX = 23,   /* [type][flags][first][kind] and the aux:
                                      * kind 0 none, 1 a number in place of
                                      * the pointer, 2 the three fields of an
                                      * op_argcheck_aux */
+    GOPERL_TREE_PARSE_SUBSIGNATURE = 24, /* [flags] -> op */
+    GOPERL_TREE_NEWMYSUB = 25,      /* [floor][o][proto][attrs][block] -> cv */
+    GOPERL_TREE_CV_NAME = 26        /* [cv][0 get, 1 set][utf8][length], then
+                                     * the name for a set. get -> the address
+                                     * of the name the sub has by itself<<32 |
+                                     * length<<1 | utf8, or 0 */
 };
 
 
@@ -3806,6 +3812,9 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
         if (o->op_type == OP_ARGELEM)
             /* the index is kept where the pointer would be */
             w[GOPERL_OPREC_AUX_N] = (uint32_t)PTR2IV(cUNOP_AUXx(o)->op_aux);
+        if (o->op_type == OP_MULTIPARAM)
+            /* the op_multiparam_aux, which the host reads field by field */
+            w[GOPERL_OPREC_AUX] = (uint32_t)(uintptr_t)cUNOP_AUXx(o)->op_aux;
         if (o->op_type == OP_MULTIDEREF) {
             UNOP_AUX_item *items = cUNOP_AUXx(o)->op_aux;
             w[GOPERL_OPREC_AUX] = (uint32_t)(uintptr_t)items;
@@ -6351,6 +6360,30 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                 g_custom_built[o] = OPclass_UNOP_AUX;
             }
             return (uint64_t)(uintptr_t)o;
+        }
+        case GOPERL_TREE_PARSE_SUBSIGNATURE:
+            return (uint64_t)(uintptr_t)parse_subsignature((U32)w[0]);
+        case GOPERL_TREE_NEWMYSUB:
+            return (uint64_t)(uintptr_t)(SV *)newMYSUB((I32)w[0], GOPERL_W_OP(1),
+                                                       GOPERL_W_OP(2), GOPERL_W_OP(3),
+                                                       GOPERL_W_OP(4));
+        case GOPERL_TREE_CV_NAME: {
+            CV *cv = (CV *)GOPERL_W_SV(0);
+            if (w[1]) { /* CvNAME_HEK_set */
+                const char *name = (s && b > 16) ? s + 16 : "";
+                const I32 len = (I32)w[3];
+                U32 hash;
+                PERL_HASH(hash, name, len);
+                HEK *hek = share_hek(name, w[2] ? -len : len, hash);
+                if (CvNAMED(cv) && CvNAME_HEK(cv)) unshare_hek(CvNAME_HEK(cv));
+                ((XPVCV *)MUTABLE_PTR(SvANY(cv)))->xcv_gv_u.xcv_hek = hek;
+                CvNAMED_on(cv);
+                return 0;
+            }
+            HEK *hek = CvNAME_HEK(cv);
+            if (!hek) return 0;
+            return ((uint64_t)(uintptr_t)HEK_KEY(hek) << 32) |
+                   ((uint32_t)HEK_LEN(hek) << 1) | (HEK_UTF8(hek) ? 1u : 0u);
         }
         case GOPERL_TREE_NEWPVOP: { /* the string follows the two words; the
                  * op owns a copy */
