@@ -38,12 +38,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <langinfo.h>
 #include <locale.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unordered_map>
@@ -391,6 +393,15 @@ OP *builtin_fcntl(pTHX) {
     return next;
 }
 
+/* ioctl FILEHANDLE, FUNCTION, SCALAR: the number of the request, for the
+ * requests this C library answers. */
+OP *builtin_ioctl(pTHX) {
+    if (!active()) return behind(aTHX);
+    dSP;
+    slot_to_guest(aTHX_ SP - 1, FAMILY_ioctl);
+    return behind(aTHX);
+}
+
 /* socket SOCKET, DOMAIN, TYPE, PROTOCOL and socketpair SOCKET1, SOCKET2,
  * DOMAIN, TYPE, PROTOCOL. */
 OP *builtin_socket(pTHX) {
@@ -720,6 +731,16 @@ XS_INTERNAL(xsub_sigprocmask) {
     xsub(aTHX_ cv);
 }
 
+/* I18N::Langinfo::langinfo(item). */
+XS_INTERNAL(xsub_langinfo) {
+    const XSUBADDR_t xsub = xsub_behind(cv);
+    if (active()) {
+        const XsubCall call = xsub_call(aTHX);
+        if (call.items >= 1) slot_to_guest(aTHX_ xsub_slot(aTHX_ call, 0), FAMILY_langinfo);
+    }
+    xsub(aTHX_ cv);
+}
+
 /* POSIX::setlocale(category, locale). */
 XS_INTERNAL(xsub_setlocale) {
     const XSUBADDR_t xsub = xsub_behind(cv);
@@ -741,6 +762,7 @@ const struct {
     {"POSIX::sigaction", xsub_sigaction},
     {"POSIX::sigprocmask", xsub_sigprocmask},
     {"POSIX::setlocale", xsub_setlocale},
+    {"I18N::Langinfo::langinfo", xsub_langinfo},
     {"SDBM_File::TIEHASH", xsub_third_is_open_flags},
     {"IO::Poll::_poll", xsub_poll},
     {"POSIX::open", xsub_posix_open},
@@ -887,6 +909,7 @@ pid_t __wrap_waitpid(pid_t pid, int *status, int options) {
 void numbers_wrap_builtins(void) {
     wrap_builtin(OP_SYSOPEN, builtin_sysopen);
     wrap_builtin(OP_FCNTL, builtin_fcntl);
+    wrap_builtin(OP_IOCTL, builtin_ioctl);
     wrap_builtin(OP_SOCKET, builtin_socket);
     wrap_builtin(OP_SOCKPAIR, builtin_socket);
     wrap_builtin(OP_SSOCKOPT, builtin_sockopt);

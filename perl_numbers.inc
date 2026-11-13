@@ -907,3 +907,182 @@ NUMBER(fcntl, F_GETOWN)
 #ifdef F_SETOWN
 NUMBER(fcntl, F_SETOWN)
 #endif
+NUMBER_FAMILY(21, ioctl, ENUM)
+#ifdef FIONREAD
+NUMBER(ioctl, FIONREAD)
+#endif
+#ifdef FIONBIO
+NUMBER(ioctl, FIONBIO)
+#endif
+NUMBER_FAMILY(22, langinfo, ENUM)
+#ifdef ABDAY_1
+NUMBER(langinfo, ABDAY_1)
+#endif
+#ifdef ABDAY_2
+NUMBER(langinfo, ABDAY_2)
+#endif
+#ifdef ABDAY_3
+NUMBER(langinfo, ABDAY_3)
+#endif
+#ifdef ABDAY_4
+NUMBER(langinfo, ABDAY_4)
+#endif
+#ifdef ABDAY_5
+NUMBER(langinfo, ABDAY_5)
+#endif
+#ifdef ABDAY_6
+NUMBER(langinfo, ABDAY_6)
+#endif
+#ifdef ABDAY_7
+NUMBER(langinfo, ABDAY_7)
+#endif
+#ifdef ABMON_1
+NUMBER(langinfo, ABMON_1)
+#endif
+#ifdef ABMON_2
+NUMBER(langinfo, ABMON_2)
+#endif
+#ifdef ABMON_3
+NUMBER(langinfo, ABMON_3)
+#endif
+#ifdef ABMON_4
+NUMBER(langinfo, ABMON_4)
+#endif
+#ifdef ABMON_5
+NUMBER(langinfo, ABMON_5)
+#endif
+#ifdef ABMON_6
+NUMBER(langinfo, ABMON_6)
+#endif
+#ifdef ABMON_7
+NUMBER(langinfo, ABMON_7)
+#endif
+#ifdef ABMON_8
+NUMBER(langinfo, ABMON_8)
+#endif
+#ifdef ABMON_9
+NUMBER(langinfo, ABMON_9)
+#endif
+#ifdef ABMON_10
+NUMBER(langinfo, ABMON_10)
+#endif
+#ifdef ABMON_11
+NUMBER(langinfo, ABMON_11)
+#endif
+#ifdef ABMON_12
+NUMBER(langinfo, ABMON_12)
+#endif
+#ifdef ALT_DIGITS
+NUMBER(langinfo, ALT_DIGITS)
+#endif
+#ifdef AM_STR
+NUMBER(langinfo, AM_STR)
+#endif
+#ifdef CODESET
+NUMBER(langinfo, CODESET)
+#endif
+#ifdef CRNCYSTR
+NUMBER(langinfo, CRNCYSTR)
+#endif
+#ifdef DAY_1
+NUMBER(langinfo, DAY_1)
+#endif
+#ifdef DAY_2
+NUMBER(langinfo, DAY_2)
+#endif
+#ifdef DAY_3
+NUMBER(langinfo, DAY_3)
+#endif
+#ifdef DAY_4
+NUMBER(langinfo, DAY_4)
+#endif
+#ifdef DAY_5
+NUMBER(langinfo, DAY_5)
+#endif
+#ifdef DAY_6
+NUMBER(langinfo, DAY_6)
+#endif
+#ifdef DAY_7
+NUMBER(langinfo, DAY_7)
+#endif
+#ifdef D_FMT
+NUMBER(langinfo, D_FMT)
+#endif
+#ifdef D_T_FMT
+NUMBER(langinfo, D_T_FMT)
+#endif
+#ifdef ERA
+NUMBER(langinfo, ERA)
+#endif
+#ifdef ERA_D_FMT
+NUMBER(langinfo, ERA_D_FMT)
+#endif
+#ifdef ERA_D_T_FMT
+NUMBER(langinfo, ERA_D_T_FMT)
+#endif
+#ifdef ERA_T_FMT
+NUMBER(langinfo, ERA_T_FMT)
+#endif
+#ifdef MON_1
+NUMBER(langinfo, MON_1)
+#endif
+#ifdef MON_2
+NUMBER(langinfo, MON_2)
+#endif
+#ifdef MON_3
+NUMBER(langinfo, MON_3)
+#endif
+#ifdef MON_4
+NUMBER(langinfo, MON_4)
+#endif
+#ifdef MON_5
+NUMBER(langinfo, MON_5)
+#endif
+#ifdef MON_6
+NUMBER(langinfo, MON_6)
+#endif
+#ifdef MON_7
+NUMBER(langinfo, MON_7)
+#endif
+#ifdef MON_8
+NUMBER(langinfo, MON_8)
+#endif
+#ifdef MON_9
+NUMBER(langinfo, MON_9)
+#endif
+#ifdef MON_10
+NUMBER(langinfo, MON_10)
+#endif
+#ifdef MON_11
+NUMBER(langinfo, MON_11)
+#endif
+#ifdef MON_12
+NUMBER(langinfo, MON_12)
+#endif
+#ifdef NOEXPR
+NUMBER(langinfo, NOEXPR)
+#endif
+#ifdef NOSTR
+NUMBER(langinfo, NOSTR)
+#endif
+#ifdef PM_STR
+NUMBER(langinfo, PM_STR)
+#endif
+#ifdef RADIXCHAR
+NUMBER(langinfo, RADIXCHAR)
+#endif
+#ifdef THOUSEP
+NUMBER(langinfo, THOUSEP)
+#endif
+#ifdef T_FMT
+NUMBER(langinfo, T_FMT)
+#endif
+#ifdef T_FMT_AMPM
+NUMBER(langinfo, T_FMT_AMPM)
+#endif
+#ifdef YESEXPR
+NUMBER(langinfo, YESEXPR)
+#endif
+#ifdef YESSTR
+NUMBER(langinfo, YESSTR)
+#endif
