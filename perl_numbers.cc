@@ -211,19 +211,16 @@ long long enum_to_guest(int id, long long host) {
 
 /* ---- bits that are or-ed ---------------------------------------------------
  * Each bit (or group of bits: O_SYNC is two on linux) with a name on both
- * sides becomes the other side's; the groups with the most bits are looked
- * for first. A name whose value is 0 on one side (O_NOCTTY here) stands
- * for nothing there. Bits without a counterpart are reported in *unknown.
+ * sides becomes the other side's. Where one side has one bit for two names
+ * of the other (this C library's POLLIN is its POLLRDNORM; linux has a bit
+ * for each), the one bit becomes both: the caller that knows which were
+ * asked for keeps those (see xsub_poll). A name whose value is 0 on one
+ * side (O_NOCTTY here) stands for nothing there. Bits without a
+ * counterpart are reported in *unknown.
  *
  * The flags of open(2) hold a field that is not a set of bits, the access
  * mode: O_RDONLY, O_WRONLY and O_RDWR are values of the field O_ACCMODE
  * masks, and are translated as such. */
-int bit_count(long long v) {
-    int n = 0;
-    for (unsigned long long u = (unsigned long long)v; u; u &= u - 1) n++;
-    return n;
-}
-
 bool is_access_name(const char *name) {
     return strcmp(name, "O_RDONLY") == 0 || strcmp(name, "O_WRONLY") == 0 ||
            strcmp(name, "O_RDWR") == 0 || strcmp(name, "O_ACCMODE") == 0;
@@ -259,17 +256,23 @@ long long flags_translate(int id, long long value, bool to_host, long long *unkn
             rest &= ~from_mask;
         }
     }
-    for (int bits = 64; bits >= 1; bits--) {
-        for (const Pair &p : f.pairs) {
-            if (id == FAMILY_open && is_access_name(p.name)) continue;
-            const long long from = to_host ? p.guest : p.host;
-            if (from == 0 || bit_count(from) != bits || (rest & from) != from) continue;
-            out |= to_host ? p.host : p.guest;
-            rest &= ~from;
-        }
+    long long known = 0;
+    for (const Pair &p : f.pairs) {
+        if (id == FAMILY_open && is_access_name(p.name)) continue;
+        const long long from = to_host ? p.guest : p.host;
+        if (from == 0 || (rest & from) != from) continue;
+        out |= to_host ? p.host : p.guest;
+        known |= from;
     }
-    *unknown |= rest;
+    *unknown |= rest & ~known;
     return out;
+}
+
+/* The host's number under a name of a family; 0 when it has none. */
+long long host_number(int id, const char *name) {
+    for (const auto &h : family(id).host)
+        if (h.first == name) return h.second;
+    return 0;
 }
 
 Kind kind_of(int id) {
@@ -451,13 +454,27 @@ OP *builtin_sockopt(pTHX) {
     return next;
 }
 
+/* The flags a program gives send and recv. MSG_TRUNC and MSG_CTRUNC are
+ * left out: this C library has them only as what a receive reports, under
+ * a bit that is MSG_PEEK when given, and a receive asked to tell the real
+ * length of a datagram must not become one that leaves the datagram
+ * unread. */
+void message_flags_to_guest(pTHX_ SV **slot) {
+    SV *const sv = *slot;
+    SvGETMAGIC(sv);
+    if (!SvOK(sv)) return;
+    const long long reported = host_number(FAMILY_msg, "MSG_TRUNC") | host_number(FAMILY_msg, "MSG_CTRUNC");
+    const long long flags = (long long)SvIV_nomg(sv);
+    *slot = sv_2mortal(newSViv((IV)to_guest(FAMILY_msg, flags & ~reported)));
+}
+
 /* send SOCKET, MSG, FLAGS [, TO] and recv SOCKET, SCALAR, LENGTH, FLAGS:
  * the flags are the third and the fourth argument. */
 OP *builtin_send(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
     SV **const mark = PL_stack_base + TOPMARK;
-    if (SP - mark >= 3) slot_to_guest(aTHX_ mark + 3, FAMILY_msg);
+    if (SP - mark >= 3) message_flags_to_guest(aTHX_ mark + 3);
     return behind(aTHX);
 }
 
@@ -465,7 +482,7 @@ OP *builtin_recv(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
     SV **const mark = PL_stack_base + TOPMARK;
-    if (SP - mark >= 4) slot_to_guest(aTHX_ mark + 4, FAMILY_msg);
+    if (SP - mark >= 4) message_flags_to_guest(aTHX_ mark + 4);
     return behind(aTHX);
 }
 
@@ -537,7 +554,11 @@ SSize_t xsub_returned(pTHX_ const XsubCall &call) {
 }
 
 /* IO::Poll::_poll(timeout, fd, mask, fd, mask, ...): the masks are bits of
- * poll, and the XSUB writes the returned events over them. */
+ * poll, and the XSUB writes the returned events over them. The events of a
+ * descriptor are among those its mask asked for, and the three that are
+ * reported unasked: an event this C library has one bit for and the host
+ * two (readable: POLLIN and POLLRDNORM) comes back as the bits that were
+ * asked for. */
 XS_INTERNAL(xsub_poll) {
     const XSUBADDR_t xsub = xsub_behind(cv);
     if (!active()) {
@@ -545,14 +566,19 @@ XS_INTERNAL(xsub_poll) {
         return;
     }
     const XsubCall call = xsub_call(aTHX);
-    std::vector<SV *> masks;
+    const long long unasked = host_number(FAMILY_poll, "POLLERR") |
+                              host_number(FAMILY_poll, "POLLHUP") |
+                              host_number(FAMILY_poll, "POLLNVAL");
+    std::vector<std::pair<SV *, long long>> masks;
     for (SSize_t i = 2; i < call.items; i += 2) {
         SV *const mask = *xsub_slot(aTHX_ call, i);
-        sv_setiv(mask, (IV)to_guest(FAMILY_poll, (long long)SvIV(mask)));
-        masks.push_back(mask);
+        const long long asked = (long long)SvIV(mask);
+        sv_setiv(mask, (IV)to_guest(FAMILY_poll, asked));
+        masks.emplace_back(mask, asked);
     }
     xsub(aTHX_ cv);
-    for (SV *const mask : masks) sv_setiv(mask, (IV)to_host(FAMILY_poll, (long long)SvIV(mask)));
+    for (const auto &m : masks)
+        sv_setiv(m.first, (IV)(to_host(FAMILY_poll, (long long)SvIV(m.first)) & (m.second | unasked)));
 }
 
 /* POSIX::open(filename, flags = O_RDONLY, mode = 0666). */
