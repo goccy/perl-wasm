@@ -3495,6 +3495,10 @@ enum {
                  * written to: b = how<<32 | SV_GMAGIC or 0, how = 0 as it
                  * is, 1 UTF-8, 2 bytes -> (linear-memory ptr << 32) | len */
     GOPERL_SVCALL_CMP_LOCALE = 60, /* as CMP, by the rules of the locale */
+    GOPERL_SVCALL_AMAGIC = 61, /* amagic_call: the SV is the left operand, b
+                                * the right one | the method's index << 32 |
+                                * the AMGf_ flags << 40; the result, or 0
+                                * when the operator is not overloaded */
     GOPERL_SVCALL_AV_BODY = 59 /* the body of an array as it is in memory:
                  * (AvARRAY << 32) | the number of elements (AvFILLp + 1).
                  * Native code reads the slots there in one go. */
@@ -3737,6 +3741,8 @@ enum {
 #define GOPERL_PL_SRAND_CALLED 78
 #define GOPERL_PL_SV_COUNT 79       /* read only */
 #define GOPERL_PL_SIG_PENDING 80    /* read only */
+#define GOPERL_PL_FIRSTGV 81        /* the globs of $a and $b of a sort block */
+#define GOPERL_PL_SECONDGV 82
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -4509,6 +4515,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_DESTRUCT_LEVEL: return (uint64_t)(int64_t)PL_perl_destruct_level;
         case GOPERL_PL_LASTGV: return (uint64_t)(uintptr_t)PL_last_in_gv;
         case GOPERL_PL_COP_SEQMAX: return (uint64_t)PL_cop_seqmax;
+        case GOPERL_PL_FIRSTGV: return (uint64_t)(uintptr_t)PL_firstgv;
+        case GOPERL_PL_SECONDGV: return (uint64_t)(uintptr_t)PL_secondgv;
         }
         return 0;
     }
@@ -4545,6 +4553,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_COMPCV: PL_compcv = (CV *)val; return 0;
         case GOPERL_PL_RESTARTOP: PL_restartop = (OP *)(uintptr_t)(uint32_t)b; return 0;
         case GOPERL_PL_ERRORS: PL_errors = val; return 0;
+        case GOPERL_PL_FIRSTGV: PL_firstgv = (GV *)val; return 0;
+        case GOPERL_PL_SECONDGV: PL_secondgv = (GV *)val; return 0;
         }
         return 0;
     }
@@ -5845,6 +5855,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         case GOPERL_SVCALL_MAGIC_IS_VALUE:
             return PERL_MAGIC_TYPE_IS_VALUE_MAGIC((uint32_t)a) ? 1 : 0;
+        case GOPERL_SVCALL_AMAGIC:
+            return (uint64_t)(uintptr_t)amagic_call(sv, other, (int)(hi & 0xff), (int)(hi >> 8));
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
             SvOK_off(sv);
             return 0;
