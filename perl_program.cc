@@ -22,6 +22,7 @@
 extern "C" {
 #include <EXTERN.h>
 #include <perl.h>
+#include <perliol.h>
 }
 
 #include "perl_program.h"
@@ -95,6 +96,29 @@ static void program_incpush(pTHX_ AV *av, const std::string &dir) {
     av_push(av, newSVpvn(dir.data(), dir.size()));
 }
 
+/* Whether a standard handle is a terminal is decided when its buffer is
+ * made (PerlIOBuf_pushed): output to a terminal goes out line by line, and
+ * what is waiting for a terminal is written before input is read. The
+ * handles of this interpreter were made when the interpreter was, which
+ * may be a copy of one that was started with other streams; the program
+ * runs with the descriptors it has now, so the two flags are set from
+ * those. */
+static void program_standard_terminals(pTHX) {
+    PerlIO *const handles[] = {PerlIO_stdin(), PerlIO_stdout(), PerlIO_stderr()};
+    for (PerlIO *handle : handles) {
+        if (!handle || !PerlIOValid(handle)) continue;
+        const int fd = PerlIO_fileno(handle);
+        const bool terminal = fd >= 0 && PerlLIO_isatty(fd);
+        for (PerlIO *layer = handle; PerlIOValid(layer); layer = PerlIONext(layer)) {
+            if (!(PerlIOBase(layer)->tab->kind & PERLIO_K_BUFFERED)) continue;
+            if (terminal)
+                PerlIOBase(layer)->flags |= PERLIO_F_LINEBUF | PERLIO_F_TTY;
+            else
+                PerlIOBase(layer)->flags &= ~(PERLIO_F_LINEBUF | PERLIO_F_TTY);
+        }
+    }
+}
+
 /* The part of S_parse_body that follows the switch loop, with the switch
  * loop's effects taken from ps. Croaks like perl_parse does. */
 static void program_compile(pTHX_ const ProgramSpec &ps) {
@@ -110,6 +134,7 @@ static void program_compile(pTHX_ const ProgramSpec &ps) {
      * that was started long before (an instance made from a snapshot of
      * the process's first), and would otherwise keep that one's. */
     time(&PL_basetime);
+    program_standard_terminals(aTHX);
     PL_dowarn = G_WARN_OFF;
     PERL_SET_PHASE(PERL_PHASE_START);
 
