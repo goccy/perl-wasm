@@ -119,6 +119,14 @@ void boot_Want(pTHX_ CV *cv);
 void boot_YAML__XS__LibYAML(pTHX_ CV *cv);
 }
 
+/* The numbers of the operating system as the program sees them
+ * (perl_numbers.cc). */
+extern "C" {
+void numbers_wrap_builtins(void);
+void numbers_extension_booted(pTHX_ const char *module);
+void XS_Internals_host_numbers(pTHX_ CV *cv);
+}
+
 namespace {
 
 struct StaticExtension {
@@ -194,6 +202,16 @@ const StaticExtension static_extensions[] = {
 
 } /* namespace */
 
+/* <module>::bootstrap of a linked-in extension: its boot function, and
+ * then what follows a boot here (the numbers its constants show, see
+ * perl_numbers.cc). The sub holds the extension it boots. */
+XS(XS_static_extension_bootstrap) {
+    const StaticExtension *const ext =
+        static_cast<const StaticExtension *>(CvXSUBANY(cv).any_ptr);
+    ext->boot(aTHX_ cv);
+    numbers_extension_booted(aTHX_ ext->module);
+}
+
 /* DynaLoader::dl_static_boot(module): the boot function of a linked-in
  * extension, installed as <module>::bootstrap and returned as a code
  * reference; undef for a module that is not linked in.
@@ -211,7 +229,10 @@ XS(XS_DynaLoader_dl_static_boot) {
         if (strlen(ext.module) != len || memcmp(ext.module, module, len) != 0) continue;
         SV *const name = sv_2mortal(newSVpvf("%s::bootstrap", ext.module));
         CV *boot = get_cv(SvPV_nolen(name), 0);
-        if (!boot) boot = newXS(SvPV_nolen(name), ext.boot, __FILE__);
+        if (!boot) {
+            boot = newXS(SvPV_nolen(name), XS_static_extension_bootstrap, __FILE__);
+            CvXSUBANY(boot).any_ptr = const_cast<StaticExtension *>(&ext);
+        }
         ST(0) = sv_2mortal(newRV_inc((SV *)boot));
         XSRETURN(1);
     }
@@ -297,6 +318,7 @@ static void xs_init(pTHX) {
     newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
     newXS("DynaLoader::dl_static_boot", XS_DynaLoader_dl_static_boot, file);
     newXS("Internals::site_directories", XS_Internals_site_directories, file);
+    newXS("Internals::host_numbers", XS_Internals_host_numbers, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */
@@ -1515,6 +1537,8 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_ar
         perl5opt = perl5opt_env;
         unsetenv("PERL5OPT");
     }
+    /* before anything is compiled: an op is given its routine then */
+    numbers_wrap_builtins();
     const int parse_failed =
         perl_parse(g_my_perl, xs_init, argc, argv, nullptr);
     if (had_perl5opt) setenv("PERL5OPT", perl5opt.c_str(), 1);

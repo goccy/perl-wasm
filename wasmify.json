@@ -64,7 +64,9 @@
       "-Wl,--wrap=unsetenv",
       "-Wl,--wrap=putenv",
       "-Wl,--wrap=clearenv",
-      "-Wl,--wrap=setlocale"
+      "-Wl,--wrap=setlocale",
+      "-Wl,--wrap=waitpid",
+      "-Wl,--wrap=strerror"
     ]
   },
   "user_selection": {
@@ -79,6 +81,7 @@
       "perl_process.cc",
       "perl_signal.cc",
       "perl_libc.cc",
+      "perl_numbers.cc",
       "perl_syslog.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",

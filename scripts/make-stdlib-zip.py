@@ -70,6 +70,12 @@ The path of the perl command (perlpath, and startperl, the #! line for a
 program that is installed) is $^X when that is an absolute path: the
 embedding application sets $^X to what runs it as perl, if anything does.
 
+The error numbers of Errno are those the program sees. Errno.pm holds the
+numbers of the C library perl was built with; a program that is shown the
+numbers of the system it runs on (see perl_numbers.cc) gets that system's
+names and numbers there too: the shipped Errno.pm asks the interpreter for
+them (Internals::host_numbers) when it is loaded. See present_errno.
+
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
 
@@ -164,6 +170,43 @@ CONFIG_HEAVY_LIBDIR = """\
         $set->('perlpath', $^X);
         $set->('startperl', "#!$^X");
     }
+    # The signals have the numbers the program is shown, when those are
+    # another system's than the build's: the names in the order of their
+    # numbers (a number without a name is NUMnn), then the second names of
+    # numbers that have two, as Configure lists them.
+    my @signals = Internals::host_numbers('signal');
+    my %built;
+    {
+        my @names = /^sig_name='(.*)'$/m ? split(' ', $1) : ();
+        my @numbers = /^sig_num='(.*)'$/m ? split(' ', $1) : ();
+        @built{@names} = @numbers;
+    }
+    my %shown;
+    for (my $i = 0; $i < @signals; $i += 2) {
+        (my $name = $signals[$i]) =~ s/\\ASIG//;
+        $shown{$name} = $signals[$i + 1];
+    }
+    # (a system that numbers them as the build does keeps the build's list,
+    # which has the real-time signals too)
+    if (grep { exists $built{$_} && $built{$_} != $shown{$_} } keys %shown) {
+        my (@name, @alias);
+        while (my ($name, $number) = splice(@signals, 0, 2)) {
+            $name =~ s/\\ASIG//;
+            if (defined $name[$number]) { push @alias, [$name, $number] }
+            else { $name[$number] = $name }
+        }
+        $name[0] = 'ZERO';
+        my @names = map { $name[$_] // "NUM$_" } 0 .. $#name;
+        my @numbers = (0 .. $#name);
+        push @names, map { $_->[0] } @alias;
+        push @numbers, map { $_->[1] } @alias;
+        $set->('sig_name', join(' ', @names) . ' ');
+        $set->('sig_num', join(' ', @numbers) . ' ');
+        $set->('sig_name_init', join(', ', (map { qq{"$_"} } @names), 0));
+        $set->('sig_num_init', join(', ', @numbers, 0));
+        $set->('sig_count', scalar @name);
+        $set->('sig_size', scalar @names);
+    }
 }
 """
 
@@ -179,6 +222,39 @@ def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
     if count != 1:
         raise SystemExit(f"make-stdlib-zip: {what}: {count} matches, expected 1")
     return result
+
+
+# What Errno.pm does once it has the table of the build: the table of the
+# system the program is shown the numbers of takes its place, when there is
+# one.
+ERRNO_PM_HOST = """\
+    # The names and numbers of the system whose numbers the program is
+    # shown, when the interpreter shows it another system's than those of
+    # the C library it was built with (the table above).
+    if (my %host = Internals::host_numbers('errno')) {
+        %err = %host;
+    }
+"""
+
+# The names of the POSIX tag are those the table has.
+ERRNO_PM_TAGS = """\
+@{ $EXPORT_TAGS{POSIX} } = grep { exists $err{$_} } @{ $EXPORT_TAGS{POSIX} };
+
+"""
+
+
+def present_errno(text: str) -> str:
+    """Returns Errno.pm with the table taken from the interpreter when it
+    shows the program the numbers of another system (see the module
+    docstring)."""
+    start = text.find("\nBEGIN {\n    %err = (\n")
+    end = text.find("\n    );\n", start)
+    if start < 0 or end < 0:
+        raise SystemExit("make-stdlib-zip: Errno.pm: the table was not found")
+    end += len("\n    );\n")
+    text = text[:end] + ERRNO_PM_HOST + text[end:]
+    return replace_once(text, r"^sub TIEHASH \{ bless \\%err \}$",
+                        ERRNO_PM_TAGS + "sub TIEHASH { bless \\%err }", "Errno.pm: TIEHASH")
 
 
 def relocate_config(rel_path: str, data: bytes) -> bytes:
@@ -199,6 +275,8 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
             text = replace_once(text, rf"^    {key} => '[^'\n]*',$",
                                 f"    {key} => $site{{{key}}} // {match.group(1)},", f"Config.pm: {key}")
         return text.encode("utf-8")
+    if rel_path == "Errno.pm":
+        return present_errno(data.decode("utf-8")).encode("utf-8")
     if rel_path == "Config_heavy.pl":
         text = data.decode("utf-8")
         # The text of config.sh is the here-document assigned to $_ through

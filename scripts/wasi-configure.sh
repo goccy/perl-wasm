@@ -867,6 +867,42 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"native-mechanism patch applied to {path}")
 PYPATCH
+# ---- $! and the status of a die are numbers the program sees ------------------
+# errno holds the error numbers of this C library. A program that is the
+# host process is shown the host's numbers (perl_numbers.cc), so the three
+# places where errno becomes a value of the program or the reverse go
+# through host_errno_of and guest_errno_of (declared in wasi-posix-shim.h,
+# which every file is compiled with): reading $!, assigning to $! and to
+# $^E, and the exit status of a die, which is the error number. Without host
+# numbering the two return what they are given. Idempotent.
+python3 - <<'PYPATCH'
+def patch(path, edits):
+    t = open(path).read()
+    if "host_errno_of" in t or "guest_errno_of" in t:
+        print(f"error numbers of the program already present in {path}")
+        return
+    for old, new in edits:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"error numbers of the program applied to {path}")
+
+patch("mg.c", [
+    ("            sv_setnv(sv, (NV)errno);\n#endif\n#ifdef OS2\n",
+     "            sv_setnv(sv, (NV)host_errno_of(errno));\n#endif\n#ifdef OS2\n"),
+    ("        SETERRNO(SvIOK(sv) ? SvIVX(sv) : SvOK(sv) ? sv_2iv(sv) : 0,\n"
+     "                 (SvIV(sv) == EVMSERR) ? 4 : PERL_VMS_BANG);\n#endif\n        }\n",
+     "        SETERRNO(guest_errno_of(SvIOK(sv) ? SvIVX(sv) : SvOK(sv) ? sv_2iv(sv) : 0),\n"
+     "                 (SvIV(sv) == EVMSERR) ? 4 : PERL_VMS_BANG);\n#endif\n        }\n"),
+    ("            SETERRNO(SvIV(sv), 4);\n",
+     "            SETERRNO(guest_errno_of(SvIV(sv)), 4);\n"),
+])
+patch("perl.c", [
+    ("    int eno = errno;\n    if (eno & 255)\n",
+     "    int eno = host_errno_of(errno);\n    if (eno & 255)\n"),
+])
+PYPATCH
+
 # ---- XSLoader, DynaLoader: linked-in extensions are found when loaded ---------
 # A statically linked perl registers <Module>::bootstrap for every linked-in
 # extension at start-up, and the two loaders look for that sub. This build

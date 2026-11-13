@@ -160,6 +160,13 @@ struct sockaddr_un {
 extern "C" {
 #endif
 
+/* The number the program sees for an error number of this C library, and
+ * the C library's for one the program gives (perl_numbers.cc): what $! and
+ * the status of a die pass through (the patch to mg.c and perl.c in
+ * wasi-configure.sh). */
+int host_errno_of(int guest_errno);
+int guest_errno_of(long long host_errno);
+
 mode_t umask(mode_t);
 /* The real-time interval timer. wasi-libc guards setitimer, getitimer and
  * their types out of <sys/time.h> ("WASI has no getitimer") and shows ualarm
