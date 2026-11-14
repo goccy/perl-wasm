@@ -3720,7 +3720,10 @@ enum {
     GOPERL_PIO_GET_BUFSIZ = 28,
     GOPERL_PIO_SET_PTRCNT = 29,
     GOPERL_PIO_FILL = 30,
-    GOPERL_PIO_APPLY_LAYERS = 31
+    GOPERL_PIO_APPLY_LAYERS = 31,
+    GOPERL_PIO_LAYERS = 32 /* -> the address of [n] and, for each layer from
+                            * the top, [the address of its next field][the
+                            * address of its name][its kind][its flags] */
 };
 
 /* SAVE_MISC selectors. */
@@ -6639,6 +6642,18 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return (uint64_t)(uintptr_t)IoOFP(io);
         }
         case GOPERL_PIO_VALID: return PerlIOValid(f) ? 1 : 0;
+        case GOPERL_PIO_LAYERS: {
+            static std::vector<uint32_t> w;
+            w.assign(1, 0);
+            for (PerlIO *l = f; l && *l; l = PerlIONext(l)) {
+                w.push_back((uint32_t)(uintptr_t)PerlIONext(l));
+                w.push_back((uint32_t)(uintptr_t)(*l)->tab->name);
+                w.push_back((uint32_t)(*l)->tab->kind);
+                w.push_back((uint32_t)(*l)->flags);
+                w[0]++;
+            }
+            return (uint64_t)(uintptr_t)w.data();
+        }
         }
         /* Everything below works on an open handle; on anything else it
          * fails the way the function does on a closed one. */
