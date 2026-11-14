@@ -436,12 +436,6 @@ static int32_t g_go_cb = 0;
  * enclosing guest scope pops (normally or during die unwinding). */
 #define GOPERL_DTOR_METHOD_ID (-4)
 
-/* Reserved callback method id for host-side set-magic: when a guest SV whose
- * anchor was upgraded via op SV_MAGIC_SET_HOOK has its value assigned, the
- * guest forwards the u32 host id so the host can run the svt_set hooks of
- * its mirror MAGIC chain (e.g. Moose's re-export flag magic, which clears
- * itself when the glob is overwritten). */
-#define GOPERL_MG_SET_METHOD_ID (-5)
 /* `local` on an SV that carries the anchor: the payload is the anchor's
  * host id and the token of the SV that takes the variable's place. */
 #define GOPERL_MG_LOCAL_METHOD_ID (-8)
@@ -468,11 +462,16 @@ enum {
     GOPERL_HOST_UVAR = 5,   /* a function of uvar magic: [is_set][arg][sv][key] -> [key][result] */
     GOPERL_HOST_FILTER = 6, /* a source filter: [id][idx][buf][maxlen] -> [result] */
     GOPERL_HOST_RUNOPS = 7, /* a run loop: [id] */
-    GOPERL_HOST_BHK = 8     /* a block hook: [id][which][arg] -> [op] */
+    GOPERL_HOST_BHK = 8,    /* a block hook: [id][which][arg] -> [op] */
+    GOPERL_HOST_INFIX = 9   /* an infix operator of native code: [0][def lo][def
+                             * hi][opdata] -> [opdata] (its parse), or [1][def
+                             * lo][def hi][opdata][lhs][rhs] -> [opdata][op]
+                             * (its build_op) */
 };
 /* The hooks of GOPERL_HOST_MAGIC, and the bits of an anchor's mask. */
 enum {
     GOPERL_MGHOOK_GET = 0,
+    GOPERL_MGHOOK_SET = 1,
     GOPERL_MGHOOK_LEN = 2,
     GOPERL_MGHOOK_CLEAR = 3,
     GOPERL_MGHOOK_COPY = 4
@@ -634,6 +633,48 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
     return (*g_next_keyword_plugin)(aTHX_ keyword_ptr, keyword_len, op_ptr);
 }
 
+/* An infix operator of native code: what this interpreter is given is a
+ * struct of its own for each of the module's, whose functions ask the host
+ * to run the module's (GOPERL_HOST_INFIX). The structs last as long as the
+ * interpreter, as the modules' static ones do. */
+struct goperl_infix_def {
+    struct Perl_custom_infix def; /* first: perl hands this pointer back */
+    uint64_t host;                /* the module's struct */
+};
+static std::unordered_map<uint64_t, goperl_infix_def *> g_infix_defs;
+static unsigned char *goperl_host_call(pTHX_ uint32_t kind, const uint32_t *words,
+                                       uint32_t nwords, uint32_t *rlen);
+static void goperl_infix_parse(pTHX_ SV **opdata, struct Perl_custom_infix *def) {
+    const uint64_t host = ((goperl_infix_def *)def)->host;
+    const uint32_t words[4] = {0, (uint32_t)host, (uint32_t)(host >> 32),
+                               (uint32_t)(uintptr_t)*opdata};
+    uint32_t rlen = 0;
+    unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_INFIX, words, 4, &rlen);
+    if (rlen >= 5) {
+        uint32_t tok = 0;
+        memcpy(&tok, resp + 1, 4);
+        *opdata = (SV *)(uintptr_t)tok;
+    }
+    free(resp);
+}
+static OP *goperl_infix_build(pTHX_ SV **opdata, OP *lhs, OP *rhs,
+                              struct Perl_custom_infix *def) {
+    const uint64_t host = ((goperl_infix_def *)def)->host;
+    const uint32_t words[6] = {1, (uint32_t)host, (uint32_t)(host >> 32),
+                               (uint32_t)(uintptr_t)*opdata, (uint32_t)(uintptr_t)lhs,
+                               (uint32_t)(uintptr_t)rhs};
+    uint32_t rlen = 0;
+    unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_INFIX, words, 6, &rlen);
+    uint32_t tok = 0, op = 0;
+    if (rlen >= 9) {
+        memcpy(&tok, resp + 1, 4);
+        memcpy(&op, resp + 5, 4);
+        *opdata = (SV *)(uintptr_t)tok;
+    }
+    free(resp);
+    return (OP *)(uintptr_t)op;
+}
+
 static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
                                   struct Perl_custom_infix **def) {
     if (g_go_cb && oplen > 0 && oplen < 256) {
@@ -641,8 +682,10 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
         uint32_t kind = 1;
         memcpy(buf, &kind, 4);
         memcpy(buf + 4, opname, oplen);
+        goperl_native_enter(aTHX);
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 4 + (uint32_t)oplen);
+        goperl_native_leave();
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
         uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
@@ -657,6 +700,28 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
                 msg[ml] = '\0';
                 free(resp);
                 Perl_croak(aTHX_ "%s", msg);
+            }
+            /* claimed: [1][1][length u32][the module's struct u64][prec
+             * u32][has parse u8] */
+            if (resp_len >= 19 && resp[1]) {
+                uint32_t len = 0, prec = 0;
+                uint64_t host = 0;
+                memcpy(&len, resp + 2, 4);
+                memcpy(&host, resp + 6, 8);
+                memcpy(&prec, resp + 14, 4);
+                const bool has_parse = resp[18] != 0;
+                free(resp);
+                goperl_infix_def *&d = g_infix_defs[host];
+                if (!d) {
+                    d = (goperl_infix_def *)calloc(1, sizeof *d);
+                    if (!d) Perl_croak(aTHX_ "Out of memory!");
+                    d->host = host;
+                }
+                d->def.prec = (enum Perl_custom_infix_precedence)prec;
+                d->def.parse = has_parse ? goperl_infix_parse : NULL;
+                d->def.build_op = goperl_infix_build;
+                *def = &d->def;
+                return (STRLEN)len;
             }
             free(resp);
         }
@@ -2811,21 +2876,6 @@ static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
     return 0;
 }
 
-/* Set magic of the anchor: assigning to the SV fires the host id over
- * GOPERL_MG_SET_METHOD_ID so mirror svt_set hooks run. */
-static int goperl_host_mg_set(pTHX_ SV *sv, MAGIC *mg) {
-    PERL_UNUSED_ARG(sv);
-    if (g_go_cb != 0) {
-        uint32_t id = (uint32_t)(uintptr_t)mg->mg_ptr;
-        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_SET_METHOD_ID,
-                                             &id, sizeof(id));
-        if (rc == GOPERL_CALLBACK_JUMPED) return 0;
-        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
-    }
-    return 0;
-}
-
 static unsigned char *goperl_host_call(pTHX_ uint32_t kind, const uint32_t *words,
                                        uint32_t nwords, uint32_t *rlen);
 
@@ -2847,6 +2897,13 @@ static uint32_t goperl_host_mg_hook(pTHX_ uint32_t hook, SV *sv, SV *nsv,
 static int goperl_host_mg_get(pTHX_ SV *sv, MAGIC *mg) {
     PERL_UNUSED_ARG(mg);
     return (int)goperl_host_mg_hook(aTHX_ GOPERL_MGHOOK_GET, sv, NULL, NULL, 0);
+}
+/* Set magic of the anchor: the svt_set hooks of the SV's mirror chain run
+ * (Moose's re-export flag magic clears itself when the glob is
+ * overwritten); a hook that croaks dies here, as in perl's mg_set. */
+static int goperl_host_mg_set(pTHX_ SV *sv, MAGIC *mg) {
+    PERL_UNUSED_ARG(mg);
+    return (int)goperl_host_mg_hook(aTHX_ GOPERL_MGHOOK_SET, sv, NULL, NULL, 0);
 }
 static U32 goperl_host_mg_len(pTHX_ SV *sv, MAGIC *mg) {
     PERL_UNUSED_ARG(mg);
@@ -3512,6 +3569,10 @@ enum {
     GOPERL_CALL_SV_PEEK = 23,   /* a = the SV -> the address of sv_peek's text */
     GOPERL_CALL_SV_RECODE = 24, /* a = the SV, b = the encoding -> the address of
                                  * the string after, or 0 */
+    GOPERL_CALL_CASEMAP = 25,   /* a = which (0 upper, 1 lower, 2 title, 3 fold),
+                                 * b = a code point -> the address of [the first
+                                 * code point of the result u32][its length in
+                                 * bytes u32][its UTF-8 bytes] */
     GOPERL_CALL_ASYNC = 16   /* what is pending is delivered, as between ops
                               * -> 1 when a handler died (the error is $@) */
 };
@@ -3877,7 +3938,18 @@ enum {
     GOPERL_LEX_UNSTUFF = 6,
     GOPERL_LEX_GROW_LINESTR = 7,
     GOPERL_LEX_NEXT_CHUNK = 8,
-    GOPERL_LEX_DISCARD_TO = 9
+    GOPERL_LEX_DISCARD_TO = 9,
+    /* the scanning functions perl gives B::Hooks::Parser (PERL_EXT); b is
+     * the address in the buffer to scan from */
+    GOPERL_LEX_SCAN_WORD = 10, /* s = [destlen][allow_package] -> the address
+                                * of [the address after the word][its length]
+                                * [the word] */
+    GOPERL_LEX_SCAN_STR = 11,  /* s = [keep_quoted][keep_delims][re_reparse] ->
+                                * the address of [the address after the
+                                * string, or 0][the address of the closing
+                                * delimiter]; the string is the parser's
+                                * lex_stuff */
+    GOPERL_LEX_SKIPSPACE = 12  /* s = [flags] -> the address after the space */
 };
 enum {
     GOPERL_PARSE_BLOCK = 0,
@@ -4039,6 +4111,10 @@ enum {
 #define GOPERL_PL_STATNAME 106
 #define GOPERL_PL_CURSTACK 107      /* read only */
 #define GOPERL_PL_MAINSTACK 108     /* read only */
+#define GOPERL_PL_IN_CLEAN_OBJS 109 /* read only */
+#define GOPERL_PL_IN_CLEAN_ALL 110  /* read only */
+#define GOPERL_PL_ORIGARGC 111      /* read only */
+#define GOPERL_PL_ORIGARGV 112      /* read only: the address of the vector */
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -5282,6 +5358,10 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_STATNAME: return (uint64_t)(uintptr_t)PL_statname;
         case GOPERL_PL_CURSTACK: return (uint64_t)(uintptr_t)(SV *)PL_curstack;
         case GOPERL_PL_MAINSTACK: return (uint64_t)(uintptr_t)(SV *)PL_mainstack;
+        case GOPERL_PL_IN_CLEAN_OBJS: return PL_in_clean_objs ? 1 : 0;
+        case GOPERL_PL_IN_CLEAN_ALL: return PL_in_clean_all ? 1 : 0;
+        case GOPERL_PL_ORIGARGC: return (uint64_t)(int64_t)PL_origargc;
+        case GOPERL_PL_ORIGARGV: return (uint64_t)(uintptr_t)PL_origargv;
         }
         return 0;
     }
@@ -6125,6 +6205,42 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_LEX_DISCARD_TO: /* b = an address in the buffer */
             lex_discard_to((char *)(uintptr_t)(uint32_t)b);
             return 0;
+        case GOPERL_LEX_SCAN_WORD: {
+            static struct {
+                uint32_t end;
+                uint32_t len;
+                char word[256];
+            } r;
+            uint32_t w[2] = {0, 0};
+            if (s) memcpy(w, s, sizeof w);
+            STRLEN destlen = w[0] < sizeof r.word ? w[0] : sizeof r.word;
+            STRLEN len = 0;
+            char *end = Perl_scan_word(aTHX_ (char *)(uintptr_t)(uint32_t)b, r.word,
+                                       destlen, (int)w[1], &len);
+            r.end = (uint32_t)(uintptr_t)end;
+            r.len = (uint32_t)len;
+            return (uint64_t)(uintptr_t)&r;
+        }
+        case GOPERL_LEX_SCAN_STR: {
+            static struct {
+                uint32_t end;
+                uint32_t delim;
+            } r;
+            uint32_t w[3] = {0, 0, 0};
+            if (s) memcpy(w, s, sizeof w);
+            char *delim = NULL;
+            char *end = Perl_scan_str(aTHX_ (char *)(uintptr_t)(uint32_t)b, (int)w[0],
+                                      (int)w[1], (int)w[2], &delim);
+            r.end = (uint32_t)(uintptr_t)end;
+            r.delim = (uint32_t)(uintptr_t)delim;
+            return (uint64_t)(uintptr_t)&r;
+        }
+        case GOPERL_LEX_SKIPSPACE: {
+            uint32_t flags = 0;
+            if (s) memcpy(&flags, s, sizeof flags);
+            return (uint64_t)(uintptr_t)Perl_skipspace_flags(
+                aTHX_ (char *)(uintptr_t)(uint32_t)b, (U32)flags);
+        }
         }
         Perl_croak(aTHX_ "goperl: unknown lexer call %d", (int)a);
     }
@@ -7179,6 +7295,25 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                 return (uint64_t)(uintptr_t)w;
             }
             return 0;
+        }
+        case GOPERL_CALL_CASEMAP: {
+            static struct {
+                uint32_t first;
+                uint32_t len;
+                U8 bytes[UTF8_MAXBYTES_CASE + 1];
+            } r;
+            const UV cp = (UV)b;
+            STRLEN len = 0;
+            UV first;
+            switch ((uint32_t)a) {
+            case 0: first = toUPPER_uvchr(cp, r.bytes, &len); break;
+            case 1: first = toLOWER_uvchr(cp, r.bytes, &len); break;
+            case 2: first = toTITLE_uvchr(cp, r.bytes, &len); break;
+            default: first = toFOLD_uvchr(cp, r.bytes, &len); break;
+            }
+            r.first = (uint32_t)first;
+            r.len = (uint32_t)len;
+            return (uint64_t)(uintptr_t)&r;
         }
         case GOPERL_CALL_UVAR: { /* b bit 0: the module has uf_val, bit 1:
                  * uf_set */
