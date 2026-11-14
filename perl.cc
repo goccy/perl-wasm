@@ -5598,7 +5598,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         const svtype t = SvTYPE(sv);
         switch ((int)(a >> 32)) {
         case GOPERL_SVSLOT_RV:
-            return SvROK(sv) ? (uint64_t)(uintptr_t)SvRV(sv) : 0;
+            /* the slot itself, as SvRV reads it, whatever the flags say:
+             * it still holds the target after SvROK_off, and code that
+             * reads it from a reference that was just freed gets what
+             * perl gives it there (Doubly::Linked does). */
+            return (uint64_t)(uintptr_t)sv->sv_u.svu_rv;
         case GOPERL_SVSLOT_STASH:
             return t >= SVt_PVMG ? (uint64_t)(uintptr_t)(SV *)SvSTASH(sv) : 0;
         case GOPERL_SVSLOT_IV:
