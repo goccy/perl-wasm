@@ -28,6 +28,8 @@
 #include "scripts/include/termios.h"
 #include <time.h>
 #include <unistd.h>
+#include <vector>
+#include <poll.h>
 #include <wasi/api.h>
 
 /* the prototypes perl is compiled with (struct netent and friends too) */
@@ -884,6 +886,132 @@ struct protoent *getprotobynumber(int number) {
     for (size_t i = 0; i < protocol_count; i++)
         if (protocols[i].p_proto == number) return &protocols[i];
     return NULL;
+}
+
+/* ---- poll(2) ---------------------------------------------------------------
+ * poll over poll_oneoff, as wasi-libc's ppoll, except that a descriptor asked
+ * for neither reading nor writing is still watched for the events poll
+ * reports whether asked or not: POLLNVAL (it is not open), POLLERR and
+ * POLLHUP (its peer has hung up). wasi-libc refuses such a descriptor
+ * (ENOSYS: it builds one subscription per POLLRDNORM and POLLWRNORM), and a
+ * program that turns reading off for a while passes one: Danga::Socket's
+ * poll loop asks POLLERR|POLLHUP|POLLNVAL of a client it has stopped
+ * reading, got -1 for every wait and spun (Perlbal).
+ *
+ * Such a descriptor gets a subscription for reading whose readiness is not
+ * reported, as it was not asked for: only its error (POLLNVAL, POLLERR) and
+ * the event's hang-up flag (POLLHUP). When a wait ends with nothing to
+ * report but such readiness — the descriptor has input nobody asked about —
+ * the wait goes on without that subscription for what is left of the
+ * timeout, as poll(2) would not have returned. */
+/* What a subscription of poll's is for, in the low bits of its userdata
+ * (the descriptor's index is above them). */
+static const uint64_t POLL_READ = 0, POLL_WRITE = 1, POLL_UNASKED = 2;
+
+static uint64_t poll_userdata(size_t index, uint64_t kind) { return (uint64_t)index << 2 | kind; }
+
+/* The monotonic clock, in nanoseconds. */
+static uint64_t poll_now(void) {
+    __wasi_timestamp_t now = 0;
+    (void)__wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &now);
+    return now;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
+    /* A descriptor whose unasked readiness ended a wait: left out of the
+     * waits that follow. */
+    std::vector<bool> quiet(nfds, false);
+    const bool bounded = timeout >= 0;
+    const uint64_t deadline = bounded ? poll_now() + (uint64_t)timeout * 1000000 : 0;
+    std::vector<__wasi_subscription_t> subs;
+    std::vector<__wasi_event_t> events;
+    for (;;) {
+        subs.clear();
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd < 0) continue;
+            /* POLLPRI is never reported: nothing here has priority data */
+            const short asked = fds[i].events & ~POLLPRI;
+            __wasi_subscription_t sub = {};
+            if (asked & POLLRDNORM) {
+                sub.userdata = poll_userdata(i, POLL_READ);
+                sub.u.tag = __WASI_EVENTTYPE_FD_READ;
+                sub.u.u.fd_read.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+            if (asked & POLLWRNORM) {
+                sub.userdata = poll_userdata(i, POLL_WRITE);
+                sub.u.tag = __WASI_EVENTTYPE_FD_WRITE;
+                sub.u.u.fd_write.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+            if (!(asked & (POLLRDNORM | POLLWRNORM)) && !quiet[i]) {
+                sub.userdata = poll_userdata(i, POLL_UNASKED);
+                sub.u.tag = __WASI_EVENTTYPE_FD_READ;
+                sub.u.u.fd_read.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+        }
+        const bool watched = !subs.empty();
+        if (bounded || (!watched && nfds > 0)) {
+            /* The timeout; with nothing left to watch and none given, a
+             * wait a signal ends, as poll(2) waits on descriptors that
+             * report nothing. */
+            const uint64_t now = poll_now();
+            __wasi_subscription_t sub = {};
+            sub.userdata = UINT64_MAX;
+            sub.u.tag = __WASI_EVENTTYPE_CLOCK;
+            sub.u.u.clock.id = __WASI_CLOCKID_MONOTONIC;
+            sub.u.u.clock.timeout = bounded ? (deadline > now ? deadline - now : 0) : (uint64_t)1 << 62;
+            subs.push_back(sub);
+        }
+        if (subs.empty()) {
+            /* nothing at all to wait for: as wasi-libc */
+            errno = ENOTSUP;
+            return -1;
+        }
+        events.resize(subs.size());
+        size_t nevents = 0;
+        const __wasi_errno_t error = __wasi_poll_oneoff(subs.data(), events.data(), subs.size(), &nevents);
+        if (error != 0) {
+            errno = error;
+            return -1;
+        }
+        bool expired = false;
+        for (size_t e = 0; e < nevents; e++) {
+            const __wasi_event_t &ev = events[e];
+            if (ev.type == __WASI_EVENTTYPE_CLOCK) {
+                expired = expired || bounded;
+                continue;
+            }
+            const size_t i = (size_t)(ev.userdata >> 2);
+            const uint64_t kind = ev.userdata & 3;
+            if (i >= nfds) continue;
+            struct pollfd &p = fds[i];
+            if (ev.error == __WASI_ERRNO_BADF) {
+                p.revents |= POLLNVAL;
+            } else if (ev.error == __WASI_ERRNO_PIPE) {
+                p.revents |= POLLHUP;
+            } else if (ev.error != 0) {
+                p.revents |= POLLERR;
+            } else {
+                const bool hangup = (ev.fd_readwrite.flags & __WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0;
+                if (kind == POLL_READ) p.revents |= POLLRDNORM;
+                if (kind == POLL_WRITE) p.revents |= POLLWRNORM;
+                if (hangup) p.revents |= POLLHUP;
+                /* readable, and nobody asked: not an event of poll's */
+                if (kind == POLL_UNASKED && !hangup) quiet[i] = true;
+            }
+        }
+        int ready = 0;
+        for (nfds_t i = 0; i < nfds; i++) {
+            /* POLLHUP contradicts POLLWRNORM */
+            if (fds[i].revents & POLLHUP) fds[i].revents &= ~POLLWRNORM;
+            if (fds[i].revents) ready++;
+        }
+        if (ready > 0 || expired) return ready;
+        if (bounded && poll_now() >= deadline) return 0;
+    }
 }
 
 } /* extern "C" */
