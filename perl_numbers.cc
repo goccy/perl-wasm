@@ -20,7 +20,9 @@
  *     numbers into the C library's and the results back
  *     (numbers_wrap_builtins, numbers_extension_booted);
  *   - the status of a child ($?), whose low bits are a signal number: where
- *     waitpid hands it to the interpreter (the link wraps waitpid).
+ *     waitpid hands it to the interpreter (the link wraps waitpid);
+ *   - the packed socket addresses, which are structures with a family number
+ *     in them: see "socket addresses" below.
  *
  * One table drives all of it. perl_numbers.inc lists the families and, per
  * family, the names this C library defines, with its values; the host gives
@@ -83,6 +85,13 @@ int wasi_host_fd_ioctl(int fd, unsigned int request, int buffer, uintptr_t arg,
  * __wrap_waitpid and __wrap_strerror, below */
 pid_t __real_waitpid(pid_t pid, int *status, int options);
 char *__real_strerror(int number);
+
+/* A socket address of this C library as the host's C library has it, and
+ * the reverse (wasmify's host sockets). 0 or an errno. */
+int __wasmify_sockaddr_to_host(const struct sockaddr *addr, socklen_t addrlen, void *out,
+                               size_t cap, size_t *out_len);
+int __wasmify_sockaddr_from_host(const void *raw, size_t len, struct sockaddr *out,
+                                 socklen_t *out_len);
 }
 
 namespace {
@@ -346,6 +355,67 @@ void slot_to_guest(pTHX_ SV **slot, int id) {
     *slot = sv_2mortal(newSViv((IV)to_guest(id, (long long)SvIV_nomg(sv))));
 }
 
+/* ---- socket addresses ----------------------------------------------------------
+ * A program holds a socket address as a string, the bytes of a struct
+ * sockaddr, and hands it to the system as it is. The structures of this C
+ * library are not the host's: the family is another number, an IPv6 or a
+ * Unix-domain address has another size, some systems put a length byte in
+ * front. A program that is shown the host's numbers holds the host's
+ * structures, so that an address it gets from native code (a resolver's
+ * result), packs itself (pack 'S n a4 x8', AF_INET, ...) or hands to native
+ * code is one the system and the native code read alike. Each place where
+ * a packed address passes between the program and the interpreter's C code
+ * turns it into the other side's:
+ *
+ *   - the built-ins bind, connect and send (its TO) take one; accept,
+ *     getpeername, getsockname and recv return one;
+ *   - Socket's pack_sockaddr_in, pack_sockaddr_in6 and pack_sockaddr_un
+ *     return one, unpack_sockaddr_in, unpack_sockaddr_in6,
+ *     unpack_sockaddr_un, sockaddr_family and getnameinfo take one, and
+ *     getaddrinfo returns them.
+ *
+ * A string that is no address of a family both have is passed on as it
+ * is: the system refuses it as it refuses any string that is no address. */
+
+/* The bytes of a packed address; at most this many are an address. */
+union AddressBytes {
+    struct sockaddr sa;
+    char bytes[256];
+};
+
+/* The C library's address for a packed address of the host's: a new value,
+ * or the program's own where it is no address of the host's. */
+SV *guest_address(pTHX_ SV *host) {
+    SvGETMAGIC(host);
+    if (!SvOK(host) || !SvPOK(host)) return host;
+    SV *bytes = host;
+    if (SvUTF8(host)) {
+        /* the built-ins take the bytes of a string */
+        bytes = sv_2mortal(newSVsv_nomg(host));
+        if (!sv_utf8_downgrade(bytes, TRUE)) return host;
+    }
+    STRLEN len;
+    const char *const raw = SvPV_nomg(bytes, len);
+    AddressBytes guest;
+    socklen_t guest_len = sizeof(guest);
+    if (__wasmify_sockaddr_from_host(raw, len, &guest.sa, &guest_len) != 0) return host;
+    if (guest_len > sizeof(guest)) return host;
+    return sv_2mortal(newSVpvn(guest.bytes, guest_len));
+}
+
+/* Puts the host's address in a stack slot that holds a packed address of
+ * the C library's; a slot that holds no address is left as it is. */
+void address_slot_to_host(pTHX_ SV **slot) {
+    SV *const sv = *slot;
+    if (!SvPOK(sv) || SvCUR(sv) < sizeof(sa_family_t) || SvCUR(sv) > sizeof(AddressBytes)) return;
+    AddressBytes guest;
+    memcpy(guest.bytes, SvPVX(sv), SvCUR(sv));
+    char host[sizeof(AddressBytes)];
+    size_t host_len = 0;
+    if (__wasmify_sockaddr_to_host(&guest.sa, (socklen_t)SvCUR(sv), host, sizeof(host), &host_len) != 0) return;
+    *slot = sv_2mortal(newSVpvn(host, host_len));
+}
+
 /* The XSUB (or built-in) that a routine of this file stands in front of.
  * Nothing else records it: the routines of an extension are static, and
  * the op table has only the one slot. */
@@ -544,12 +614,14 @@ void message_flags_to_guest(pTHX_ SV **slot) {
 }
 
 /* send SOCKET, MSG, FLAGS [, TO] and recv SOCKET, SCALAR, LENGTH, FLAGS:
- * the flags are the third and the fourth argument. */
+ * the flags are the third and the fourth argument; send's TO is a packed
+ * address, and so is what recv returns (the sender's). */
 OP *builtin_send(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
     SV **const mark = PL_stack_base + TOPMARK;
     if (SP - mark >= 3) message_flags_to_guest(aTHX_ mark + 3);
+    if (SP - mark >= 4) mark[4] = guest_address(aTHX_ mark[4]);
     return behind(aTHX);
 }
 
@@ -558,7 +630,27 @@ OP *builtin_recv(pTHX) {
     dSP;
     SV **const mark = PL_stack_base + TOPMARK;
     if (SP - mark >= 4) message_flags_to_guest(aTHX_ mark + 4);
+    OP *const next = behind(aTHX);
+    address_slot_to_host(aTHX_ PL_stack_sp);
+    return next;
+}
+
+/* bind SOCKET, NAME and connect SOCKET, NAME: the name is a packed
+ * address. */
+OP *builtin_address_in(pTHX) {
+    if (!active()) return behind(aTHX);
+    dSP;
+    *SP = guest_address(aTHX_ *SP);
     return behind(aTHX);
+}
+
+/* accept NEWSOCKET, GENERICSOCKET, getpeername SOCKET and getsockname
+ * SOCKET return a packed address. */
+OP *builtin_address_out(pTHX) {
+    if (!active()) return behind(aTHX);
+    OP *const next = behind(aTHX);
+    address_slot_to_host(aTHX_ PL_stack_sp);
+    return next;
 }
 
 /* gethostbyname NAME, gethostbyaddr ADDR, ADDRTYPE and gethostent: the
@@ -702,7 +794,8 @@ XS_INTERNAL(xsub_first_is_family) {
     xsub(aTHX_ cv);
 }
 
-/* Socket::sockaddr_family(sockaddr) returns an address family. */
+/* Socket::sockaddr_family(sockaddr) returns the address family of a packed
+ * address. */
 XS_INTERNAL(xsub_returns_family) {
     const XSUBADDR_t xsub = xsub_behind(cv);
     if (!active()) {
@@ -710,11 +803,36 @@ XS_INTERNAL(xsub_returns_family) {
         return;
     }
     const XsubCall call = xsub_call(aTHX);
+    if (call.items >= 1) *xsub_slot(aTHX_ call, 0) = guest_address(aTHX_ *xsub_slot(aTHX_ call, 0));
     xsub(aTHX_ cv);
     if (xsub_returned(aTHX_ call) == 1) {
         SV **const result = xsub_slot(aTHX_ call, 0);
         if (SvOK(*result)) *result = sv_2mortal(newSViv((IV)to_host(FAMILY_af, (long long)SvIV(*result))));
     }
+}
+
+/* Socket::pack_sockaddr_in, pack_sockaddr_in6 and pack_sockaddr_un return
+ * a packed address. */
+XS_INTERNAL(xsub_returns_address) {
+    const XSUBADDR_t xsub = xsub_behind(cv);
+    if (!active()) {
+        xsub(aTHX_ cv);
+        return;
+    }
+    const XsubCall call = xsub_call(aTHX);
+    xsub(aTHX_ cv);
+    if (xsub_returned(aTHX_ call) >= 1) address_slot_to_host(aTHX_ xsub_slot(aTHX_ call, 0));
+}
+
+/* Socket::unpack_sockaddr_in, unpack_sockaddr_in6 and unpack_sockaddr_un
+ * take a packed address. */
+XS_INTERNAL(xsub_takes_address) {
+    const XSUBADDR_t xsub = xsub_behind(cv);
+    if (active()) {
+        const XsubCall call = xsub_call(aTHX);
+        if (call.items >= 1) *xsub_slot(aTHX_ call, 0) = guest_address(aTHX_ *xsub_slot(aTHX_ call, 0));
+    }
+    xsub(aTHX_ cv);
 }
 
 /* The error of getaddrinfo and getnameinfo is a number and a text in one
@@ -733,7 +851,8 @@ long long af_to_guest(long long v) { return to_guest(FAMILY_af, v); }
 long long af_to_host(long long v) { return to_host(FAMILY_af, v); }
 
 /* Socket::getaddrinfo(host, service, hints): the hints name flags, a
- * family and a socket type; each result names a family and a socket type. */
+ * family and a socket type; each result names a family and a socket type,
+ * and holds a packed address. */
 XS_INTERNAL(xsub_getaddrinfo) {
     const XSUBADDR_t xsub = xsub_behind(cv);
     if (!active()) {
@@ -761,10 +880,16 @@ XS_INTERNAL(xsub_getaddrinfo) {
         if (!SvROK(result) || SvTYPE(SvRV(result)) != SVt_PVHV) continue;
         member_translate(aTHX_ MUTABLE_HV(SvRV(result)), "family", af_to_host);
         member_translate(aTHX_ MUTABLE_HV(SvRV(result)), "socktype", socktype_to_host);
+        SV **const addr = hv_fetchs(MUTABLE_HV(SvRV(result)), "addr", 0);
+        if (addr) {
+            SV *host = *addr;
+            address_slot_to_host(aTHX_ &host);
+            if (host != *addr) sv_setsv(*addr, host);
+        }
     }
 }
 
-/* Socket::getnameinfo(addr, flags, xflags). */
+/* Socket::getnameinfo(addr, flags, xflags): the address is a packed one. */
 XS_INTERNAL(xsub_getnameinfo) {
     const XSUBADDR_t xsub = xsub_behind(cv);
     if (!active()) {
@@ -772,6 +897,7 @@ XS_INTERNAL(xsub_getnameinfo) {
         return;
     }
     const XsubCall call = xsub_call(aTHX);
+    if (call.items >= 1) *xsub_slot(aTHX_ call, 0) = guest_address(aTHX_ *xsub_slot(aTHX_ call, 0));
     if (call.items >= 2) slot_to_guest(aTHX_ xsub_slot(aTHX_ call, 1), FAMILY_ni);
     xsub(aTHX_ cv);
     if (xsub_returned(aTHX_ call) >= 1) error_to_host(aTHX_ *xsub_slot(aTHX_ call, 0));
@@ -872,6 +998,12 @@ const struct {
     {"Socket::sockaddr_family", xsub_returns_family},
     {"Socket::getaddrinfo", xsub_getaddrinfo},
     {"Socket::getnameinfo", xsub_getnameinfo},
+    {"Socket::pack_sockaddr_in", xsub_returns_address},
+    {"Socket::pack_sockaddr_in6", xsub_returns_address},
+    {"Socket::pack_sockaddr_un", xsub_returns_address},
+    {"Socket::unpack_sockaddr_in", xsub_takes_address},
+    {"Socket::unpack_sockaddr_in6", xsub_takes_address},
+    {"Socket::unpack_sockaddr_un", xsub_takes_address},
 };
 
 /* ---- constants ------------------------------------------------------------------
@@ -1029,6 +1161,11 @@ void numbers_wrap_builtins(void) {
     wrap_builtin(OP_GSOCKOPT, builtin_sockopt);
     wrap_builtin(OP_SEND, builtin_send);
     wrap_builtin(OP_RECV, builtin_recv);
+    wrap_builtin(OP_BIND, builtin_address_in);
+    wrap_builtin(OP_CONNECT, builtin_address_in);
+    wrap_builtin(OP_ACCEPT, builtin_address_out);
+    wrap_builtin(OP_GETPEERNAME, builtin_address_out);
+    wrap_builtin(OP_GETSOCKNAME, builtin_address_out);
     wrap_builtin(OP_KILL, builtin_kill);
     wrap_builtin(OP_GHBYNAME, builtin_hostent);
     wrap_builtin(OP_GHBYADDR, builtin_hostent);
