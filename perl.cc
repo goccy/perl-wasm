@@ -2033,8 +2033,15 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out);
  * destructor that calls exit there ends the process on the spot, as it does
  * in perl (there is no jump environment left to return to).
  *
- * PERL_SYS_TERM is intentionally NOT called: it is process teardown, and
- * the instance may create a fresh interpreter afterwards. */
+ * The destruct level is perl's main()'s, 0: the objects are destroyed and
+ * the exit-list functions run, and the rest of the memory goes with the
+ * instance, which is never entered again, as a process's memory goes with
+ * it. Freeing every value besides (a higher level, a leak-hunting setting)
+ * frees values code is entitled to leave behind at exit: Object::Pad keeps
+ * pointers to C structures of its own in arrays that live to the end, which
+ * perl's main() never frees.
+ *
+ * PERL_SYS_TERM is intentionally NOT called: it is process teardown. */
 static int destroy_interpreter() {
     PERL_SET_CONTEXT(g_my_perl);
     {
@@ -2043,7 +2050,7 @@ static int destroy_interpreter() {
         SvREFCNT_dec(g_inc_from_environment);
         g_inc_from_environment = nullptr;
     }
-    PL_perl_destruct_level = 2;
+    PL_perl_destruct_level = 0;
     const int status = perl_destruct(g_my_perl);
     perl_free(g_my_perl);
     g_my_perl = nullptr;
