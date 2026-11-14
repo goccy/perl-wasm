@@ -465,7 +465,10 @@ enum {
     GOPERL_HOST_CALLCK = 3, /* a call checker: [id][entersubop][namegv][ckobj] -> [op] */
     GOPERL_HOST_MAGIC = 4,  /* a hook of the magic native code attached:
                              * [hook][sv][nsv][name][namlen] -> [result] */
-    GOPERL_HOST_UVAR = 5    /* a function of uvar magic: [is_set][arg][sv][key] -> [key][result] */
+    GOPERL_HOST_UVAR = 5,   /* a function of uvar magic: [is_set][arg][sv][key] -> [key][result] */
+    GOPERL_HOST_FILTER = 6, /* a source filter: [id][idx][buf][maxlen] -> [result] */
+    GOPERL_HOST_RUNOPS = 7, /* a run loop: [id] */
+    GOPERL_HOST_BHK = 8     /* a block hook: [id][which][arg] -> [op] */
 };
 /* The hooks of GOPERL_HOST_MAGIC, and the bits of an anchor's mask. */
 enum {
@@ -808,6 +811,87 @@ static void goperl_atexit_thunk(pTHX_ void *p) {
     free(goperl_host_call(aTHX_ GOPERL_HOST_ATEXIT, words, 1, &rlen));
 }
 
+/* Source filters of native code (filter_add with a function of its own).
+ * The filter the interpreter runs is one of these functions, one per
+ * function of native code (by the host's id of it): the filter's data
+ * stays the module's (FILTER_DATA), and the function a filter has, which
+ * filter_del looks for and a module compares with its own, tells the id. */
+#define GOPERL_FILTERS_MAX 64
+static I32 goperl_filter_dispatch(pTHX_ int id, int idx, SV *buf, int maxlen) {
+    if (g_go_cb == 0) return -1;
+    const uint32_t words[4] = {(uint32_t)id, (uint32_t)idx, (uint32_t)(uintptr_t)buf,
+                               (uint32_t)maxlen};
+    uint32_t rlen = 0;
+    unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_FILTER, words, 4, &rlen);
+    int32_t r = 0;
+    if (rlen >= 5) memcpy(&r, resp + 1, 4);
+    free(resp);
+    return (I32)r;
+}
+template <int N> static I32 goperl_filter_tramp(pTHX_ int idx, SV *buf, int maxlen) {
+    return goperl_filter_dispatch(aTHX_ N + 1, idx, buf, maxlen);
+}
+template <std::size_t... I>
+static constexpr std::array<filter_t, sizeof...(I)> goperl_filter_tramps_make(
+    std::index_sequence<I...>) {
+    return {{&goperl_filter_tramp<(int)I>...}};
+}
+static const std::array<filter_t, GOPERL_FILTERS_MAX> goperl_filter_tramps =
+    goperl_filter_tramps_make(std::make_index_sequence<GOPERL_FILTERS_MAX>{});
+/* The id (1-based) of the function of native code a filter function runs,
+ * or 0 for a function of the interpreter's. */
+static uint32_t goperl_filter_id(filter_t fn) {
+    for (std::size_t i = 0; i < goperl_filter_tramps.size(); i++)
+        if (goperl_filter_tramps[i] == fn) return (uint32_t)i + 1;
+    return 0;
+}
+
+/* Block hooks of native code (blockhook_register). Each is a BHK of the
+ * interpreter's whose entries call the module's through the host-call
+ * channel, by the hook's id (its index here, plus one): [id][which][arg],
+ * which 0 start (arg: full), 1 pre_end and 2 post_end (arg: the op, the
+ * answer the op that takes its place), 3 eval (arg: the op). The flags
+ * are the module's: an entry it leaves unset is not called. */
+#define GOPERL_BHK_MAX 16
+static BHK g_native_bhk[GOPERL_BHK_MAX];
+static uint32_t g_native_bhk_n = 0;
+static uint32_t goperl_bhk_dispatch(pTHX_ int id, uint32_t which, uint32_t arg) {
+    if (g_go_cb == 0) return arg;
+    const uint32_t words[3] = {(uint32_t)id, which, arg};
+    uint32_t rlen = 0;
+    unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_BHK, words, 3, &rlen);
+    uint32_t r = arg;
+    if (rlen >= 5) memcpy(&r, resp + 1, 4);
+    free(resp);
+    return r;
+}
+template <int K> static void goperl_bhk_start_tramp(pTHX_ int full) {
+    goperl_bhk_dispatch(aTHX_ K + 1, 0, (uint32_t)full);
+}
+template <int K> static void goperl_bhk_pre_end_tramp(pTHX_ OP **o) {
+    *o = (OP *)(uintptr_t)goperl_bhk_dispatch(aTHX_ K + 1, 1, (uint32_t)(uintptr_t)*o);
+}
+template <int K> static void goperl_bhk_post_end_tramp(pTHX_ OP **o) {
+    *o = (OP *)(uintptr_t)goperl_bhk_dispatch(aTHX_ K + 1, 2, (uint32_t)(uintptr_t)*o);
+}
+template <int K> static void goperl_bhk_eval_tramp(pTHX_ OP *const o) {
+    goperl_bhk_dispatch(aTHX_ K + 1, 3, (uint32_t)(uintptr_t)o);
+}
+struct goperl_bhk_entries {
+    void (*start)(pTHX_ int);
+    void (*pre_end)(pTHX_ OP **);
+    void (*post_end)(pTHX_ OP **);
+    void (*eval)(pTHX_ OP *const);
+};
+template <std::size_t... I>
+static constexpr std::array<goperl_bhk_entries, sizeof...(I)> goperl_bhk_tramps_make(
+    std::index_sequence<I...>) {
+    return {{{&goperl_bhk_start_tramp<(int)I>, &goperl_bhk_pre_end_tramp<(int)I>,
+              &goperl_bhk_post_end_tramp<(int)I>, &goperl_bhk_eval_tramp<(int)I>}...}};
+}
+static const std::array<goperl_bhk_entries, GOPERL_BHK_MAX> goperl_bhk_tramps =
+    goperl_bhk_tramps_make(std::make_index_sequence<GOPERL_BHK_MAX>{});
+
 /* The perl stack as a pp function on the host sees it.
  *
  * A pp function reads and writes the argument stack and the mark stack
@@ -1017,6 +1101,20 @@ static int runops_interruptible(pTHX) {
      * does: a die that unwinds to an eval leaves PL_tainted as the failing
      * op set it, and the code that called the loop (the parser compiling the
      * next `use`, for a BEGIN block) must not inherit it. */
+    TAINT_NOT;
+    return 0;
+}
+
+/* A run loop of native code: PL_runops given a function of a module's own
+ * (Devel::Cover runs every op through one). The host's id of the function,
+ * while it is the loop; the loop runs on the host, from PL_op, until an op
+ * returns no next op. */
+static uint32_t g_runops_native = 0;
+static int goperl_runops_native(pTHX) {
+    if (g_go_cb == 0 || g_runops_native == 0) return runops_interruptible(aTHX);
+    const uint32_t words[1] = {g_runops_native};
+    uint32_t rlen = 0;
+    free(goperl_host_call(aTHX_ GOPERL_HOST_RUNOPS, words, 1, &rlen));
     TAINT_NOT;
     return 0;
 }
@@ -3228,8 +3326,28 @@ enum {
                                      * the interpreter's in place of none */
     GOPERL_INT_HV_ARRAY = 20,       /* a: a hash -> the address of its buckets<<32 |
                                      * their number (HvMAX + 1), or 0 */
-    GOPERL_INT_PERLIO_DEBUG = 21    /* s: a message for PerlIO_debug */
+    GOPERL_INT_PERLIO_DEBUG = 21,   /* s: a message for PerlIO_debug */
+    GOPERL_INT_SV_PV_FREE = 22,     /* a: an SV: SvPV_free */
+    GOPERL_INT_STATCACHE = 23,      /* b = 0: -> the address of the fields of
+                                     * PL_statcache as 13 64-bit words (below);
+                                     * b = 1: s = those words, stored there */
+    GOPERL_INT_FILTER_ADD = 24,     /* a: the data (or 0); b: the host's id of
+                                     * the function -> the data filter_add
+                                     * returned, or 0 */
+    GOPERL_INT_FILTER_DEL = 25,     /* b: the host's id of the function */
+    GOPERL_INT_FILTER_READ = 26,    /* a: the buffer; b: idx<<32 | maxlen ->
+                                     * filter_read's result */
+    GOPERL_INT_FILTER_ID = 27,      /* a: a filter's data -> the host's id of the
+                                     * function of native code it runs, or 0 */
+    GOPERL_INT_SV_GETS = 28,        /* a: the SV; b: append<<32 | the handle ->
+                                     * 1 when a line was read, 0 at the end */
+    GOPERL_INT_BHK_REGISTER = 29,   /* b: the flags -> the id of a new block
+                                     * hook of native code */
+    GOPERL_INT_BHK_FLAGS = 30       /* a: the id of a block hook; b: its flags */
 };
+/* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
+ * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
+#define GOPERL_STATCACHE_WORDS 13
 /* What a save is of (INTERNAL SAVE_*): a pointer that holds a reference
  * (SAVESPTR), a pointer that holds none (SAVEVPTR, SAVEPPTR, save_hptr), a
  * pointer whose reference the save owns (SAVEGENERICSV), an integer. */
@@ -3367,6 +3485,8 @@ enum {
     GOPERL_CALL_NEWGVGEN = 18, /* s = the package, b = flags -> a new glob */
     GOPERL_CALL_RANDOM = 19, /* b low 2 bits: 0 Drand01() -> the bits of the
                               * double; 1 seedDrand01(b >> 2); 2 seed() */
+    GOPERL_CALL_QERROR = 20, /* a = the message: a compile error is queued */
+    GOPERL_CALL_SV_CAT_DECODE = 21, /* sv_cat_decode (see the call) */
     GOPERL_CALL_ASYNC = 16   /* what is pending is delivered, as between ops
                               * -> 1 when a handler died (the error is $@) */
 };
@@ -3398,7 +3518,14 @@ enum {
     GOPERL_PARSERW_RSFP = 23,
     GOPERL_PARSERW_RSFP_FILTERS = 24,
     GOPERL_PARSERW_LEX_FORMBRACK = 25,
-    GOPERL_PARSERW_WORDS = 26
+    GOPERL_PARSERW_LEX_STUFF = 26,
+    GOPERL_PARSERW_LEX_REPL = 27,
+    GOPERL_PARSERW_LEX_BRACKSTACK = 28, /* an address of this memory */
+    GOPERL_PARSERW_TOKENBUF = 29,       /* the address of the parser's
+                                         * tokenbuf (a char[256]) */
+    GOPERL_PARSERW_FILTERED = 30,
+    GOPERL_PARSERW_LAST_LOP_OP = 31,
+    GOPERL_PARSERW_WORDS = 32
 };
 /* COP_SET fields. */
 enum {
@@ -3407,7 +3534,8 @@ enum {
     GOPERL_COPF_HINTS = 2,
     GOPERL_COPF_STASH = 3,
     GOPERL_COPF_FILE = 4, /* s = the name */
-    GOPERL_COPF_FEATURES = 5
+    GOPERL_COPF_FEATURES = 5,
+    GOPERL_COPF_FILE_FREE = 6 /* the file is let go of (CopFILE_free) */
 };
 
 /* FIELD selectors (a = selector<<32 | token, b = the value to store). */
@@ -3465,7 +3593,9 @@ enum {
 enum {
     GOPERL_CX_DUMP = 0,     /* b = index -> address of the fields, or 0 */
     GOPERL_CX_DOUNWIND = 1, /* b = index */
-    GOPERL_CX_MAX = 2       /* cxstack_max */
+    GOPERL_CX_MAX = 2,      /* cxstack_max */
+    GOPERL_CX_SET = 3       /* s = [index][field][value]: a field of the
+                             * context, numbered as CX_DUMP's words */
 };
 
 /* PERLIO selectors: the handle functions of perlio.h. */
@@ -3715,7 +3845,11 @@ enum {
     GOPERL_LEX_READ_UNICHAR = 2,
     GOPERL_LEX_READ_TO = 3,
     GOPERL_LEX_BUFUTF8 = 4,
-    GOPERL_LEX_STUFF_PVN = 5
+    GOPERL_LEX_STUFF_PVN = 5,
+    GOPERL_LEX_UNSTUFF = 6,
+    GOPERL_LEX_GROW_LINESTR = 7,
+    GOPERL_LEX_NEXT_CHUNK = 8,
+    GOPERL_LEX_DISCARD_TO = 9
 };
 enum {
     GOPERL_PARSE_BLOCK = 0,
@@ -3860,6 +3994,14 @@ enum {
 #define GOPERL_PL_CURSTNAME 92
 #define GOPERL_PL_PADIX_FLOOR 93
 #define GOPERL_PL_PARSER 94         /* saves only: the parser is CALL 15's */
+#define GOPERL_PL_MULTIDEREF_PC 95  /* the item of a multideref's aux being
+                                     * run (an address of this memory) */
+#define GOPERL_PL_NOMEMOK 96
+#define GOPERL_PL_MINUS_N 97
+#define GOPERL_PL_MINUS_P 98
+#define GOPERL_PL_RUNOPS 99         /* the host's id of the run loop of native
+                                     * code that is PL_runops, 0 for the
+                                     * interpreter's own */
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -4450,6 +4592,92 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, const 
     case GOPERL_INT_PERLIO_DEBUG:
         PerlIO_debug("%s", s ? s : "");
         return 0;
+    case GOPERL_INT_SV_PV_FREE: {
+        /* SvPV_free: the string buffer the SV owns is freed (the offset of a
+         * buffer whose start was chopped off is undone first); the fields
+         * stay as they are, for the caller to set */
+        SV *sv = (SV *)(uintptr_t)lo;
+        if (!sv || SvTYPE(sv) < SVt_PV) return 0;
+        SvPV_free(sv);
+        return 0;
+    }
+    case GOPERL_INT_STATCACHE: {
+        /* what the last stat found, which -X _ reads: native code reads it
+         * and may store what it found itself */
+        static uint64_t w[GOPERL_STATCACHE_WORDS];
+        if (b == 0) {
+            w[0] = (uint64_t)PL_statcache.st_dev;
+            w[1] = (uint64_t)PL_statcache.st_ino;
+            w[2] = (uint64_t)PL_statcache.st_mode;
+            w[3] = (uint64_t)PL_statcache.st_nlink;
+            w[4] = (uint64_t)PL_statcache.st_uid;
+            w[5] = (uint64_t)PL_statcache.st_gid;
+            w[6] = (uint64_t)PL_statcache.st_rdev;
+            w[7] = (uint64_t)(int64_t)PL_statcache.st_size;
+            w[8] = (uint64_t)(int64_t)PL_statcache.st_atime;
+            w[9] = (uint64_t)(int64_t)PL_statcache.st_mtime;
+            w[10] = (uint64_t)(int64_t)PL_statcache.st_ctime;
+            w[11] = (uint64_t)(int64_t)PL_statcache.st_blksize;
+            w[12] = (uint64_t)(int64_t)PL_statcache.st_blocks;
+            return (uint64_t)(uintptr_t)w;
+        }
+        if (!s) return 0;
+        memcpy(w, s, sizeof w);
+        PL_statcache.st_dev = (dev_t)w[0];
+        PL_statcache.st_ino = (ino_t)w[1];
+        PL_statcache.st_mode = (mode_t)w[2];
+        PL_statcache.st_nlink = (nlink_t)w[3];
+        PL_statcache.st_uid = (uid_t)w[4];
+        PL_statcache.st_gid = (gid_t)w[5];
+        PL_statcache.st_rdev = (dev_t)w[6];
+        PL_statcache.st_size = (off_t)(int64_t)w[7];
+        PL_statcache.st_atime = (time_t)(int64_t)w[8];
+        PL_statcache.st_mtime = (time_t)(int64_t)w[9];
+        PL_statcache.st_ctime = (time_t)(int64_t)w[10];
+        PL_statcache.st_blksize = (blksize_t)(int64_t)w[11];
+        PL_statcache.st_blocks = (blkcnt_t)(int64_t)w[12];
+        return 0;
+    }
+    case GOPERL_INT_FILTER_ADD: {
+        const uint32_t id = (uint32_t)b;
+        if (id == 0 || id > goperl_filter_tramps.size())
+            Perl_croak(aTHX_ "goperl: no source filter function %u", (unsigned)id);
+        return (uint64_t)(uintptr_t)filter_add(goperl_filter_tramps[id - 1], (SV *)(uintptr_t)lo);
+    }
+    case GOPERL_INT_FILTER_DEL: {
+        const uint32_t id = (uint32_t)b;
+        if (id == 0 || id > goperl_filter_tramps.size()) return 0;
+        filter_del(goperl_filter_tramps[id - 1]);
+        return 0;
+    }
+    case GOPERL_INT_FILTER_READ:
+        return (uint64_t)(uint32_t)filter_read((int)(int32_t)(uint32_t)(b >> 32),
+                                               (SV *)(uintptr_t)lo, (int)(int32_t)(uint32_t)b);
+    case GOPERL_INT_FILTER_ID: {
+        SV *datasv = (SV *)(uintptr_t)lo;
+        if (!datasv || SvTYPE(datasv) != SVt_PVIO) return 0;
+        return goperl_filter_id(DPTR2FPTR(filter_t, IoANY(datasv)));
+    }
+    case GOPERL_INT_SV_GETS:
+        return sv_gets((SV *)(uintptr_t)lo, (PerlIO *)(uintptr_t)(uint32_t)b,
+                       (I32)(int32_t)(uint32_t)(b >> 32)) ? 1 : 0;
+    case GOPERL_INT_BHK_REGISTER: {
+        if (g_native_bhk_n >= GOPERL_BHK_MAX)
+            Perl_croak(aTHX_ "goperl: too many block hooks of native code");
+        const uint32_t k = g_native_bhk_n++;
+        BHK *hk = &g_native_bhk[k];
+        hk->bhk_flags = (U32)b;
+        hk->bhk_start = goperl_bhk_tramps[k].start;
+        hk->bhk_pre_end = goperl_bhk_tramps[k].pre_end;
+        hk->bhk_post_end = goperl_bhk_tramps[k].post_end;
+        hk->bhk_eval = goperl_bhk_tramps[k].eval;
+        Perl_blockhook_register(aTHX_ hk);
+        return k + 1;
+    }
+    case GOPERL_INT_BHK_FLAGS:
+        if (lo == 0 || lo > g_native_bhk_n) return 0;
+        g_native_bhk[lo - 1].bhk_flags = (U32)b;
+        return 0;
     case GOPERL_INT_PARSER_NEW: {
         /* just enough of a parser for the compiler's functions, as a module
          * makes one when there is none; freed with the scope */
@@ -4964,6 +5192,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_SUBNAME: return (uint64_t)(uintptr_t)PL_subname;
         case GOPERL_PL_CURSTNAME: return (uint64_t)(uintptr_t)PL_curstname;
         case GOPERL_PL_PADIX_FLOOR: return (uint64_t)(int64_t)PL_padix_floor;
+        case GOPERL_PL_MULTIDEREF_PC: return (uint64_t)(uintptr_t)PL_multideref_pc;
+        case GOPERL_PL_NOMEMOK: return PL_nomemok ? 1 : 0;
+        case GOPERL_PL_MINUS_N: return PL_minus_n ? 1 : 0;
+        case GOPERL_PL_MINUS_P: return PL_minus_p ? 1 : 0;
+        case GOPERL_PL_RUNOPS: return PL_runops == goperl_runops_native ? g_runops_native : 0;
         }
         return 0;
     }
@@ -5024,6 +5257,14 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_SUBNAME: PL_subname = val; return 0;
         case GOPERL_PL_CURSTNAME: PL_curstname = val; return 0;
         case GOPERL_PL_PADIX_FLOOR: PL_padix_floor = (PADOFFSET)(int64_t)b; return 0;
+        case GOPERL_PL_MULTIDEREF_PC: PL_multideref_pc = (UNOP_AUX_item *)(uintptr_t)(uint32_t)b; return 0;
+        case GOPERL_PL_NOMEMOK: PL_nomemok = cBOOL(b); return 0;
+        case GOPERL_PL_MINUS_N: PL_minus_n = cBOOL(b); return 0;
+        case GOPERL_PL_MINUS_P: PL_minus_p = cBOOL(b); return 0;
+        case GOPERL_PL_RUNOPS:
+            g_runops_native = (uint32_t)b;
+            PL_runops = b ? goperl_runops_native : runops_interruptible;
+            return 0;
         }
         return 0;
     }
@@ -5151,6 +5392,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                 * the table entry is always the original. The type may
                 * differ from PL_op->op_type (pp_entersub with type 0). */
         uint32_t t = (uint32_t)a;
+        /* b: the op to run, when the host runs the ops itself (a run loop
+         * of native code makes each one PL_op, as perl's loop does) */
+        if (b) PL_op = (OP *)(uintptr_t)(uint32_t)b;
         if (t >= MAXO || !PL_op) return 0;
         OP *next = PL_ppaddr[t](aTHX);
         return (uint64_t)(uintptr_t)next;
@@ -5774,6 +6018,16 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_LEX_STUFF_PVN: /* b = flags<<32|len */
             lex_stuff_pvn(s ? s : "", (STRLEN)(uint32_t)b, (U32)(b >> 32));
             return 0;
+        case GOPERL_LEX_UNSTUFF: /* b = the address in the buffer to discard to */
+            lex_unstuff((char *)(uintptr_t)(uint32_t)b);
+            return 0;
+        case GOPERL_LEX_GROW_LINESTR: /* b = the length -> the buffer's address */
+            return (uint64_t)(uintptr_t)lex_grow_linestr((STRLEN)(uint32_t)b);
+        case GOPERL_LEX_NEXT_CHUNK: /* b = flags */
+            return lex_next_chunk((U32)b) ? 1 : 0;
+        case GOPERL_LEX_DISCARD_TO: /* b = an address in the buffer */
+            lex_discard_to((char *)(uintptr_t)(uint32_t)b);
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown lexer call %d", (int)a);
     }
@@ -5837,6 +6091,43 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PARSER_IN_MY:
             PL_parser->in_my = (U16)b;
             return 0;
+        /* the fields native code that lexes by itself stores into (a
+         * scanner of its own over the buffer): pointers are addresses of
+         * this memory, values are stored as they are, as C code compiled
+         * against perl's parser.h does */
+#define GOPERL_PSET_PTR(w, field) \
+        case 100 + (w): PL_parser->field = (char *)(uintptr_t)(uint32_t)b; return 0;
+        GOPERL_PSET_PTR(GOPERL_PARSERW_BUFPTR, bufptr)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_BUFEND, bufend)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_OLDBUFPTR, oldbufptr)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_OLDOLDBUFPTR, oldoldbufptr)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_LINESTART, linestart)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_LAST_UNI, last_uni)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_LAST_LOP, last_lop)
+        GOPERL_PSET_PTR(GOPERL_PARSERW_LEX_BRACKSTACK, lex_brackstack)
+#undef GOPERL_PSET_PTR
+        case 100 + GOPERL_PARSERW_LEX_STUFF:
+            PL_parser->lex_stuff = (SV *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case 100 + GOPERL_PARSERW_LEX_REPL:
+            PL_parser->lex_repl = (SV *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case 100 + GOPERL_PARSERW_RSFP:
+            PL_parser->rsfp = (PerlIO *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case 100 + GOPERL_PARSERW_RSFP_FILTERS:
+            PL_parser->rsfp_filters = (AV *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case 100 + GOPERL_PARSERW_ERROR_COUNT: PL_parser->error_count = (I32)(int32_t)(uint32_t)b; return 0;
+        case 100 + GOPERL_PARSERW_LEX_STATE: PL_parser->lex_state = (U8)b; return 0;
+        case 100 + GOPERL_PARSERW_LEX_BRACKETS: PL_parser->lex_brackets = (I32)(int32_t)(uint32_t)b; return 0;
+        case 100 + GOPERL_PARSERW_LEX_FORMBRACK: PL_parser->lex_formbrack = (I32)(int32_t)(uint32_t)b; return 0;
+        case 100 + GOPERL_PARSERW_LEX_INWHAT: PL_parser->lex_inwhat = (U16)b; return 0;
+        case 100 + GOPERL_PARSERW_MULTI_START: PL_parser->multi_start = (line_t)b; return 0;
+        case 100 + GOPERL_PARSERW_MULTI_END: PL_parser->multi_end = (line_t)b; return 0;
+        case 100 + GOPERL_PARSERW_MULTI_OPEN: PL_parser->multi_open = (UV)b; return 0;
+        case 100 + GOPERL_PARSERW_MULTI_CLOSE: PL_parser->multi_close = (UV)b; return 0;
+        case 100 + GOPERL_PARSERW_LAST_LOP_OP: PL_parser->last_lop_op = (OPCODE)b; return 0;
         }
         return 0;
     }
@@ -6839,6 +7130,19 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             default:
                 return (uint64_t)seed();
             }
+        case GOPERL_CALL_QERROR: /* a = the message (an SV), or 0 */
+            qerror(sv);
+            return 0;
+        case GOPERL_CALL_SV_CAT_DECODE: { /* a = dsv; s = [encoding][ssv][offset]
+                 * [tlen] and the terminator's bytes -> offset<<32 | result */
+            uint32_t w[4] = {0, 0, 0, 0};
+            if (!s) return 0;
+            memcpy(w, s, sizeof w);
+            int offset = (int)w[2];
+            const bool r = sv_cat_decode(sv, (SV *)(uintptr_t)w[0], (SV *)(uintptr_t)w[1],
+                                         &offset, (char *)(s + sizeof w), (int)w[3]);
+            return ((uint64_t)(uint32_t)offset << 32) | (r ? 1 : 0);
+        }
         case GOPERL_CALL_PARSER: {
             static uint32_t w[GOPERL_PARSERW_WORDS];
             yy_parser *ps = PL_parser;
@@ -6869,6 +7173,12 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             w[GOPERL_PARSERW_RSFP] = (uint32_t)(uintptr_t)ps->rsfp;
             w[GOPERL_PARSERW_RSFP_FILTERS] = (uint32_t)(uintptr_t)(SV *)ps->rsfp_filters;
             w[GOPERL_PARSERW_LEX_FORMBRACK] = (uint32_t)ps->lex_formbrack;
+            w[GOPERL_PARSERW_LEX_STUFF] = (uint32_t)(uintptr_t)ps->lex_stuff;
+            w[GOPERL_PARSERW_LEX_REPL] = (uint32_t)(uintptr_t)ps->lex_repl;
+            w[GOPERL_PARSERW_LEX_BRACKSTACK] = (uint32_t)(uintptr_t)ps->lex_brackstack;
+            w[GOPERL_PARSERW_TOKENBUF] = (uint32_t)(uintptr_t)ps->tokenbuf;
+            w[GOPERL_PARSERW_FILTERED] = ps->filtered;
+            w[GOPERL_PARSERW_LAST_LOP_OP] = (uint32_t)ps->last_lop_op;
             return (uint64_t)(uintptr_t)w;
         }
         case GOPERL_CALL_ATOF: {
@@ -6904,6 +7214,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             case GOPERL_COPF_STASH: CopSTASH_set(cop, (HV *)(uintptr_t)val); return 0;
             case GOPERL_COPF_FILE: CopFILE_set(cop, s ? s : ""); return 0;
             case GOPERL_COPF_FEATURES: cop->cop_features.bits[0] = val; return 0;
+            case GOPERL_COPF_FILE_FREE: CopFILE_free(cop); return 0;
             }
             Perl_croak(aTHX_ "goperl: unknown cop field %d", (int)(b >> 32));
         }
@@ -7127,6 +7438,60 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return 0;
         case GOPERL_CX_MAX:
             return si ? (uint64_t)(int64_t)si->si_cxmax : 0;
+        case GOPERL_CX_SET: { /* native code stored into a context, as code
+                 * compiled against perl's headers does (cx->blk_sub.retop =
+                 * op): the field takes the value, nothing else happens */
+            const uint32_t *w = (const uint32_t *)s;
+            const I32 ix = (I32)w[0];
+            const uint32_t v = w[2];
+            if (!si || ix < 0 || ix > si->si_cxix) return 0;
+            PERL_CONTEXT *cx = &si->si_cxstack[ix];
+            switch (w[1]) {
+            case 0: cx->cx_type = (U8)v; return 1;
+            case 1: cx->blk_gimme = (U8)v; return 1;
+            case 2: cx->blk_u16 = (U16)v; return 1;
+            case 3: cx->blk_oldsaveix = (I32)v; return 1;
+            case 4: cx->blk_oldsp = (SSize_t)(int32_t)v; return 1;
+            case 5: cx->blk_oldmarksp = (I32)v; return 1;
+            case 6: cx->blk_oldscopesp = (I32)v; return 1;
+            case 7: cx->blk_oldcop = (COP *)(uintptr_t)v; return 1;
+            case 8: cx->blk_oldpm = (PMOP *)(uintptr_t)v; return 1;
+            case 9: cx->blk_old_tmpsfloor = (SSize_t)(int32_t)v; return 1;
+            }
+            switch (CxTYPE(cx)) {
+            case CXt_SUB:
+                switch (w[1]) {
+                case 10: cx->blk_sub.cv = (CV *)(uintptr_t)v; return 1;
+                case 11: cx->blk_sub.retop = (OP *)(uintptr_t)v; return 1;
+                case 12: cx->blk_sub.olddepth = (I32)v; return 1;
+                case 13: cx->blk_sub.savearray = (AV *)(uintptr_t)v; return 1;
+                case 14: cx->blk_sub.prevcomppad = (PAD *)(uintptr_t)v; return 1;
+                }
+                break;
+            case CXt_FORMAT:
+                switch (w[1]) {
+                case 10: cx->blk_format.cv = (CV *)(uintptr_t)v; return 1;
+                case 11: cx->blk_format.retop = (OP *)(uintptr_t)v; return 1;
+                }
+                break;
+            case CXt_EVAL:
+                switch (w[1]) {
+                case 10: cx->blk_eval.retop = (OP *)(uintptr_t)v; return 1;
+                case 11: cx->blk_eval.old_namesv = (SV *)(uintptr_t)v; return 1;
+                case 12: cx->blk_eval.cur_text = (SV *)(uintptr_t)v; return 1;
+                case 13: cx->blk_eval.cv = (CV *)(uintptr_t)v; return 1;
+                case 14: cx->blk_eval.old_eval_root = (OP *)(uintptr_t)v; return 1;
+                }
+                break;
+            default:
+                if (CxTYPE_is_LOOP(cx) && w[1] == 10) {
+                    cx->blk_loop.my_op = (LOOP *)(uintptr_t)v;
+                    return 1;
+                }
+                break;
+            }
+            Perl_croak(aTHX_ "goperl: context field %u cannot be stored into", (unsigned)w[1]);
+        }
         }
         Perl_croak(aTHX_ "goperl: unknown context call %d", (int)(a >> 32));
     }
