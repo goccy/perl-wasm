@@ -77,16 +77,18 @@ static void program_set_curstash_main(pTHX) {
 }
 
 /* perl.c's S_incpush as -I uses it: the version- and architecture-specific
- * subdirectories of dir that exist go in ahead of dir itself. */
+ * subdirectories of dir that exist go in ahead of dir itself. The name of
+ * the architecture is the run-time one (perl_wasi_archname, perl.cc). */
 static void program_incpush(pTHX_ AV *av, const std::string &dir) {
-    static const char *const subdirs[] = {
-        "/" PERL_FS_VERSION "/" ARCHNAME,
+    const std::string arch = perl_wasi_archname();
+    const std::string subdirs[] = {
+        "/" PERL_FS_VERSION "/" + arch,
         "/" PERL_FS_VERSION,
-        "/" ARCHNAME,
+        "/" + arch,
     };
-    for (const char *sub : subdirs) {
+    for (const std::string &sub : subdirs) {
         SV *path = newSVpvn(dir.data(), dir.size());
-        sv_catpv(path, sub);
+        sv_catpvn(path, sub.data(), sub.size());
         Stat_t st;
         if (PerlLIO_stat(SvPVX_const(path), &st) >= 0 && S_ISDIR(st.st_mode))
             av_push(av, path);

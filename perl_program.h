@@ -69,4 +69,8 @@ void program_execute(pTHX_ const ProgramSpec &ps);
  * Defined next to the code that builds @INC (perl.cc). */
 void program_inc_drop_environment(pTHX);
 
+/* The name of the architecture: the host's, which the interpreter was
+ * started with (perl.cc). */
+extern "C" const char *perl_wasi_archname(void);
+
 #endif /* PERL_PROGRAM_H */

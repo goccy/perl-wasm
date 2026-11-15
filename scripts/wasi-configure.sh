@@ -690,6 +690,44 @@ awk '
 ' "$CONFIG" > "$CONFIG.dedup" && mv "$CONFIG.dedup" "$CONFIG"
 echo "== canonicalised $CONFIG (deduped to last-wins per key)"
 
+# --- The name of the architecture is the host's -----------------------------
+# One interpreter runs on every host the embedder is built for, and the
+# native modules a program loads are built for that host: the name of the
+# architecture is the host's, which the embedder gives at start-up
+# (perl_new's archname; perl.cc keeps it). perl.c names the architecture
+# subdirectories it adds to @INC with a directory (PERL5LIB, -I, ...) and
+# says what perl was built for (-v) with the compile-time ARCHNAME; it asks
+# perl.cc instead. config.sh's archname is the build's own name, which
+# %Config does not show (scripts/make-stdlib-zip.py).
+python3 - "$PERL/perl.c" <<'PYPATCH'
+import sys
+path = sys.argv[1]
+t = open(path).read()
+marker = "perl_wasi_archname"
+if marker in t:
+    print("run-time archname already in perl.c")
+    sys.exit(0)
+edits = [
+    ('#include "perl.h"\n',
+     '#include "perl.h"\n'
+     '/* the name of the architecture: the host\'s (perl.cc) */\n'
+     'extern const char *perl_wasi_archname(void);\n'),
+    ('                " (%" SVf ") built for "\tARCHNAME, SVfARG(level)\n',
+     '                " (%" SVf ") built for %s", SVfARG(level), perl_wasi_archname()\n'),
+    ('                sv_catpvs(subdir, "/" PERL_FS_VERSION "/" ARCHNAME);\n',
+     '                sv_catpvf(subdir, "/" PERL_FS_VERSION "/%s", perl_wasi_archname());\n'),
+    ('                sv_catpvs(subdir, "/" ARCHNAME);\n',
+     '                sv_catpvf(subdir, "/%s", perl_wasi_archname());\n'),
+]
+for old, new in edits:
+    n = t.count(old)
+    assert n == 1, (path, old[:60], n)
+    t = t.replace(old, new)
+assert "ARCHNAME" not in t.replace("PERL_WASI", ""), "perl.c still uses ARCHNAME"
+open(path, "w").write(t)
+print("run-time archname patched into perl.c")
+PYPATCH
+
 # --- Emit config.h + Makefile from config.sh (no probing) -------------------
 # `Configure -S` performs variable substitution on the *.SH templates using the
 # existing config.sh: it writes config.h, Makefile, and the other generated

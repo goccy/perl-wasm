@@ -288,7 +288,22 @@ static std::vector<std::pair<const char *, std::string>> g_site_config;
 /* sitearch and sitelib, the two that are in @INC; empty without a site_dir. */
 static std::string g_site_arch_dir, g_site_lib_dir;
 
-static void site_configure(const char *site_dir, const char *site_arch) {
+/* The name of the architecture (perl_new's archname): the host's, or the
+ * build's ARCHNAME when the embedder names none. perl.c asks for it where
+ * it would use ARCHNAME (the patch in scripts/wasi-configure.sh), Config.pm
+ * and Config_heavy.pl through Internals::archname. */
+static std::string g_archname = ARCHNAME;
+
+extern "C" const char *perl_wasi_archname(void) { return g_archname.c_str(); }
+
+/* Internals::archname(): the name of the architecture. */
+XS(XS_Internals_archname) {
+    dXSARGS;
+    if (items != 0) croak_xs_usage(cv, "");
+    XSRETURN_PV(g_archname.c_str());
+}
+
+static void site_configure(const char *site_dir) {
     g_site_config.clear();
     g_site_arch_dir.clear();
     g_site_lib_dir.clear();
@@ -298,7 +313,7 @@ static void site_configure(const char *site_dir, const char *site_arch) {
     const std::string under = root == "/" ? "" : root;
     const std::string stem = under + "/site_perl";
     g_site_lib_dir = stem + "/" PERL_VERSION_STRING;
-    g_site_arch_dir = g_site_lib_dir + "/" + (site_arch && *site_arch ? site_arch : ARCHNAME);
+    g_site_arch_dir = g_site_lib_dir + "/" + g_archname;
     const std::string bin = under + "/bin";
     const std::string man1 = under + "/man/man1";
     const std::string man3 = under + "/man/man3";
@@ -343,6 +358,7 @@ static void xs_init(pTHX) {
     newXS("DynaLoader::boot_DynaLoader", boot_DynaLoader, file);
     newXS("DynaLoader::dl_static_boot", XS_DynaLoader_dl_static_boot, file);
     newXS("Internals::site_directories", XS_Internals_site_directories, file);
+    newXS("Internals::archname", XS_Internals_archname, file);
     newXS("Internals::host_numbers", XS_Internals_host_numbers, file);
 }
 
@@ -2044,9 +2060,10 @@ static void inc_use_stdlib(pTHX_ const char *lib_dir) {
 }
 
 /* ---- public API (pl.h) --------------------------------------------------- */
-uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch) {
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname) {
     if (g_my_perl) return 0; /* one interpreter per instance */
-    site_configure(site_dir, site_arch);
+    g_archname = archname && *archname ? archname : ARCHNAME;
+    site_configure(site_dir);
     g_lib_dir = lib_dir ? lib_dir : "";
 
     static bool sys_inited = false;

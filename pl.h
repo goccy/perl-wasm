@@ -85,21 +85,25 @@
  * `site_dir`, when non-empty, is the directory the site directories are
  * under: where modules installed for this interpreter go and are found.
  *
- *   <site_dir>/site_perl/<version>               sitelib
- *   <site_dir>/site_perl/<version>/<site_arch>   sitearch
- *   <site_dir>/bin                               sitebin, sitescript
- *   <site_dir>/man/man1, <site_dir>/man/man3     siteman1dir, siteman3dir
+ *   <site_dir>/site_perl/<version>              sitelib
+ *   <site_dir>/site_perl/<version>/<archname>   sitearch
+ *   <site_dir>/bin                              sitebin, sitescript
+ *   <site_dir>/man/man1, <site_dir>/man/man3    siteman1dir, siteman3dir
  *
- * <version> is this interpreter's. `site_arch` names the kind of machine
- * the architecture-specific files there are for (the host's, when native
- * extensions are loaded into the host process); empty stands for the
- * interpreter's own architecture name. %Config reports the directories
+ * <version> is this interpreter's. `archname` is the name of the
+ * architecture: the host's, which the one interpreter takes from whatever
+ * host it runs on (native modules are built for the host). It is
+ * $Config{archname} and myarchname, the name of the architecture
+ * subdirectories perl adds to @INC with a directory (PERL5LIB, -I) and of
+ * the site's architecture directory, and what `perl -v` says perl was
+ * built for; empty stands for the name the build was configured with.
+ * %Config reports the directories
  * under every key that names one of them, and sitearch and sitelib are in
  * @INC where perl has them: after the PERL5LIB directories and before the
  * standard library. None of them is created. Without a site_dir %Config
  * keeps the values of the build's configuration and @INC has no site
  * directory. */
-uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch);
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname);
 
 /* Evaluate `src` (a string eval in scalar context, REPL-like state
  * persistence). ok payload:
