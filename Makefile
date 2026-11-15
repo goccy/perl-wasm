@@ -40,9 +40,7 @@ BUILD_ENV = WASMIFY_NON_INTERACTIVE=1
 # generate-build emits build.json, parse-headers/gen-proto emit the api spec +
 # proto + bridge, wasm-build links perl.wasm (the bridge in perl.cc is injected
 # automatically), and buf generate + bundle-gomod produce the wasm2go bundle as
-# a self-contained Go module. The link runs with warnings fatal
-# (wasm_build.extra_ldflags), so a call whose two sides disagree on the
-# function's signature fails the build.
+# a self-contained Go module.
 WASMIFY_PIPELINE = \
 	make tools && \
 	$(BUILD_ENV) bash scripts/wasi-configure.sh && \

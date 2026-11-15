@@ -16,10 +16,6 @@ wasm build:
   bootstrap that registers each `boot_<Module>`). This is the direct parallel
   to CPython's C extensions being compiled *into* `python.wasm`.
 
-Only perl's own extensions are linked: no CPAN distribution is ever linked
-into `perl.wasm`. An XS distribution from CPAN is built as a native module
-against go-perl's XS SDK and loaded at run time.
-
 The policy is **"link everything EXCEPT what is meaningless under wasm32-wasi"**
 (OS-specific, external-library/syscall dependent, threads, or test/author-only).
 Selection is against upstream Perl **v5.42.2**
