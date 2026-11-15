@@ -286,6 +286,21 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
 
+/* perl_xs_helper without the bridge's encoding, for the operations native
+ * code makes by the million: perl_xs_opbox answers the address of the
+ * instance's operation box, a struct goperl_opbox in linear memory
+ * ([a][b][result] as u64, [op] as i32, [slen] as u32, then the slen bytes
+ * of s: 32 bytes before s, GOPERL_OPBOX_STR bytes of room for s). The
+ * host writes an operation's arguments there and calls perl_xs_op, which
+ * runs it as perl_xs_helper does (s NUL-terminated) and leaves its result
+ * in the box; it answers 0, so that the bridge sends nothing back. A
+ * string longer than the box holds goes through perl_xs_helper. The box is
+ * free again once perl_xs_op has returned: an operation that leads to
+ * native code (magic, a callback) has the operations of that code use it
+ * meanwhile, after this one has taken its arguments out. */
+uint32_t perl_xs_opbox(uint64_t h);
+uint32_t perl_xs_op(void);
+
 /* Run a forked child to its end.
  *
  * fork is emulated the way perl emulates it on Windows: when the guest

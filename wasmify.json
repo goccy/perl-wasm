@@ -114,6 +114,8 @@
       "perl_set_go_dispatcher",
       "perl_register_native_xs",
       "perl_xs_helper",
+      "perl_xs_op",
+      "perl_xs_opbox",
       "perl_fork_child",
       "perl_run_program"
     ]

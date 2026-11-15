@@ -4860,6 +4860,38 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, const 
     Perl_croak(aTHX_ "goperl: unknown internal call %d", sel);
 }
 
+/* The operation box (pl.h perl_xs_opbox). */
+#define GOPERL_OPBOX_STR 4096
+struct goperl_opbox {
+    uint64_t a;
+    uint64_t b;
+    uint64_t result;
+    int32_t op;
+    uint32_t slen;
+    char s[GOPERL_OPBOX_STR];
+};
+static_assert(offsetof(goperl_opbox, s) == 32, "the box's layout is the host's");
+static goperl_opbox g_opbox;
+
+uint32_t perl_xs_opbox(uint64_t h) {
+    return h ? (uint32_t)(uintptr_t)&g_opbox : 0;
+}
+
+uint32_t perl_xs_op(void) {
+    /* the arguments are taken out first: what the operation leads to may
+     * use the box for operations of its own */
+    const int32_t op = g_opbox.op;
+    const uint64_t a = g_opbox.a, b = g_opbox.b;
+    uint32_t slen = g_opbox.slen;
+    if (slen > GOPERL_OPBOX_STR) slen = GOPERL_OPBOX_STR;
+    char s[GOPERL_OPBOX_STR + 1];
+    memcpy(s, g_opbox.s, slen);
+    s[slen] = '\0';
+    const uint64_t r = perl_xs_helper(1, op, a, b, s);
+    g_opbox.result = r;
+    return 0;
+}
+
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s) {
     if (!g_my_perl || h == 0) return 0;
     PERL_SET_CONTEXT(g_my_perl);
