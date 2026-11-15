@@ -58,9 +58,6 @@
   },
   "wasm_build": {
     "wasm64": true,
-    "extra_ldflags_wasm64": [
-      "-Wl,--max-memory=4294967296"
-    ],
     "extra_ldflags": [
       "-lc-printscan-long-double",
       "-Wl,--fatal-warnings",
