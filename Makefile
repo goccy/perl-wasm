@@ -40,12 +40,9 @@ BUILD_ENV = WASMIFY_NON_INTERACTIVE=1
 # generate-build emits build.json, parse-headers/gen-proto emit the api spec +
 # proto + bridge, wasm-build links perl.wasm (the bridge in perl.cc is injected
 # automatically), and buf generate + bundle-gomod produce the wasm2go bundle as
-# a self-contained Go module. The link accepts a symbol that two of its
-# archives define and keeps one of them; scripts/ext-symbols.py fails the
-# build when that happened (the perl5 build runs the same script on the
-# archives it made, see build_commands in wasmify.json), and the link itself
-# runs with warnings fatal (wasm_build.extra_ldflags), so a call whose two
-# sides disagree on the function's signature fails the build too.
+# a self-contained Go module. The link runs with warnings fatal
+# (wasm_build.extra_ldflags), so a call whose two sides disagree on the
+# function's signature fails the build.
 WASMIFY_PIPELINE = \
 	make tools && \
 	$(BUILD_ENV) bash scripts/wasi-configure.sh && \
@@ -54,7 +51,6 @@ WASMIFY_PIPELINE = \
 	wasmify parse-headers --header pl.h --clang $(WASI_CLANG) && \
 	wasmify gen-proto && \
 	$(BUILD_ENV) wasmify wasm-build --optimize --non-interactive && \
-	python3 scripts/ext-symbols.py linked .wasmify/wasm-build/lib && \
 	rm -rf build && \
 	buf generate --timeout 0 && \
 	make bundle-gomod

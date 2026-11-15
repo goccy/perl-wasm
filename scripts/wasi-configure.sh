@@ -42,11 +42,6 @@ POSIX_SHIM="-include $HERE/scripts/wasi-posix-shim.h"
 # Headers of system interfaces wasi-libc has no header for and this project
 # implements (<syslog.h>, see perl_syslog.cc).
 SYSTEM_HEADERS="-I$HERE/scripts/include"
-# Each bundled CPAN distribution renames its external symbols with a header
-# of this name in the directory it compiles in (scripts/ext-symbols.py). The
-# compiler looks for a force-included file in the working directory first and
-# on the include path after it, where scripts/include has the empty default.
-EXT_NAMES="-include perlwasm_ext_names.h"
 CLANG="$WASI_SDK_PATH/bin/clang"
 
 [ -d "$PERL/.git" ] || [ -f "$PERL/Configure" ] || {
@@ -104,11 +99,6 @@ Time/Piece Unicode/Collate Unicode/Normalize mro re"
 # HiRes.xs patch below). clock_nanosleep stays configured off. See
 # docs/xs-modules.md.
 
-# CPAN distributions linked in on top of the core's extensions: unpacked into
-# perl5/cpan and built by the core's own extension machinery (make_ext.pl runs
-# each distribution's Makefile.PL), so they land in static_ext like the rest.
-BUNDLED_EXT="$(python3 "$HERE/scripts/fetch-bundled-cpan.py" "$HERE/scripts/bundled-cpan.txt" "$PERL")"
-STATIC_EXT="$STATIC_EXT $BUNDLED_EXT"
 # Collapse the line continuations / extra whitespace into single spaces.
 STATIC_EXT="$(echo $STATIC_EXT)"
 
@@ -246,8 +236,8 @@ d_nanosleep='define'
 # down). Upstream Perl's Configure always adds this for gcc/clang (the arm base
 # config.sh we derive from carries it); the wasi override dropped it. Restore it.
 # Applies to core .c AND every XS extension (MakeMaker reads ccflags via %Config).
-ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
-cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $EXT_NAMES $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+ccflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+cppflags='--sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
 optimize='-O2'
 cccdlflags=' '
 ccdlflags=' '

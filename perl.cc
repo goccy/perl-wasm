@@ -42,7 +42,7 @@ extern "C" {
  * The XS extensions of this build are part of perl.wasm: one boot function
  * per extension, each in its lib/auto/<Mod>/<Mod>.a archive and resolved at
  * the perl.wasm link. KEEP IN SYNC with STATIC_EXT in
- * scripts/wasi-configure.sh and with scripts/bundled-cpan.txt.
+ * scripts/wasi-configure.sh.
  *
  * A statically linked perl usually registers every one of them at start-up
  * as <Module>::bootstrap (the xs_init ExtUtils::Miniperl writes into
@@ -100,26 +100,6 @@ void boot_Unicode__Collate(pTHX_ CV *cv);
 void boot_Unicode__Normalize(pTHX_ CV *cv);
 void boot_mro(pTHX_ CV *cv);
 void boot_re(pTHX_ CV *cv);
-/* CPAN distributions bundled on top of the core (scripts/bundled-cpan.txt) */
-void boot_Class__Load__XS(pTHX_ CV *cv);
-void boot_Class__XSAccessor(pTHX_ CV *cv);
-void boot_Clone(pTHX_ CV *cv);
-void boot_Cpanel__JSON__XS(pTHX_ CV *cv);
-void boot_Devel__Caller(pTHX_ CV *cv);
-void boot_Devel__Size(pTHX_ CV *cv);
-void boot_Digest__SHA1(pTHX_ CV *cv);
-void boot_HTML__Parser(pTHX_ CV *cv);
-void boot_List__MoreUtils__XS(pTHX_ CV *cv);
-void boot_Package__Stash__XS(pTHX_ CV *cv);
-void boot_PadWalker(pTHX_ CV *cv);
-void boot_Params__Util(pTHX_ CV *cv);
-void boot_Set__Object(pTHX_ CV *cv);
-void boot_Sub__Identify(pTHX_ CV *cv);
-void boot_Sub__Name(pTHX_ CV *cv);
-void boot_Test__LeakTrace(pTHX_ CV *cv);
-void boot_Text__CSV_XS(pTHX_ CV *cv);
-void boot_Want(pTHX_ CV *cv);
-void boot_YAML__XS__LibYAML(pTHX_ CV *cv);
 }
 
 /* The numbers of the operating system as the program sees them
@@ -182,25 +162,6 @@ const StaticExtension static_extensions[] = {
     {"Unicode::Normalize", boot_Unicode__Normalize},
     {"mro", boot_mro},
     {"re", boot_re},
-    {"Class::Load::XS", boot_Class__Load__XS},
-    {"Class::XSAccessor", boot_Class__XSAccessor},
-    {"Clone", boot_Clone},
-    {"Cpanel::JSON::XS", boot_Cpanel__JSON__XS},
-    {"Devel::Caller", boot_Devel__Caller},
-    {"Devel::Size", boot_Devel__Size},
-    {"Digest::SHA1", boot_Digest__SHA1},
-    {"HTML::Parser", boot_HTML__Parser},
-    {"List::MoreUtils::XS", boot_List__MoreUtils__XS},
-    {"Package::Stash::XS", boot_Package__Stash__XS},
-    {"PadWalker", boot_PadWalker},
-    {"Params::Util", boot_Params__Util},
-    {"Set::Object", boot_Set__Object},
-    {"Sub::Identify", boot_Sub__Identify},
-    {"Sub::Name", boot_Sub__Name},
-    {"Test::LeakTrace", boot_Test__LeakTrace},
-    {"Text::CSV_XS", boot_Text__CSV_XS},
-    {"Want", boot_Want},
-    {"YAML::XS::LibYAML", boot_YAML__XS__LibYAML},
 };
 
 } /* namespace */
