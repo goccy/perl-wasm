@@ -66,6 +66,16 @@ which may be replaced as a whole, and what an installation writes beside the
 library (ExtUtils::MakeMaker's perllocal.pod, under installarchlib) belongs
 to the user's installations.
 
+The name of the architecture is the host's: one interpreter runs on every
+host the embedding application is built for, and the native modules a
+program loads are built for the host. The interpreter is started with it
+(Internals::archname, see perl.cc), and the shipped Config.pm and
+Config_heavy.pl report it as archname and myarchname. The site's
+architecture directory is named after it: the build configures sitearch as
+sitelib/archname, and without site directories the shipped files report
+the build's sitelib with the run-time name below it (the build's own name,
+which config.sh holds, is not shown).
+
 The path of the perl command (perlpath, and startperl, the #! line for a
 program that is installed) is $^X when that is an absolute path: the
 embedding application sets $^X to what runs it as perl, if anything does.
@@ -74,7 +84,11 @@ The error numbers of Errno are those the program sees. Errno.pm holds the
 numbers of the C library perl was built with; a program that is shown the
 numbers of the system it runs on (see perl_numbers.cc) gets that system's
 names and numbers there too: the shipped Errno.pm asks the interpreter for
-them (Internals::host_numbers) when it is loaded. See present_errno.
+them (Internals::host_numbers) when it is loaded. Errno.pm also dies when
+%Config's archname and osvers are not the build's; at run time archname is
+the host's name of the architecture, and the archive ships with the
+interpreter whose C library the table is of, so the shipped Errno.pm does
+not compare them. See present_errno.
 
 The archive is written deterministically (sorted entries, fixed 1980 timestamps,
 fixed 0644 perms) so the same lib/ always yields byte-identical bytes.
@@ -133,6 +147,10 @@ $libdir = '/' if $libdir eq '';
 # it was started with any.
 my %site = Internals::site_directories();
 
+# The name of the architecture is the host's, which the interpreter was
+# started with.
+my $archname = Internals::archname();
+
 """
 
 # What Config_heavy.pl does to the text of config.sh it holds in $_, right
@@ -159,6 +177,20 @@ CONFIG_HEAVY_LIBDIR = """\
     my %site = Internals::site_directories();
     for my $key (keys %site) {
         $set->($key, $site{$key});
+    }
+    # The name of the architecture is the host's, which the interpreter was
+    # started with; the site's architecture directory is named after it
+    # (sitearch is sitelib/archname) also when no site directory was given.
+    my $archname = Internals::archname();
+    $set->('archname', $archname);
+    $set->('myarchname', $archname);
+    unless (%site) {
+        for my $kind (['sitearch', 'sitelib'], ['sitearchexp', 'sitelibexp'],
+                      ['installsitearch', 'installsitelib']) {
+            my ($arch, $lib) = @$kind;
+            my ($value) = /^\\Q$lib\\E='([^']*)'$/m;
+            $set->($arch, "$value/$archname") if defined $value;
+        }
     }
     # What is installed goes to the site directories, also what perl would
     # install beside its own library: the library directory is not a place
@@ -211,8 +243,10 @@ CONFIG_HEAVY_LIBDIR = """\
 """
 
 LIBDIR_KEYS = ("archlibexp", "privlibexp")
-# The site directories among the values Config.pm holds itself.
-SITE_KEYS = ("sitearchexp", "sitelibexp")
+# The keys of the architecture directories and of the library directory
+# each is below, which the build configures as <library>/<archname>.
+SITEARCH_KEYS = (("sitearch", "sitelib"), ("sitearchexp", "sitelibexp"),
+                 ("installsitearch", "installsitelib"))
 
 
 def replace_once(text: str, pattern: str, replacement: str, what: str) -> str:
@@ -242,11 +276,22 @@ ERRNO_PM_TAGS = """\
 
 """
 
+# Errno_pm.PL's comparison of %Config's architecture and system version
+# with the build's (see the module docstring for why it is left out).
+ERRNO_PM_ARCH_CHECK = (
+    r"^\"\$Config\{'archname'\}-\$Config\{'osvers'\}\" eq\n"
+    r"\"[^\"\n]*\" or\n"
+    r"\tdie \"Errno architecture \([^\n]*\) does not match executable architecture "
+    r"\(\$Config\{'archname'\}-\$Config\{'osvers'\}\)\";\n"
+)
+
 
 def present_errno(text: str) -> str:
     """Returns Errno.pm with the table taken from the interpreter when it
-    shows the program the numbers of another system (see the module
+    shows the program the numbers of another system, and without the
+    comparison of %Config's architecture with the build's (see the module
     docstring)."""
+    text = replace_once(text, ERRNO_PM_ARCH_CHECK, "", "Errno.pm: the architecture check")
     start = text.find("\nBEGIN {\n    %err = (\n")
     end = text.find("\n    );\n", start)
     if start < 0 or end < 0:
@@ -268,12 +313,21 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
         for key in LIBDIR_KEYS:
             text = replace_once(text, rf"^    {key} => '[^'\n]*',$", f"    {key} => $libdir,",
                                 f"Config.pm: {key}")
-        for key in SITE_KEYS:
-            match = re.search(rf"^    {key} => ('[^'\n]*'),$", text, flags=re.M)
-            if match is None:
-                raise SystemExit(f"make-stdlib-zip: Config.pm: {key} was not found")
-            text = replace_once(text, rf"^    {key} => '[^'\n]*',$",
-                                f"    {key} => $site{{{key}}} // {match.group(1)},", f"Config.pm: {key}")
+        archname = re.search(r"^    archname => '([^'\n]*)',$", text, flags=re.M)
+        sitelib = re.search(r"^    sitelibexp => '([^'\n]*)',$", text, flags=re.M)
+        sitearch = re.search(r"^    sitearchexp => '([^'\n]*)',$", text, flags=re.M)
+        if archname is None or sitelib is None or sitearch is None:
+            raise SystemExit("make-stdlib-zip: Config.pm: archname, sitelibexp or sitearchexp was not found")
+        if sitearch.group(1) != sitelib.group(1) + "/" + archname.group(1):
+            raise SystemExit("make-stdlib-zip: Config.pm: sitearchexp is not sitelibexp/archname")
+        text = replace_once(text, r"^    archname => '[^'\n]*',$", "    archname => $archname,",
+                            "Config.pm: archname")
+        text = replace_once(text, r"^    sitelibexp => '[^'\n]*',$",
+                            f"    sitelibexp => $site{{sitelibexp}} // '{sitelib.group(1)}',",
+                            "Config.pm: sitelibexp")
+        text = replace_once(text, r"^    sitearchexp => '[^'\n]*',$",
+                            f"    sitearchexp => $site{{sitearchexp}} // '{sitelib.group(1)}/' . $archname,",
+                            "Config.pm: sitearchexp")
         return text.encode("utf-8")
     if rel_path == "Errno.pm":
         return present_errno(data.decode("utf-8")).encode("utf-8")
@@ -288,6 +342,14 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
         if end < 0:
             raise SystemExit("make-stdlib-zip: Config_heavy.pl: the config.sh text does not end")
         end += len("\n!END!\n")
+        archname = re.search(r"^archname='([^']*)'$", text[start:end], flags=re.M)
+        if archname is None:
+            raise SystemExit("make-stdlib-zip: Config_heavy.pl: archname was not found")
+        for arch, lib in SITEARCH_KEYS:
+            a = re.search(rf"^{arch}='([^']*)'$", text[start:end], flags=re.M)
+            l = re.search(rf"^{lib}='([^']*)'$", text[start:end], flags=re.M)
+            if a is None or l is None or a.group(1) != l.group(1) + "/" + archname.group(1):
+                raise SystemExit(f"make-stdlib-zip: Config_heavy.pl: {arch} is not {lib}/archname")
         return (text[:end] + CONFIG_HEAVY_LIBDIR + text[end:]).encode("utf-8")
     return data
 

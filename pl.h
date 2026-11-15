@@ -85,21 +85,25 @@
  * `site_dir`, when non-empty, is the directory the site directories are
  * under: where modules installed for this interpreter go and are found.
  *
- *   <site_dir>/site_perl/<version>               sitelib
- *   <site_dir>/site_perl/<version>/<site_arch>   sitearch
- *   <site_dir>/bin                               sitebin, sitescript
- *   <site_dir>/man/man1, <site_dir>/man/man3     siteman1dir, siteman3dir
+ *   <site_dir>/site_perl/<version>              sitelib
+ *   <site_dir>/site_perl/<version>/<archname>   sitearch
+ *   <site_dir>/bin                              sitebin, sitescript
+ *   <site_dir>/man/man1, <site_dir>/man/man3    siteman1dir, siteman3dir
  *
- * <version> is this interpreter's. `site_arch` names the kind of machine
- * the architecture-specific files there are for (the host's, when native
- * extensions are loaded into the host process); empty stands for the
- * interpreter's own architecture name. %Config reports the directories
+ * <version> is this interpreter's. `archname` is the name of the
+ * architecture: the host's, which the one interpreter takes from whatever
+ * host it runs on (native modules are built for the host). It is
+ * $Config{archname} and myarchname, the name of the architecture
+ * subdirectories perl adds to @INC with a directory (PERL5LIB, -I) and of
+ * the site's architecture directory, and what `perl -v` says perl was
+ * built for; empty stands for the name the build was configured with.
+ * %Config reports the directories
  * under every key that names one of them, and sitearch and sitelib are in
  * @INC where perl has them: after the PERL5LIB directories and before the
  * standard library. None of them is created. Without a site_dir %Config
  * keeps the values of the build's configuration and @INC has no site
  * directory. */
-uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *site_arch);
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname);
 
 /* Evaluate `src` (a string eval in scalar context, REPL-like state
  * persistence). ok payload:
@@ -131,8 +135,8 @@ void perl_close(uint64_t h);
  *
  *   *(uint32_t *)perl_interrupt_addr(h) = 1;
  *
- * The guest clears the flag when it fires. Addresses are 32-bit linear-memory
- * offsets (wasm32). Like CPython's eval-breaker, this only fires at opcode
+ * The guest clears the flag when it fires. The address is a linear-memory
+ * offset. Like CPython's eval-breaker, this only fires at opcode
  * boundaries: a single long-running op (a pathological regex, a big sort) is
  * not preempted until it returns to the run loop.
  *
@@ -140,7 +144,7 @@ void perl_close(uint64_t h);
  * (pseudo-)process: no eval can catch it, and the process ends by that
  * signal at the next opcode boundary, where it stands (no END block, no
  * destructor). */
-uint32_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
+uint64_t perl_interrupt_addr(uint64_t h); /* &interrupt flag word (write 1 to trip) */
 
 /* Call the named Perl subroutine in list context. `sub_name` is a fully
  * qualified sub name ("main::handler", "My::App::run") or a main:: sub name;
@@ -216,33 +220,32 @@ void perl_set_go_dispatcher(uint64_t h, int32_t callback_id);
  * in a host-native shared library the embedder dlopen'd (go-perl's native XS
  * SDK). Perl-side each such sub is an ordinary XS backed by a generic thunk
  * that forwards the call over the wasmify callback import with the reserved
- * method id -1: payload [u32 fn_id][u32 cv_token][u32 items][u32
- * sv_tokens...], response [u8 ok] then on success [u32 nret][u32
- * sv_tokens...] or on failure the croak message. The host runs the native
- * XSUB (real XSUBs receive their own CV, hence the cv token), using
+ * method id -1. The requests and responses of the reserved method ids are
+ * made of 64-bit words (an address of the linear memory is one, whole): the
+ * request is [fn_id][cv][items][svs...], the response a status byte, then
+ * on success [nret][svs...] or on failure the croak message. The host runs
+ * the native XSUB (real XSUBs receive their own CV, hence the cv), using
  * perl_xs_helper for every SV operation, and the thunk pushes the returned
  * (mortal) SVs.
  *
  * A second reserved method id, -2, flows the OTHER way on teardown: freeing
  * a guest SV that carries goperl anchor magic (op SV_MAGIC_ATTACH) sends
- * the u32 host magic id so the host can run the native module's svt_free
- * and drop its mirror MAGIC chain.
+ * the host magic id ([id]) so the host can run the native module's
+ * svt_free and drop its mirror MAGIC chain.
  *
  * Reserved method id -3 carries pp hooks: for op types a native module
- * claimed (op PP_HOOK_SET), the run loop sends [u32 op][u32 op_type][u32 n]
- * [u32 stack-top tokens] instead of executing the pp, and the host answers
- * [1][u32 next_op] (or [0]+message to croak). The hook runs the true pp
- * itself through op RUN_ORIGINAL — the guest PL_ppaddr is never patched.
+ * claimed (op PP_HOOK_SET), the run loop sends [op][op_type] and the perl
+ * stack instead of executing the pp, and the host answers [1][next_op] and
+ * the stack (or [0]+message to croak). The hook runs the true pp itself
+ * through op RUN_ORIGINAL — the guest PL_ppaddr is never patched.
  *
  * Reserved method id -4 fires save-stack destructors (op SAVE_DESTRUCTOR):
- * the u32 host id is delivered when the guest scope holding it pops,
+ * the host id ([id]) is delivered when the guest scope holding it pops,
  * during normal exit and die unwinding alike.
  *
- * Reserved method id -5 fires host-side set-magic: when a guest SV whose
- * anchor magic was upgraded via op SV_MAGIC_SET_HOOK is assigned to, the
- * u32 host magic id is delivered so the host can run the svt_set hooks of
- * its mirror MAGIC chain. Anchors start set-less; the host upgrades one
- * only when a mirror entry actually carries svt_set. */
+ * The other reserved method ids (-6 PerlIO layers, -7 keyword and infix
+ * plugins, -8 `local` of an SV with host magic, -9 the calls of native code
+ * that share one channel) are described in perl.cc. */
 
 /* Bind the generic native thunk as the Perl sub `name`; fn_id is the host's
  * key for the actual native function (stored in the CV's XSANY). */
@@ -250,21 +253,26 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
 
 /* SV micro-operations the host-side SDK vtable is built from. The full op
  * table lives in perl.cc (and mirrors the GOPERL_OP_* enum in the go-perl
- * native SDK header); representative entries:
+ * native SDK header). An operation takes three u64 operands a, b and c and
+ * a string s; a token (an address of the linear memory) is always an
+ * operand of its own, whole. It answers a u64; an operation that answers
+ * two values leaves the second in the operation box (result2, see
+ * perl_xs_opbox), where the host reads it right after the operation.
+ * Representative entries:
  *   1  SV_IV       a=sv                  -> IV (as u64)
- *   2  SV_PV       a=sv                  -> (ptr<<32)|len into linear memory
+ *   2  SV_PV       a=sv                  -> ptr into linear memory; second: len
  *   3  NEW_IV      a=iv                  -> new SV token
  *   4  NEW_PVN     s=bytes b=len         -> new SV token
  *   5  SV_MORTAL   a=sv                  -> sv (now mortal)
  *   ...
  *   23-64          sv_setsv/setiv/setnv/catsv families, NV ops, AV/HV entry
  *                  and iterator ops, ENTER/LEAVE/SAVETMPS/FREETMPS
- *   65 CALL_SV     a=flags<<32|sv, s+b=packed u32 arg tokens
- *                  -> died<<63 | count<<32 | mortal-AV token of results
- *   66 CALL_METHOD like CALL_SV but s = "name\0" + packed tokens
+ *   65 CALL_SV     a=sv, c=flags, s+b=the arguments, a u64 word each
+ *                  -> mortal-AV token of results; second: died<<63 | count
+ *   66 CALL_METHOD like CALL_SV but s = "name\0" + the arguments
  *   68 SAVE_OP     scope-save PL_op (the SAVEOP() macro)
- *   69 RUN_PP_SCRATCH a=op_flags<<32|op_type, s+b=arg tokens: run one pp
- *                  function on a scratch OP in list context
+ *   69 RUN_PP_SCRATCH a=op_flags<<32|op_type, s+b=the arguments as words:
+ *                  run one pp function on a scratch OP in list context
  *   70-72          host-side MAGIC anchor attach / id lookup / unattach
  *   73-74,80       PL_* interpreter-variable get/set and local'ised hooks
  *   98-100         pp-hook table, RUN_ORIGINAL, save-stack destructors
@@ -284,21 +292,24 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  *                  I/O, sv_force_normal, cop hints, real sv_magic for
  *                  behavioral (tie) magic
  * Unknown ops return 0. */
-uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s);
+uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, uint64_t c,
+                        const char *s);
 
 /* perl_xs_helper without the bridge's encoding, for the operations native
  * code makes by the million: perl_xs_opbox answers the address of the
  * instance's operation box, a struct goperl_opbox in linear memory
- * ([a][b][result] as u64, [op] as i32, [slen] as u32, then the slen bytes
- * of s: 32 bytes before s, GOPERL_OPBOX_STR bytes of room for s). The
- * host writes an operation's arguments there and calls perl_xs_op, which
- * runs it as perl_xs_helper does (s NUL-terminated) and leaves its result
- * in the box; it answers 0, so that the bridge sends nothing back. A
- * string longer than the box holds goes through perl_xs_helper. The box is
- * free again once perl_xs_op has returned: an operation that leads to
- * native code (magic, a callback) has the operations of that code use it
- * meanwhile, after this one has taken its arguments out. */
-uint32_t perl_xs_opbox(uint64_t h);
+ * ([a][b][c][result][result2] as u64, [op] as i32, [slen] as u32, then the
+ * slen bytes of s: 48 bytes before s, GOPERL_OPBOX_STR bytes of room for
+ * s). The host writes an operation's arguments there and calls perl_xs_op,
+ * which runs it as perl_xs_helper does (s NUL-terminated) and leaves its
+ * result in the box; it answers 0, so that the bridge sends nothing back. A
+ * string longer than the box holds goes through perl_xs_helper. Either way
+ * the second value of an operation that answers two is in result2 when the
+ * operation has returned. The box is free again once the operation has
+ * returned: an operation that leads to native code (magic, a callback) has
+ * the operations of that code use it meanwhile, after this one has taken
+ * its arguments out. */
+uint64_t perl_xs_opbox(uint64_t h);
 uint32_t perl_xs_op(void);
 
 /* Run a forked child to its end.
