@@ -961,6 +961,38 @@ else:
     open(path, "w").write(t)
     print(f"Unix-domain address lengths applied to {path}")
 PYPATCH
+# ---- op.c: the ops whose memory goes back are reported -------------------------
+# The XS bridge tells the host which of the ops it described were freed
+# (perl.cc, goperl_op_released): only then can an address name another op,
+# and the host's copy of the op must go. PL_opfreehook does not say it of
+# every op: op_free calls it, op_destroy does not (the list op_append_list
+# moved into another, the loop op newFOROP makes anew). Slab_Free, which
+# both free an op through, reports the op; so does newFOROP when realloc
+# moves a loop op made outside a slab. Idempotent.
+python3 - <<'PYPATCH'
+path = "op.c"
+t = open(path).read()
+if "goperl_op_released" in t:
+    print(f"op release reports already present in {path}")
+else:
+    for old, new in [
+        ("void\nPerl_Slab_Free(pTHX_ void *op)\n{\n    PERL_ARGS_ASSERT_SLAB_FREE;\n\n"
+         "    OP * const o = (OP *)op;\n    OPSLAB *slab;\n",
+         "extern void goperl_op_released(OP *o);\n\n"
+         "void\nPerl_Slab_Free(pTHX_ void *op)\n{\n    PERL_ARGS_ASSERT_SLAB_FREE;\n\n"
+         "    OP * const o = (OP *)op;\n    OPSLAB *slab;\n\n    goperl_op_released(o);\n"),
+        ("        /* loop was malloc()ed */\n"
+         "        loop = (LOOP*)PerlMemShared_realloc(loop, sizeof(LOOP));\n",
+         "        /* loop was malloc()ed */\n"
+         "        const uintptr_t was = (uintptr_t)loop;\n"
+         "        loop = (LOOP*)PerlMemShared_realloc(loop, sizeof(LOOP));\n"
+         "        if ((uintptr_t)loop != was) goperl_op_released((OP *)was);\n"),
+    ]:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"op release reports applied to {path}")
+PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of
 # the core *.o files, so a flag change alone would leave stale objects that

@@ -4210,9 +4210,9 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
     uint32_t w[GOPERL_OPREC_WORDS];
     memset(w, 0, sizeof w);
     if (o->op_type == OP_FREED) {
-        /* freed without a word to the free hook (the interpreter drops an
-         * op it has just merged into another that way): its type says so,
-         * and nothing else of it means anything */
+        /* an op whose slot went back to the free list of its slab, which a
+         * link an op still holds can lead to: its type says so, and nothing
+         * else of it means anything */
         w[GOPERL_OPREC_TOK] = (uint32_t)(uintptr_t)o;
         w[GOPERL_OPREC_TYPE] = (uint32_t)OP_FREED;
         w[GOPERL_OPREC_BITS] = edge ? GOPERL_OPBIT_EDGE : 0;
@@ -4391,13 +4391,17 @@ static void goperl_op_dump(pTHX_ OP *root, int mode, bool root_is_cop,
  * with), and the ones of them the interpreter has freed since the host last
  * asked: a description is good until its op is freed, since only then can
  * the address name another op. The host reads the count straight from this
- * memory, and asks for the list when it is not zero. */
+ * memory, and asks for the list when it is not zero.
+ *
+ * Every op perl frees goes back through Slab_Free, by op_free, which tells
+ * PL_opfreehook, or by op_destroy, which does not (the list op_append_list
+ * moved into another, the loop op newFOROP makes anew); and newFOROP moves
+ * a loop op made outside a slab with realloc. The patch to op.c (see
+ * scripts/wasi-configure.sh) reports each of them here. */
 static std::unordered_set<OP *> g_ops_described;
 static std::vector<uint32_t> g_ops_freed;
 static uint32_t g_ops_freed_count = 0;
-static Perl_ophook_t g_next_opfreehook = NULL;
-static bool g_opfreehook_set = false;
-static void goperl_opfreehook(pTHX_ OP *o) {
+extern "C" void goperl_op_released(OP *o) {
     if (!g_raw_ops.empty()) g_raw_ops.erase(o);
     if (!g_custom_built.empty()) g_custom_built.erase(o);
     if (!g_ops_described.empty()) {
@@ -4408,13 +4412,6 @@ static void goperl_opfreehook(pTHX_ OP *o) {
             g_ops_freed_count = (uint32_t)g_ops_freed.size();
         }
     }
-    if (g_next_opfreehook) g_next_opfreehook(aTHX_ o);
-}
-static void goperl_opfreehook_install(pTHX) {
-    if (g_opfreehook_set) return;
-    g_opfreehook_set = true;
-    g_next_opfreehook = PL_opfreehook;
-    PL_opfreehook = goperl_opfreehook;
 }
 
 /* ---- INTERNAL: the compiler's structures and saves of interpreter state ---- */
@@ -5345,7 +5342,6 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s,
         case GOPERL_PL_ERRNO: return (uint64_t)(int64_t)errno;
         case GOPERL_PL_STATUSVALUE: return (uint64_t)(int64_t)PL_statusvalue;
         case GOPERL_PL_OP_FREED:
-            goperl_opfreehook_install(aTHX);
             return (uint64_t)(uintptr_t)&g_ops_freed_count;
         case GOPERL_PL_COMPILING: return (uint64_t)(uintptr_t)(OP *)&PL_compiling;
         case GOPERL_PL_WARN_ALL: return (uint64_t)(uintptr_t)pWARN_ALL;
@@ -6159,7 +6155,6 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s,
             o = (OP *)Perl_Slab_Alloc(aTHX_ sizeof(LOGOP));
             o->op_type = OP_NULL;
             o->op_ppaddr = PL_ppaddr[OP_NULL];
-            goperl_opfreehook_install(aTHX);
             g_raw_ops.insert(o);
             break;
         }
@@ -6175,10 +6170,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s,
                           cUNOPx(o)->op_first->op_type == OP_CUSTOM)
                            ? cUNOPx(o)->op_first
                            : NULL;
-            if (made && cls >= 0 && cls < (int)(sizeof built / sizeof built[0])) {
-                goperl_opfreehook_install(aTHX);
+            if (made && cls >= 0 && cls < (int)(sizeof built / sizeof built[0]))
                 g_custom_built[made] = built[cls];
-            }
         }
         return (uint64_t)(uintptr_t)o;
     }
@@ -7373,7 +7366,6 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s,
                    (uint32_t)records.size();
         }
         if (!o) return 0;
-        goperl_opfreehook_install(aTHX);
         const size_t cap = (size_t)(b >> 8);
         goperl_op_dump(aTHX_ o, (int)(b & 0x7F), cBOOL(b & 0x80), cap ? cap : 1, records);
         for (size_t i = 0; i < records.size(); i += GOPERL_OPREC_WORDS)
@@ -7738,10 +7730,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s,
             }
             }
             OP *o = newUNOP_AUX((I32)w[0], (I32)w[1], GOPERL_W_OP(2), aux);
-            if ((I32)w[0] == OP_CUSTOM) {
-                goperl_opfreehook_install(aTHX);
-                g_custom_built[o] = OPclass_UNOP_AUX;
-            }
+            if ((I32)w[0] == OP_CUSTOM) g_custom_built[o] = OPclass_UNOP_AUX;
             return (uint64_t)(uintptr_t)o;
         }
         case GOPERL_TREE_PARSE_SUBSIGNATURE:
