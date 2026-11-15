@@ -3767,11 +3767,10 @@ enum {
 
 /* A word of the answers laid out as words in this memory (LAYERS,
  * FIND_FILE, EXPORT_FILE): an address of this memory, or a value that
- * travels with one, as wide as an address. A 64-bit value is two of them,
- * the low one first. */
+ * travels with one, in 32 bits. An address fits one: the linear memory is
+ * at most 4 GiB (see "Addresses" at the top of this file). A 64-bit value
+ * is two of them, the low one first. */
 typedef uint32_t goperl_gword_t;
-static_assert(sizeof(goperl_gword_t) == sizeof(void *),
-              "a word of the answers is as wide as an address");
 
 /* SAVE_MISC selectors. */
 enum {
