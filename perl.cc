@@ -1085,7 +1085,19 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
                                          sizeof(id));
     if (rc == GOPERL_CALLBACK_JUMPED) return;
     uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    if (resp_ptr == 0) return;
+    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+    /* The destructor died: so does the scope's end, as with a destructor
+     * of perl's own (the die goes on to the nearest eval, also when the
+     * scope ends because of an earlier one). */
+    goperl_die_if_thrown(aTHX_ resp);
+    if (resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
+        SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
+        free(resp);
+        croak_sv(msg);
+    }
+    free(resp);
 }
 
 /* PL_runops replacement: checks the interrupt flag on every opcode. When set,
@@ -3515,7 +3527,8 @@ enum {
     GOPERL_CALL_UVAR = 11,   /* uvar magic whose functions are the host's */
     GOPERL_CALL_XOP = 12,    /* custom_op_register: b = class, s = name NUL
                               * description NUL -> the op's number */
-    GOPERL_CALL_COP_SAVE = 13, /* b: 0 SAVECOPLINE, 1 SAVECOPFILE_FREE */
+    GOPERL_CALL_COP_SAVE = 13, /* b: 0 SAVECOPLINE, 1 SAVECOPFILE_FREE,
+                                * 2 SAVECOPSTASH_FREE */
     GOPERL_CALL_LEX_START = 14, /* a = the line (or 0), b = flags */
     GOPERL_CALL_PARSER = 15, /* -> the address of the parser's fields, or 0 */
     GOPERL_CALL_SCAN_VERSION = 17, /* a = the SV to fill; b = qv<<32 | the
@@ -3606,7 +3619,13 @@ enum {
     GOPERL_FIELD_CV_OUTSIDE_SET = 16,
     GOPERL_FIELD_HVAUX_FLAGS = 17,
     GOPERL_FIELD_LV_TYPE_SET = 18,
-    GOPERL_FIELD_LV_TARG_SET = 19
+    GOPERL_FIELD_LV_TARG_SET = 19,
+    /* the fields of an IO, the plain stores of sv.h: b = the handle (an
+     * address of this memory), the type character, the flags */
+    GOPERL_FIELD_IO_IFP_SET = 20,
+    GOPERL_FIELD_IO_OFP_SET = 21,
+    GOPERL_FIELD_IO_TYPE_SET = 22,
+    GOPERL_FIELD_IO_FLAGS_SET = 23
 };
 static_assert(HvAUXf_IS_CLASS == 0x4, "the SDK's HvAUXf_IS_CLASS is this build's");
 
@@ -3682,10 +3701,35 @@ enum {
     GOPERL_PIO_SET_PTRCNT = 29,
     GOPERL_PIO_FILL = 30,
     GOPERL_PIO_APPLY_LAYERS = 31,
-    GOPERL_PIO_LAYERS = 32 /* -> the address of [n] and, for each layer from
-                            * the top, [the address of its next field][the
-                            * address of its name][its kind][its flags] */
+    GOPERL_PIO_LAYERS = 32, /* -> the address of [n] and, for each layer
+                            * from the top, [the address of its next
+                            * field][the address of its name][its kind][its
+                            * flags]; with b = 1 six more words a layer:
+                            * [buf][end][ptr][bufsiz][posn lo][posn hi] of a
+                            * buffered one (PerlIOBuf), zeros for another */
+    /* The stdio stream of the handle, made as perl makes it: FIND_FILE is
+     * PerlIO_findFILE (the stream of the handle's :stdio layer, or a new
+     * one), EXPORT_FILE is PerlIO_exportFILE (s = the mode, or empty): the
+     * handle is flushed, a stream is opened on its descriptor and a :stdio
+     * layer with it is pushed. Both -> the address of [descriptor][the
+     * stream][st_dev lo][st_dev hi][st_ino lo][st_ino hi][offset lo][offset
+     * hi], the descriptor being -1 when there is no stream; the device, the
+     * inode and the offset (-1 where it has none) are the descriptor's, for
+     * the host to know whether its descriptor of that number is the same.
+     * RELEASE_FILE (b = the stream) is
+     * PerlIO_releaseFILE: the :stdio layer of that stream is popped. */
+    GOPERL_PIO_FIND_FILE = 33,
+    GOPERL_PIO_EXPORT_FILE = 34,
+    GOPERL_PIO_RELEASE_FILE = 35
 };
+
+/* A word of the answers laid out as words in this memory (LAYERS,
+ * FIND_FILE, EXPORT_FILE): an address of this memory, or a value that
+ * travels with one, as wide as an address. A 64-bit value is two of them,
+ * the low one first. */
+typedef uint32_t goperl_gword_t;
+static_assert(sizeof(goperl_gword_t) == sizeof(void *),
+              "a word of the answers is as wide as an address");
 
 /* SAVE_MISC selectors. */
 enum {
@@ -3786,6 +3830,7 @@ enum {
                                 * the right one | the method's index << 32 |
                                 * the AMGf_ flags << 40; the result, or 0
                                 * when the operator is not overloaded */
+    GOPERL_SVCALL_NUMCMP = 62, /* as CMP, numerically (sv_numcmp_flags) */
     GOPERL_SVCALL_AV_BODY = 59 /* the body of an array as it is in memory:
                  * (AvARRAY << 32) | the number of elements (AvFILLp + 1).
                  * Native code reads the slots there in one go. */
@@ -3811,6 +3856,7 @@ enum {
     GOPERL_GVCALL_HV_SET = 15,
     GOPERL_GVCALL_CVGEN_SET = 16, /* GvCVGEN(gv) = b */
     GOPERL_GVCALL_STASH_SET = 17, /* GvSTASH(gv) = b, the plain assignment */
+    GOPERL_GVCALL_IO_SET = 18,    /* GvIOp(gv) = b, the plain assignment */
     GOPERL_GVCALL_FIRST_CV = 32,
     GOPERL_GVCALL_CV_GV_SET = 32,
     GOPERL_GVCALL_CV_STASH_SET = 33,
@@ -4057,7 +4103,10 @@ enum {
 #define GOPERL_PL_SUBNAME 91
 #define GOPERL_PL_CURSTNAME 92
 #define GOPERL_PL_PADIX_FLOOR 93
-#define GOPERL_PL_PARSER 94         /* saves only: the parser is CALL 15's */
+#define GOPERL_PL_PARSER 94         /* the parser is CALL 15's; a store
+                                     * only clears it (b = 0), as code does
+                                     * that hides the parser from the hooks
+                                     * an op it builds runs */
 #define GOPERL_PL_MULTIDEREF_PC 95  /* the item of a multideref's aux being
                                      * run (an address of this memory) */
 #define GOPERL_PL_NOMEMOK 96
@@ -5405,6 +5454,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_PL_TMPS_FLOOR: PL_tmps_floor = (SSize_t)(int64_t)b; return 0;
         case GOPERL_PL_CURPM: PL_curpm = (PMOP *)(uintptr_t)(uint32_t)b; return 0;
         case GOPERL_PL_DEFSTASH: PL_defstash = (HV *)val; return 0;
+        case GOPERL_PL_PARSER:
+            if (!b) PL_parser = NULL;
+            return 0;
         }
         return 0;
     }
@@ -6604,17 +6656,65 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         case GOPERL_PIO_VALID: return PerlIOValid(f) ? 1 : 0;
         case GOPERL_PIO_LAYERS: {
-            static std::vector<uint32_t> w;
+            static std::vector<goperl_gword_t> w;
             w.assign(1, 0);
             for (PerlIO *l = f; l && *l; l = PerlIONext(l)) {
-                w.push_back((uint32_t)(uintptr_t)PerlIONext(l));
-                w.push_back((uint32_t)(uintptr_t)(*l)->tab->name);
-                w.push_back((uint32_t)(*l)->tab->kind);
-                w.push_back((uint32_t)(*l)->flags);
+                w.push_back((goperl_gword_t)(uintptr_t)PerlIONext(l));
+                w.push_back((goperl_gword_t)(uintptr_t)(*l)->tab->name);
+                w.push_back((goperl_gword_t)(*l)->tab->kind);
+                w.push_back((goperl_gword_t)(*l)->flags);
+                if (b == 1) {
+                    if ((*l)->tab->kind & PERLIO_K_BUFFERED) {
+                        const PerlIOBuf *pb = PerlIOSelf(l, PerlIOBuf);
+                        w.push_back((goperl_gword_t)(uintptr_t)pb->buf);
+                        w.push_back((goperl_gword_t)(uintptr_t)pb->end);
+                        w.push_back((goperl_gword_t)(uintptr_t)pb->ptr);
+                        w.push_back((goperl_gword_t)pb->bufsiz);
+                        w.push_back((goperl_gword_t)(uint64_t)pb->posn);
+                        w.push_back((goperl_gword_t)((uint64_t)pb->posn >> 32));
+                    } else {
+                        w.insert(w.end(), 6, 0);
+                    }
+                }
                 w[0]++;
             }
             return (uint64_t)(uintptr_t)w.data();
         }
+        case GOPERL_PIO_FIND_FILE:
+        case GOPERL_PIO_EXPORT_FILE: {
+            static goperl_gword_t w[8];
+            memset(w, 0, sizeof w);
+            w[0] = (goperl_gword_t)-1;
+            /* the stream of a :stdio layer the handle has, or a new one,
+             * which is unbuffered: the host opens its own on the same
+             * descriptor, also unbuffered, so that what the program and
+             * the native code write reaches the descriptor in the order
+             * they write it (through perl's one stream) */
+            bool have = false;
+            if (fn == GOPERL_PIO_FIND_FILE)
+                for (PerlIO *l = f; l && *l; l = PerlIONext(l))
+                    if ((*l)->tab == &PerlIO_stdio) have = true;
+            FILE *stdio = have ? PerlIO_findFILE(f)
+                               : PerlIO_exportFILE(f, (s && *s) ? s : NULL);
+            if (stdio && !have) setvbuf(stdio, NULL, _IONBF, 0);
+            const int fd = stdio ? fileno(stdio) : -1;
+            struct stat st;
+            if (fd >= 0 && fstat(fd, &st) == 0) {
+                w[0] = (goperl_gword_t)fd;
+                w[1] = (goperl_gword_t)(uintptr_t)stdio;
+                w[2] = (goperl_gword_t)(uint64_t)st.st_dev;
+                w[3] = (goperl_gword_t)((uint64_t)st.st_dev >> 32);
+                w[4] = (goperl_gword_t)(uint64_t)st.st_ino;
+                w[5] = (goperl_gword_t)((uint64_t)st.st_ino >> 32);
+                const int64_t off = (int64_t)lseek(fd, 0, SEEK_CUR);
+                w[6] = (goperl_gword_t)(uint64_t)off;
+                w[7] = (goperl_gword_t)((uint64_t)off >> 32);
+            }
+            return (uint64_t)(uintptr_t)w;
+        }
+        case GOPERL_PIO_RELEASE_FILE:
+            PerlIO_releaseFILE(f, (FILE *)(uintptr_t)(uint32_t)b);
+            return 0;
         }
         /* Everything below works on an open handle; on anything else it
          * fails the way the function does on a closed one. */
@@ -6738,6 +6838,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
             return (uint64_t)(int64_t)sv_cmp_flags(sv, other, hi);
         case GOPERL_SVCALL_CMP_LOCALE:
             return (uint64_t)(int64_t)sv_cmp_locale_flags(sv, other, hi);
+        case GOPERL_SVCALL_NUMCMP:
+            return (uint64_t)(int64_t)sv_numcmp_flags(sv, other, hi);
         case GOPERL_SVCALL_EQ: return sv_eq_flags(sv, other, hi) ? 1 : 0;
         case GOPERL_SVCALL_MRO_LINEAR_ISA:
             return (uint64_t)(uintptr_t)(SV *)mro_get_linear_isa((HV *)sv);
@@ -6873,6 +6975,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_GVCALL_SV_SET: GvSV(gv) = other; return 0;
         case GOPERL_GVCALL_AV_SET: GvAV(gv) = (AV *)other; return 0;
         case GOPERL_GVCALL_HV_SET: GvHV(gv) = (HV *)other; return 0;
+        case GOPERL_GVCALL_IO_SET: GvIOp(gv) = (IO *)other; return 0;
         case GOPERL_GVCALL_CV_GV_SET: CvGV_set(cv, (GV *)other); return 0;
         case GOPERL_GVCALL_CV_STASH_SET: CvSTASH_set(cv, (HV *)other); return 0;
         case GOPERL_GVCALL_CV_FLAGS: {
@@ -7040,6 +7143,18 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         case GOPERL_FIELD_CV_OUTSIDE_SET: /* the plain store: no count changes */
             if (SvTYPE(sv) == SVt_PVCV || SvTYPE(sv) == SVt_PVFM)
                 CvOUTSIDE((CV *)sv) = (CV *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case GOPERL_FIELD_IO_IFP_SET:
+            if (SvTYPE(sv) == SVt_PVIO) IoIFP((IO *)sv) = (PerlIO *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case GOPERL_FIELD_IO_OFP_SET:
+            if (SvTYPE(sv) == SVt_PVIO) IoOFP((IO *)sv) = (PerlIO *)(uintptr_t)(uint32_t)b;
+            return 0;
+        case GOPERL_FIELD_IO_TYPE_SET:
+            if (SvTYPE(sv) == SVt_PVIO) IoTYPE((IO *)sv) = (char)b;
+            return 0;
+        case GOPERL_FIELD_IO_FLAGS_SET:
+            if (SvTYPE(sv) == SVt_PVIO) IoFLAGS((IO *)sv) = (U8)b;
             return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown field %d", (int)(a >> 32));
@@ -7314,7 +7429,9 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         }
         case GOPERL_CALL_COP_SAVE: {
             COP *cop = (COP *)(uintptr_t)(uint32_t)a;
-            if (b)
+            if (b == 2)
+                SAVECOPSTASH_FREE(cop);
+            else if (b)
                 SAVECOPFILE_FREE(cop);
             else
                 SAVECOPLINE(cop);
