@@ -933,6 +933,60 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"native-mechanism patch applied to {path}")
 PYPATCH
+# ---- B: the number of an op carries bit 62 ------------------------------------
+# A native module of the host process makes an op a number (PTR2IV) and a
+# number an op (INT2PTR), and so does B: the number of a B::OP object is the
+# op's address. The module's own ops are in the host process, the
+# interpreter's are in this memory, and an address of either can be any
+# number below the end of the memory: a number alone would not say which.
+# So the number of an interpreter op has bit 62 set, which no address of a
+# host process has (user space ends below 2^47 on macOS and 2^48, or 2^57,
+# on Linux; arm64 memory tags use bits 56-59), and the native SDK's PTR2IV
+# and INT2PTR of an op do the same (go-perl's xs/sdk/include/perl.h,
+# GOPERL_OP_NUMBER_TAG). B gives tagged numbers (make_op_object, the keys of
+# B::overlay, walkoptree's objects) and takes tagged and untagged ones
+# (T_OP_OBJ). No op is still the number 0. Idempotent.
+python3 - <<'PYPATCH'
+def patch(path, marker, edits):
+    t = open(path).read()
+    if marker in t:
+        print(f"op numbers with bit 62 already in {path}")
+        return
+    for old, new in edits:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"op numbers with bit 62 applied to {path}")
+
+patch("ext/B/B.xs", "GOPERL_OP_NUMBER_TAG", [
+    ('#include "XSUB.h"\n',
+     '#include "XSUB.h"\n'
+     '\n'
+     '/* The number of an op is its address with bit 62 set, which no address\n'
+     ' * of the host process has: a native module tells an op of this\n'
+     ' * interpreter from one of its own by the number (perl-wasm\n'
+     ' * scripts/wasi-configure.sh). No op is 0. */\n'
+     '#define GOPERL_OP_NUMBER_TAG ((IV)1 << 62)\n'
+     '#define GOPERL_OP_NUMBER(o) ((o) ? (PTR2IV(o) | GOPERL_OP_NUMBER_TAG) : (IV)0)\n'
+     '#define GOPERL_NUMBER_OP(type, iv) INT2PTR(type, (iv) & ~GOPERL_OP_NUMBER_TAG)\n'),
+    ('    sv_setiv(newSVrv(opsv, opclassnames[op_class(o)]), PTR2IV(o));\n',
+     '    sv_setiv(newSVrv(opsv, opclassnames[op_class(o)]), GOPERL_OP_NUMBER(o));\n'),
+    ('    key = newSViv(PTR2IV(o));\n',
+     '    key = newSViv(GOPERL_OP_NUMBER(o));\n'),
+    ('    sv_setiv(object, PTR2IV(o));\n',
+     '    sv_setiv(object, GOPERL_OP_NUMBER(o));\n'),
+])
+patch("ext/B/typemap", "GOPERL_NUMBER_OP", [
+    ('T_OP_OBJ\n'
+     '\tif (SvROK($arg)) {\n'
+     '\t    IV tmp = SvIV((SV*)SvRV($arg));\n'
+     '\t    $var = INT2PTR($type,tmp);\n',
+     'T_OP_OBJ\n'
+     '\tif (SvROK($arg)) {\n'
+     '\t    IV tmp = SvIV((SV*)SvRV($arg));\n'
+     '\t    $var = GOPERL_NUMBER_OP($type,tmp);\n'),
+])
+PYPATCH
 # ---- $! and the status of a die are numbers the program sees ------------------
 # errno holds the error numbers of this C library. A program that is the
 # host process is shown the host's numbers (perl_numbers.cc), so the three
