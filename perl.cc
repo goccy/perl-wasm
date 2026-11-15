@@ -1,4 +1,4 @@
-/* perl.cc — Perl embedding bridge (implements pl.h) for wasm32-wasi + Go.
+/* perl.cc — Perl embedding bridge (implements pl.h) for wasm64-wasi + Go.
  *
  * This is the wasmify CustomBridgeSource: it wraps libperl.a (+ the statically
  * linked XS extensions) behind the tiny pl.h surface (perl_new / perl_eval /
@@ -13,6 +13,15 @@
  * interpreter with PERL_SET_CONTEXT before each entry point is sufficient; a
  * second interpreter means a second wasm2go module instance with its own
  * linear memory and its own copy of these globals.
+ *
+ * Addresses: the interpreter is LP64 (wasm64, memory64): a pointer, a long
+ * and a size_t are 8 bytes. Its linear memory is declared with a maximum of
+ * 4 GiB (wasm_build.extra_ldflags_wasm64 in wasmify.json), so every address
+ * in it is below 2^32, and the host is handed addresses in 32 bits where
+ * the operations and callbacks below pack one beside another value: a token
+ * as a u32, (address << 32) | length in one u64. What the host reads in
+ * linear memory itself is laid out at the interpreter's widths: a pointer
+ * stored there is 8 bytes.
  */
 #include "pl.h"
 
@@ -345,9 +354,9 @@ static PerlInterpreter *g_my_perl = nullptr;
  * Perl->Go) call goes through. Declared here rather than via the generated
  * bridge header so perl.cc stays self-contained; the signature must match
  * bridge/api_bridge.h's WASM_IMPORT(wasmify, callback_invoke). The i64 result
- * packs (resp_ptr << 32) | resp_len; the response buffer transfers to us (we
- * free it), while the request buffer only lends: the host reads it during the
- * call and we keep ownership (it lives in a Perl SV). */
+ * names the response (goperl_callback_response); the response buffer
+ * transfers to us (we free it), while the request buffer only lends: the host
+ * reads it during the call and we keep ownership (it lives in a Perl SV). */
 __attribute__((import_module("wasmify"), import_name("callback_invoke")))
 extern "C" int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_id,
                                            void *req, size_t req_len);
@@ -367,6 +376,29 @@ extern "C" int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_i
  * functions have), so its caller goes on unwinding right after it returns.
  * The host answers this value for nothing else. */
 #define GOPERL_CALLBACK_JUMPED ((int64_t)-1)
+
+/* The response of a call of the import: its buffer (which transfers to the
+ * caller, who frees it) and its length, from the i64 the import returns. On
+ * wasm32 the i64 packs (buffer << 32) | length. On wasm64 an address does
+ * not fit beside a length, and the i64 is the address of a {buffer, length}
+ * pair of u64 the host keeps for the next answer (the convention of the
+ * wasmify bridge's decode_result): it is read here, before anything else
+ * can call the host. 0 is no response on both. Never called with
+ * GOPERL_CALLBACK_JUMPED, which is no address. */
+static inline unsigned char *goperl_callback_response(int64_t rc, uint32_t *len) {
+    if (rc == 0) {
+        *len = 0;
+        return nullptr;
+    }
+#ifdef __wasm64__
+    const uint64_t *d = (const uint64_t *)(uintptr_t)rc;
+    *len = (uint32_t)d[1];
+    return (unsigned char *)(uintptr_t)d[0];
+#else
+    *len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    return (unsigned char *)(uintptr_t)((uint64_t)rc >> 32);
+#endif
+}
 
 /* The Go-side callback id every Perl->Go call from this instance dispatches
  * to. 0 = no dispatcher registered (perl_set_go_dispatcher not called). */
@@ -566,10 +598,9 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
                                              buf, 4 + (uint32_t)keyword_len);
         goperl_native_leave();
         if (rc == GOPERL_CALLBACK_JUMPED) return KEYWORD_PLUGIN_DECLINE;
-        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-        if (resp_ptr != 0 && resp_len >= 1) {
-            unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+        uint32_t resp_len;
+        unsigned char *resp = goperl_callback_response(rc, &resp_len);
+        if (resp != nullptr && resp_len >= 1) {
             goperl_die_if_thrown(aTHX_ resp);
             if (resp[0] == GOPERL_RESP_FAIL) {
                 char msg[512];
@@ -648,10 +679,9 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
                                              buf, 4 + (uint32_t)oplen);
         goperl_native_leave();
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
-        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-        if (resp_ptr != 0 && resp_len >= 1) {
-            unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+        uint32_t resp_len;
+        unsigned char *resp = goperl_callback_response(rc, &resp_len);
+        if (resp != nullptr && resp_len >= 1) {
             goperl_die_if_thrown(aTHX_ resp);
             if (resp[0] == GOPERL_RESP_FAIL) {
                 char msg[512];
@@ -748,11 +778,10 @@ static unsigned char *goperl_host_call(pTHX_ uint32_t kind, const uint32_t *word
         *rlen = 0;
         return NULL;
     }
-    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-    if (resp_ptr == 0 || resp_len < 1)
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "goperl: host call %u: empty response", (unsigned)kind);
-    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
     goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) {
         char msg[512];
@@ -1011,11 +1040,10 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     /* nothing with a destructor may be alive across a croak */
     std::vector<uint32_t>().swap(buf);
     if (rc == GOPERL_CALLBACK_JUMPED) return NULL;
-    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-    if (resp_ptr == 0 || resp_len < 1)
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "pp hook: empty response");
-    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
     goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) {
         char msg[512];
@@ -1084,10 +1112,9 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
     int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_DTOR_METHOD_ID, &id,
                                          sizeof(id));
     if (rc == GOPERL_CALLBACK_JUMPED) return;
-    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-    if (resp_ptr == 0) return;
-    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr) return;
     /* The destructor died: so does the scope's end, as with a destructor
      * of perl's own (the die goes on to the nearest eval, also when the
      * scope ends because of an earlier one). */
@@ -1505,11 +1532,10 @@ static void goperl_go_dispatch(pTHX_ int32_t func_id, SV **args, I32 nargs,
     int64_t rc = wasmify_callback_invoke(g_go_cb, func_id,
                                          const_cast<char *>(req.data()), req.size());
     if (rc == GOPERL_CALLBACK_JUMPED) return;
-    uint32_t resp_ptr = static_cast<uint32_t>(static_cast<uint64_t>(rc) >> 32);
-    uint32_t resp_len = static_cast<uint32_t>(static_cast<uint64_t>(rc) & 0xFFFFFFFFu);
-    if (resp_ptr == 0 || resp_len < 1)
+    uint32_t resp_len;
+    char *resp = reinterpret_cast<char *>(goperl_callback_response(rc, &resp_len));
+    if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "Go function dispatch: empty response");
-    char *resp = reinterpret_cast<char *>(static_cast<uintptr_t>(resp_ptr));
 
     NodeReader r(resp, resp_len);
     uint8_t status = r.get_u8();
@@ -1605,11 +1631,10 @@ XS(XS_goperl_native_thunk) {
     free(payload);
     if (rc == GOPERL_CALLBACK_JUMPED) return;
 
-    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    uint32_t resp_len = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-    if (resp_ptr == 0 || resp_len < 1)
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "native XS dispatch: empty response");
-    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
 
     goperl_die_if_thrown(aTHX_ resp);
     if (resp[0] == GOPERL_RESP_FAIL) { /* the rest is the croak message */
@@ -2282,9 +2307,9 @@ uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len)
     return static_cast<uint32_t>(destroy_interpreter()) & 0xff;
 }
 
-uint32_t perl_interrupt_addr(uint64_t h) {
+uint64_t perl_interrupt_addr(uint64_t h) {
     (void)h;
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
 }
 
 /* ---- protected operation driver ------------------------------------------
@@ -2821,9 +2846,10 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
         uint32_t id = (uint32_t)(uintptr_t)mg->mg_ptr;
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_FREE_METHOD_ID,
                                              &id, sizeof(id));
-        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        if (rc != GOPERL_CALLBACK_JUMPED && resp_ptr != 0)
-            free((void *)(uintptr_t)resp_ptr);
+        if (rc != GOPERL_CALLBACK_JUMPED) {
+            uint32_t resp_len;
+            free(goperl_callback_response(rc, &resp_len));
+        }
     }
     mg->mg_ptr = NULL; /* not a real pointer; never let core touch it */
     return 0;
@@ -2843,8 +2869,8 @@ static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_LOCAL_METHOD_ID,
                                              req, sizeof(req));
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
-        uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-        if (resp_ptr != 0) free((void *)(uintptr_t)resp_ptr);
+        uint32_t resp_len;
+        free(goperl_callback_response(rc, &resp_len));
     }
     return 0;
 }
@@ -3015,11 +3041,10 @@ static unsigned char *goperlio_call(pTHX_ U32 hook, GoperlIOL *l, PerlIO *f,
         *resplen = 0;
         return NULL;
     }
-    uint32_t resp_ptr = (uint32_t)((uint64_t)rc >> 32);
-    uint32_t rlen = (uint32_t)((uint64_t)rc & 0xFFFFFFFFu);
-    if (resp_ptr == 0 || rlen < 1)
+    uint32_t rlen;
+    unsigned char *resp = goperl_callback_response(rc, &rlen);
+    if (resp == nullptr || rlen < 1)
         Perl_croak(aTHX_ "PerlIO layer hook: empty response");
-    unsigned char *resp = (unsigned char *)(uintptr_t)resp_ptr;
     if (resp[0] == 0) {
         char msg[512];
         size_t ml = rlen - 1;
@@ -4305,9 +4330,26 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
         if (o->op_type == OP_ARGELEM)
             /* the index is kept where the pointer would be */
             w[GOPERL_OPREC_AUX_N] = (uint32_t)PTR2IV(cUNOP_AUXx(o)->op_aux);
-        if (o->op_type == OP_MULTIPARAM)
-            /* the op_multiparam_aux, which the host reads field by field */
+        if (o->op_type == OP_MULTIPARAM) {
+            /* the op_multiparam_aux, which the host reads field by field at
+             * these offsets (go-perl's SDK, goperl_multiparam_aux) */
+            static_assert(offsetof(struct op_multiparam_aux, min_args) == 0 &&
+                              offsetof(struct op_multiparam_aux, n_positional) == 8 &&
+                              offsetof(struct op_multiparam_aux, n_named) == 16 &&
+                              offsetof(struct op_multiparam_aux, slurpy) == 24 &&
+                              offsetof(struct op_multiparam_aux, slurpy_padix) == 32 &&
+                              offsetof(struct op_multiparam_aux, param_padix) == 40 &&
+                              offsetof(struct op_multiparam_aux, named) == 48 &&
+                              sizeof(PADOFFSET) == 8,
+                          "the host reads op_multiparam_aux at these offsets");
+            static_assert(offsetof(struct op_multiparam_named_aux, padix) == 0 &&
+                              offsetof(struct op_multiparam_named_aux, namepv) == 8 &&
+                              offsetof(struct op_multiparam_named_aux, namelen) == 16 &&
+                              offsetof(struct op_multiparam_named_aux, namehash) == 24 &&
+                              sizeof(struct op_multiparam_named_aux) == 32,
+                          "the host reads op_multiparam_named_aux at these offsets");
             w[GOPERL_OPREC_AUX] = (uint32_t)(uintptr_t)cUNOP_AUXx(o)->op_aux;
+        }
         if (o->op_type == OP_MULTIDEREF) {
             UNOP_AUX_item *items = cUNOP_AUXx(o)->op_aux;
             w[GOPERL_OPREC_AUX] = (uint32_t)(uintptr_t)items;

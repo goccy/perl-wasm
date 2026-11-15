@@ -670,7 +670,11 @@ int uname(struct utsname *out) {
     strcpy(out->nodename, "(none)");
     strcpy(out->release, "0.0.0");
     strcpy(out->version, "0.0.0");
+#ifdef __wasm64__
+    strcpy(out->machine, "wasm64");
+#else
     strcpy(out->machine, "wasm32");
+#endif
     return 0;
 }
 
