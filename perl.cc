@@ -4447,7 +4447,19 @@ static void goperl_save_plvar(pTHX_ int id, int kind) {
     case GOPERL_PL_RS: GOPERL_SAVE_PTRVAR(PL_rs);
     case GOPERL_PL_ERRORS: GOPERL_SAVE_PTRVAR(PL_errors);
     case GOPERL_PL_CURPAD: GOPERL_SAVE_PTRVAR(PL_curpad);
-    case GOPERL_PL_COMPPAD: GOPERL_SAVE_PTRVAR(PL_comppad);
+    /* Making a pad the one in use makes its values PL_curpad too (see
+     * GOPERL_PL_COMPPAD under the variables native code sets), so putting
+     * the pad back puts its values back, as perl's SAVECOMPPAD does: a save
+     * of PL_curpad made after the pad was changed (Exporter::Lexical saves
+     * PL_comppad, sets it, then saves PL_curpad) holds the new pad's
+     * values, and the scope ends with the pad and the values of the code
+     * that was running. */
+    case GOPERL_PL_COMPPAD:
+        if (kind != GOPERL_SAVEK_GENERIC) {
+            SAVECOMPPAD();
+            return;
+        }
+        GOPERL_SAVE_PTRVAR(PL_comppad);
     case GOPERL_PL_COMPPAD_NAME: GOPERL_SAVE_PTRVAR(PL_comppad_name);
     case GOPERL_PL_CURPM: GOPERL_SAVE_PTRVAR(PL_curpm);
     case GOPERL_PL_FIRSTGV: GOPERL_SAVE_PTRVAR(PL_firstgv);
@@ -4877,6 +4889,8 @@ uint32_t perl_xs_opbox(uint64_t h) {
     return h ? (uint32_t)(uintptr_t)&g_opbox : 0;
 }
 
+static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s, STRLEN slen);
+
 uint32_t perl_xs_op(void) {
     /* the arguments are taken out first: what the operation leads to may
      * use the box for operations of its own */
@@ -4887,13 +4901,21 @@ uint32_t perl_xs_op(void) {
     char s[GOPERL_OPBOX_STR + 1];
     memcpy(s, g_opbox.s, slen);
     s[slen] = '\0';
-    const uint64_t r = perl_xs_helper(1, op, a, b, s);
-    g_opbox.result = r;
+    g_opbox.result = g_my_perl ? goperl_xs_run(op, a, b, s, slen) : 0;
     return 0;
 }
 
+/* The string of an operation that comes this way (one longer than the box)
+ * ends at its first NUL. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const char *s) {
     if (!g_my_perl || h == 0) return 0;
+    return goperl_xs_run(op, a, b, s, s ? strlen(s) : 0);
+}
+
+/* An operation of native code; s is its string, slen bytes (with a NUL
+ * after them), which a name may contain (Sub::Name gives subs names with
+ * NULs in them). */
+static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, const char *s, STRLEN slen) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     switch (op) {
@@ -4939,8 +4961,8 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     }
     case GOPERL_OP_REFCNT_INC:
         return (uint64_t)(uintptr_t)SvREFCNT_inc((SV *)(uintptr_t)a);
-    case GOPERL_OP_GV_STASHPV:
-        return (uint64_t)(uintptr_t)gv_stashpv(s ? s : "", (I32)(int64_t)a);
+    case GOPERL_OP_GV_STASHPV: /* a = flags, s = the name */
+        return (uint64_t)(uintptr_t)gv_stashpvn(s ? s : "", (U32)slen, (I32)(int64_t)a);
     case GOPERL_OP_SV_BLESS:
         return (uint64_t)(uintptr_t)sv_bless((SV *)(uintptr_t)a,
                                              (HV *)(uintptr_t)b);
@@ -5569,8 +5591,11 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
         free(ary);
         return (uint64_t)(uintptr_t)(SV *)av;
     }
+    /* perl's answer as it is: grok_number's flags for a string (the
+     * number is fractional, negative, ...), the flags of the numbers it
+     * holds otherwise */
     case GOPERL_OP_LOOKS_LIKE_NUMBER:
-        return looks_like_number((SV *)(uintptr_t)a) ? 1 : 0;
+        return (uint64_t)(uint32_t)looks_like_number((SV *)(uintptr_t)a);
     case GOPERL_OP_SV_AMAGIC:
         return SvAMAGIC((SV *)(uintptr_t)a) ? 1 : 0;
     case GOPERL_OP_AMAGIC_CALL: { /* (a = method<<32 | sv, b = AMGf flags); the
@@ -5856,8 +5881,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
                  * (b = flags<<32 | stash, s = name) -> the gv token */
         GV *gv = (GV *)(uintptr_t)a;
         HV *stash = (HV *)(uintptr_t)(uint32_t)b;
-        gv_init_pvn(gv, stash, s ? s : "", strlen(s ? s : ""),
-                    (U32)(b >> 32));
+        gv_init_pvn(gv, stash, s ? s : "", slen, (U32)(b >> 32));
         return (uint64_t)(uintptr_t)gv;
     }
     case GOPERL_OP_GV_AMG: { /* Gv_AMG: does the stash have a (freshly
@@ -5895,7 +5919,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, const ch
     }
     case GOPERL_OP_SV_INSERT: /* b = off<<32 | replace_len, s = little */
         sv_insert((SV *)(uintptr_t)a, (STRLEN)(b >> 32),
-                  (STRLEN)(uint32_t)b, s ? s : "", strlen(s ? s : ""));
+                  (STRLEN)(uint32_t)b, s ? s : "", slen);
         return 0;
     case GOPERL_OP_SV_UTF8_DECODE:
         return sv_utf8_decode((SV *)(uintptr_t)a) ? 1 : 0;
