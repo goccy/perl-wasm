@@ -613,16 +613,15 @@ extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
  *   +0  the interrupt flag. The host trips a runaway eval by storing 1 here;
  *       the interruptible run loop clears it and croaks. `volatile` so the
  *       compiler always reloads it in the op loop.
- *   +4  GOPERL_HOSTWORDS_MAGIC: the words below are here.
  *   +8  where the host process has this memory: an address of this memory
- *       is that much higher in the process (see goperl_pack_address). 0
- *       until the host says. */
-#define GOPERL_HOSTWORDS_MAGIC 0x676f7077u
+ *       is that much higher in the process (see goperl_pack_address). The
+ *       host writes it before any code runs in an instance that runs native
+ *       code, and never changes it; 0 (no base) otherwise. */
 static volatile struct {
     uint32_t interrupt;
-    uint32_t magic;
+    uint32_t unused;
     uint64_t membase;
-} g_hostwords = {0, GOPERL_HOSTWORDS_MAGIC, 0};
+} g_hostwords = {0, 0, 0};
 #define g_interrupt (g_hostwords.interrupt)
 
 /* pp hooks: a host-native module (via the go-perl XS SDK) can claim op
