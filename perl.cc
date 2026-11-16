@@ -2963,7 +2963,8 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
  * the magic of the variable itself. So the anchor is not copied (it has
  * svt_local, which mg_localize calls instead); the host is told, and gives
  * the new SV what mg_localize would give it for each MAGIC of its mirror,
- * under an anchor of its own. */
+ * under an anchor of its own. When the host cannot (the magic is native
+ * code's, which a fork child cannot run), `local` dies with its message. */
 static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
     if (g_go_cb != 0) {
         goperl_gword_t req[2] = {GOPERL_ADDR(mg->mg_ptr), GOPERL_ADDR(nsv)};
@@ -2971,7 +2972,15 @@ static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
                                              req, sizeof(req));
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_len;
-        free(goperl_callback_response(rc, &resp_len));
+        unsigned char *resp = goperl_callback_response(rc, &resp_len);
+        if (resp == nullptr) return 0;
+        goperl_die_if_thrown(aTHX_ resp);
+        if (resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
+            SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
+            free(resp);
+            croak_sv(msg);
+        }
+        free(resp);
     }
     return 0;
 }
