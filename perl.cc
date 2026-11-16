@@ -644,8 +644,8 @@ static inline Perl_ppaddr_t goperl_pp_original(unsigned t) {
  * (and only that op) executes through the pp-hook callback. */
 static OP *goperl_pp_hooked_op(pTHX);
 
-static void goperl_native_enter(pTHX);
-static void goperl_native_leave(void);
+static size_t goperl_native_enter(pTHX);
+static void goperl_native_leave(size_t below);
 
 /* Host keyword/infix plugin forwarding (go-perl XS SDK, method -7). */
 static Perl_keyword_plugin_t g_next_keyword_plugin = NULL;
@@ -658,10 +658,10 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
         const goperl_gword_t kind = 0;
         memcpy(buf, &kind, 8);
         memcpy(buf + 8, keyword_ptr, keyword_len);
-        goperl_native_enter(aTHX);
+        const size_t native_below = goperl_native_enter(aTHX);
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 8 + (size_t)keyword_len);
-        goperl_native_leave();
+        goperl_native_leave(native_below);
         if (rc == GOPERL_CALLBACK_JUMPED) return KEYWORD_PLUGIN_DECLINE;
         uint32_t resp_len;
         unsigned char *resp = goperl_callback_response(rc, &resp_len);
@@ -730,10 +730,10 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
         const goperl_gword_t kind = 1;
         memcpy(buf, &kind, 8);
         memcpy(buf + 8, opname, oplen);
-        goperl_native_enter(aTHX);
+        const size_t native_below = goperl_native_enter(aTHX);
         int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 8 + (size_t)oplen);
-        goperl_native_leave();
+        goperl_native_leave(native_below);
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_len;
         unsigned char *resp = goperl_callback_response(rc, &resp_len);
@@ -785,33 +785,29 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
  * &local)) runs while the function's frame still exists. Here the jump out
  * of the native frames comes first and this interpreter's die after it, so
  * the host asks for the scopes of the call to be left right before it
- * jumps (GOPERL_HOOK_UNWIND).
+ * jumps (GOPERL_HOOK_UNWIND): the running call is the innermost, the last
+ * entry. When the interpreter itself is what jumps (it died inside an
+ * operation of the call, and the eval that catches that is further out),
+ * it has left every scope down to that eval already, and the stacks are
+ * below the call's marks.
  *
- * A die that passes through a native call from inside leaves the call's
- * entry behind; such an entry is from a deeper context than any call that
- * is still running, and is dropped when it is found on top. */
+ * Every call takes its entry off when it returns, the entries of deeper
+ * calls with it: the code after the call of the host runs also when the
+ * call ended by a jump of the interpreter, which goes on afterwards. */
 struct goperl_native_mark {
     I32 save_ix;  /* PL_savestack_ix */
     I32 scope_ix; /* PL_scopestack_ix */
-    I32 cx_ix;    /* cxstack_ix */
-    PERL_SI *si;
 };
 static std::vector<goperl_native_mark> g_native_marks;
-static void goperl_native_marks_settle(pTHX) {
-    while (!g_native_marks.empty()) {
-        const goperl_native_mark &m = g_native_marks.back();
-        if (m.si == PL_curstackinfo && m.cx_ix <= cxstack_ix &&
-            m.save_ix <= PL_savestack_ix)
-            break;
-        g_native_marks.pop_back();
-    }
+/* -> the number of the calls running below this one, which
+ * goperl_native_leave takes back */
+static size_t goperl_native_enter(pTHX) {
+    const size_t below = g_native_marks.size();
+    g_native_marks.push_back({PL_savestack_ix, PL_scopestack_ix});
+    return below;
 }
-static void goperl_native_enter(pTHX) {
-    goperl_native_marks_settle(aTHX);
-    g_native_marks.push_back({PL_savestack_ix, PL_scopestack_ix, cxstack_ix, PL_curstackinfo});
-}
-static void goperl_native_leave(void) {
-    if (!g_native_marks.empty()) g_native_marks.pop_back();
+static void goperl_native_leave(size_t below) {
+    if (g_native_marks.size() > below) g_native_marks.resize(below);
 }
 
 /* One call of native code through the host-call channel: kind and its
@@ -824,10 +820,10 @@ static unsigned char *goperl_host_call(pTHX_ goperl_gword_t kind, const goperl_g
     if (nwords > 8) Perl_croak(aTHX_ "goperl: host call with too many words");
     buf[0] = kind;
     for (uint32_t i = 0; i < nwords; i++) buf[1 + i] = words[i];
-    goperl_native_enter(aTHX);
+    const size_t native_below = goperl_native_enter(aTHX);
     int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_HOST_METHOD_ID, buf,
                                          sizeof(goperl_gword_t) * (1 + nwords));
-    goperl_native_leave();
+    goperl_native_leave(native_below);
     if (rc == GOPERL_CALLBACK_JUMPED) {
         *rlen = 0;
         return NULL;
@@ -1084,11 +1080,11 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     buf.push_back(GOPERL_ADDR(op));
     buf.push_back((goperl_gword_t)op->op_type);
     goperl_pp_stack_words(aTHX_ buf);
-    goperl_native_enter(aTHX);
+    const size_t native_below = goperl_native_enter(aTHX);
     int64_t rc = wasmify_callback_invoke(
         g_go_cb, GOPERL_PP_HOOK_METHOD_ID, buf.data(),
         sizeof(goperl_gword_t) * buf.size());
-    goperl_native_leave();
+    goperl_native_leave(native_below);
     /* nothing with a destructor may be alive across a croak */
     std::vector<goperl_gword_t>().swap(buf);
     if (rc == GOPERL_CALLBACK_JUMPED) return NULL;
@@ -1676,10 +1672,10 @@ XS(XS_goperl_native_thunk) {
     for (I32 i = 0; i < items; i++)
         payload[GOPERL_NATIVE_HDR_WORDS + i] = GOPERL_ADDR(ST(i));
 
-    goperl_native_enter(aTHX);
+    const size_t native_below = goperl_native_enter(aTHX);
     int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_NATIVE_METHOD_ID,
                                          payload, payload_len);
-    goperl_native_leave();
+    goperl_native_leave(native_below);
     free(payload);
     if (rc == GOPERL_CALLBACK_JUMPED) return;
 
@@ -4812,23 +4808,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         PERL_HASH(hash, s ? s : "", (STRLEN)b);
         return hash;
     }
-    case GOPERL_INT_PUSHSTACK: {
+    case GOPERL_INT_PUSHSTACK:
         /* Native code runs a callback on a stack of its own (a stackinfo
          * of the type it says): a loop control or a goto in the callback
-         * finds no context of its caller's to leave to. */
-        dSP;
-        PUSHSTACKi((I32)(int64_t)b);
-        PUTBACK;
+         * finds no context of its caller's to leave to. The stack pointer
+         * the interpreter has is the one to come back to; the native call
+         * may run in the middle of an operation (a sub's return values lie
+         * below it while the sub's scope ends). */
+        push_stackinfo((I32)(int64_t)b, 0);
         return 0;
-    }
-    case GOPERL_INT_POPSTACK: {
+    case GOPERL_INT_POPSTACK:
         if (!PL_curstackinfo->si_prev)
             Perl_croak(aTHX_ "goperl: POPSTACK with no stack pushed");
-        dSP;
-        POPSTACK;
-        PUTBACK;
+        /* Back on the stack below, where it was left. pop_stackinfo sets
+         * the stack pointer itself: no copy of the pointer taken before
+         * (one into the stack popped) may be stored after it. */
+        pop_stackinfo();
         return 0;
-    }
     case GOPERL_INT_SAVE_FIELD: {
         /* the fields are numbered as the host's lvalue slots of them */
         enum { GOPERL_SVF_IV = 0, GOPERL_SVF_UV = 1, GOPERL_SVF_NV = 2, GOPERL_SVF_RV = 6,
@@ -7540,7 +7536,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             call_atexit(goperl_atexit_thunk, (void *)(uintptr_t)b);
             return 0;
         case GOPERL_HOOK_UNWIND: {
-            goperl_native_marks_settle(aTHX);
+            /* the running native call is the innermost */
             if (g_native_marks.empty()) return 0;
             const goperl_native_mark m = g_native_marks.back();
             while (PL_scopestack_ix > m.scope_ix) pop_scope();
