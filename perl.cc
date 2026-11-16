@@ -3528,9 +3528,11 @@ enum {
     GOPERL_INT_BHK_FLAGS = 30,      /* a: the id of a block hook; b: its flags */
     GOPERL_INT_SAVE_FIELD = 31,     /* a: an SV; b: field<<8 | kind (GOPERL_SAVEK_):
                                      * a save of the field (GOPERL_SVF_) */
-    GOPERL_INT_HASH = 32            /* s+b: a key's bytes -> its hash (PERL_HASH),
+    GOPERL_INT_HASH = 32,           /* s+b: a key's bytes -> its hash (PERL_HASH),
                                      * as the keys of this interpreter's hashes
                                      * have it */
+    GOPERL_INT_PUSHSTACK = 33,      /* b: the stackinfo type: PUSHSTACKi */
+    GOPERL_INT_POPSTACK = 34        /* POPSTACK */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4389,7 +4391,9 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
         if (built != g_custom_built.end()) cls = built->second;
     }
     w[GOPERL_OPREC_TOK] = GOPERL_ADDR(o);
-    w[GOPERL_OPREC_TARG] = (uint32_t)o->op_targ;
+    /* as wide as the field: a module keeps a pointer of its own there
+     * (op_targ = PTR2IV(data)) */
+    w[GOPERL_OPREC_TARG] = (goperl_gword_t)o->op_targ;
     w[GOPERL_OPREC_TYPE] = (uint32_t)o->op_type | ((uint32_t)o->op_flags << 16) |
                            ((uint32_t)o->op_private << 24);
     uint32_t bits = (uint32_t)cls << 8;
@@ -4807,6 +4811,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         U32 hash;
         PERL_HASH(hash, s ? s : "", (STRLEN)b);
         return hash;
+    }
+    case GOPERL_INT_PUSHSTACK: {
+        /* Native code runs a callback on a stack of its own (a stackinfo
+         * of the type it says): a loop control or a goto in the callback
+         * finds no context of its caller's to leave to. */
+        dSP;
+        PUSHSTACKi((I32)(int64_t)b);
+        PUTBACK;
+        return 0;
+    }
+    case GOPERL_INT_POPSTACK: {
+        if (!PL_curstackinfo->si_prev)
+            Perl_croak(aTHX_ "goperl: POPSTACK with no stack pushed");
+        dSP;
+        POPSTACK;
+        PUTBACK;
+        return 0;
     }
     case GOPERL_INT_SAVE_FIELD: {
         /* the fields are numbered as the host's lvalue slots of them */
@@ -5357,7 +5378,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 count = call_method(method, flags);
             else
                 count = call_sv((SV *)(uintptr_t)a, flags);
-            died = SvTRUE(ERRSV) ? 1u : 0u;
+            /* The caller asked for G_EVAL and reads $@ itself, as perl's
+             * call_sv leaves it to: the truth of $@ is not asked here, which
+             * would run the bool overloading of an exception object. */
+            died = 0;
         } else {
             if (!goperl_plain_call_cv)
                 goperl_plain_call_cv = newXS(NULL, XS_goperl_plain_call, __FILE__);
@@ -6169,7 +6193,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             av_store(res, i, SvREFCNT_inc(POPs));
         PUTBACK;
         sv_2mortal((SV *)res);
-        uint64_t died = SvTRUE(ERRSV) ? 1u : 0u;
+        /* eval_sv traps a die in $@ and with G_RETHROW throws it again
+         * itself; the truth of $@ is not asked here, which would run the
+         * bool overloading of an exception object. */
+        const uint64_t died = 0;
         return goperl_two(GOPERL_ADDR(res), (died << 63) | (uint32_t)count);
     }
     case GOPERL_OP_AV_SHIFT:
