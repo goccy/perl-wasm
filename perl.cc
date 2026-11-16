@@ -3941,6 +3941,7 @@ enum {
     GOPERL_SVSTR_SETPVN = 14,
     GOPERL_SVSTR_TAINT_PROPER = 15, /* taint_proper(NULL, s) */
     GOPERL_SVSTR_GV_NAME_SET = 17, /* gv_name_set(gv, s, len, flags) */
+    GOPERL_SVSTR_HV_NAME_SET = 18, /* hv_name_set(stash, s, len, flags) */
     GOPERL_SVSTR_WARNER = 16 /* a warning of the category in the SV slot.
                  * Flags bit 0: the text is UTF-8; bits 1-2: 0 warner (always
                  * given), 1 ck_warner (when the category is enabled),
@@ -4182,6 +4183,7 @@ enum {
 #define GOPERL_PL_IN_CLEAN_ALL 110  /* read only */
 #define GOPERL_PL_ORIGARGC 111      /* read only */
 #define GOPERL_PL_ORIGARGV 112      /* read only: the address of the vector */
+#define GOPERL_PL_ORS 113          /* PL_ors_sv, the output record separator */
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -4543,6 +4545,7 @@ static void goperl_save_plvar(pTHX_ int id, int kind) {
     case GOPERL_PL_COMPCV: GOPERL_SAVE_PTRVAR(PL_compcv);
     case GOPERL_PL_DEFOUTGV: GOPERL_SAVE_PTRVAR(PL_defoutgv);
     case GOPERL_PL_RS: GOPERL_SAVE_PTRVAR(PL_rs);
+    case GOPERL_PL_ORS: GOPERL_SAVE_PTRVAR(PL_ors_sv);
     case GOPERL_PL_ERRORS: GOPERL_SAVE_PTRVAR(PL_errors);
     case GOPERL_PL_CURPAD: GOPERL_SAVE_PTRVAR(PL_curpad);
     /* Making a pad the one in use makes its values PL_curpad too (see
@@ -5149,7 +5152,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (SvNOK(sv)) f |= GOPERL_INFO_NOK;
         if (SvPOKp(sv)) f |= GOPERL_INFO_POKp;
         if (SvNIOKp(sv)) f |= GOPERL_INFO_NIOKp;
-        if (SvIOK(sv) && SvIsUV(sv)) f |= GOPERL_INFO_ISUV;
+        /* the flag itself, as SvIsUV is: an integer too large for an IV
+         * that perl kept only privately (SvIOKp, a string above UV_MAX
+         * numified) has it without SvIOK */
+        if (SvIsUV(sv)) f |= GOPERL_INFO_ISUV;
         if (SvRMAGICAL(sv)) f |= GOPERL_INFO_RMAGICAL;
         if (SvOBJECT(sv)) f |= GOPERL_INFO_OBJECT;
         if (SvAMAGIC(sv)) f |= 65536;           /* GOPERL_INFO_AMAGIC */
@@ -5455,6 +5461,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_STDERRGV: return (uint64_t)(uintptr_t)PL_stderrgv;
         case GOPERL_PL_DEFOUTGV: return (uint64_t)(uintptr_t)PL_defoutgv;
         case GOPERL_PL_RS: return (uint64_t)(uintptr_t)PL_rs;
+        case GOPERL_PL_ORS: return (uint64_t)(uintptr_t)PL_ors_sv;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -5530,6 +5537,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_HINTS: PL_hints = (U32)b; return 0;
         case GOPERL_PL_DEFOUTGV: PL_defoutgv = (GV *)val; return 0;
         case GOPERL_PL_RS: PL_rs = val; return 0;
+        case GOPERL_PL_ORS: PL_ors_sv = val; return 0;
         case GOPERL_PL_CURSTASH: PL_curstash = (HV *)val; return 0;
         case GOPERL_PL_TAINTED: TAINT_set(cBOOL(b)); return 0;
         case GOPERL_PL_TAINTING: TAINTING_set(cBOOL(b)); return 0;
@@ -7164,6 +7172,15 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         case GOPERL_SVSTR_GV_NAME_SET:
             gv_name_set((GV *)sv, str, (U32)len, flags);
+            return 0;
+        case GOPERL_SVSTR_HV_NAME_SET: /* the name of a stash (a hash without
+                 * one too); flags: HVhek_UTF8, and bit 31: no name (the
+                 * name is taken away) */
+            if (SvTYPE(sv) != SVt_PVHV) return 0;
+            if (flags & 0x80000000u)
+                hv_name_set((HV *)sv, NULL, 0, flags & ~0x80000000u);
+            else
+                hv_name_set((HV *)sv, str, (U32)len, flags);
             return 0;
         case GOPERL_SVSTR_WARNER: {
             SV *const text =
