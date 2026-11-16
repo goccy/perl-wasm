@@ -3517,8 +3517,11 @@ enum {
     GOPERL_INT_BHK_REGISTER = 29,   /* b: the flags -> the id of a new block
                                      * hook of native code */
     GOPERL_INT_BHK_FLAGS = 30,      /* a: the id of a block hook; b: its flags */
-    GOPERL_INT_SAVE_FIELD = 31      /* a: an SV; b: field<<8 | kind (GOPERL_SAVEK_):
+    GOPERL_INT_SAVE_FIELD = 31,     /* a: an SV; b: field<<8 | kind (GOPERL_SAVEK_):
                                      * a save of the field (GOPERL_SVF_) */
+    GOPERL_INT_HASH = 32            /* s+b: a key's bytes -> its hash (PERL_HASH),
+                                     * as the keys of this interpreter's hashes
+                                     * have it */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4791,6 +4794,11 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SAVE_PLVAR:
         goperl_save_plvar(aTHX_ (int)lo, (int)b);
         return 0;
+    case GOPERL_INT_HASH: {
+        U32 hash;
+        PERL_HASH(hash, s ? s : "", (STRLEN)b);
+        return hash;
+    }
     case GOPERL_INT_SAVE_FIELD: {
         /* the fields are numbered as the host's lvalue slots of them */
         enum { GOPERL_SVF_IV = 0, GOPERL_SVF_UV = 1, GOPERL_SVF_NV = 2, GOPERL_SVF_RV = 6,
