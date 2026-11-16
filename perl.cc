@@ -497,6 +497,10 @@ static int32_t g_go_cb = 0;
  * follow are the kind's own. The response is [1] and the kind's result, or
  * [0] and the message to croak with. */
 #define GOPERL_HOST_METHOD_ID (-9)
+
+/* Reserved callback method id for reading memory of the process that is not
+ * this memory (unpack 'p' and 'P' of such an address, goperl_unpack_address). */
+#define GOPERL_PROCMEM_METHOD_ID (-10)
 enum {
     GOPERL_HOST_NEWOP = 0, /* an op checker: [type][op] -> [op] */
     GOPERL_HOST_PEEP = 1,  /* a peephole hook: [which][op] */
@@ -604,11 +608,22 @@ extern "C" void perl_wasm_locale_start_up(int on);
  * (perl_signal.cc). Does not return. */
 extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
 
-/* Host-writable interrupt flag. The host trips a runaway eval by storing 1 here
- * via a plain linear-memory write (perl_interrupt_addr returns its address); no
- * wasm code runs on the instance. The interruptible run loop clears it and
- * croaks. `volatile` so the compiler always reloads it in the op loop. */
-static volatile uint32_t g_interrupt = 0;
+/* Words the host writes with plain linear-memory writes, no wasm code
+ * running on the instance (perl_interrupt_addr returns their address):
+ *   +0  the interrupt flag. The host trips a runaway eval by storing 1 here;
+ *       the interruptible run loop clears it and croaks. `volatile` so the
+ *       compiler always reloads it in the op loop.
+ *   +4  GOPERL_HOSTWORDS_MAGIC: the words below are here.
+ *   +8  where the host process has this memory: an address of this memory
+ *       is that much higher in the process (see goperl_pack_address). 0
+ *       until the host says. */
+#define GOPERL_HOSTWORDS_MAGIC 0x676f7077u
+static volatile struct {
+    uint32_t interrupt;
+    uint32_t magic;
+    uint64_t membase;
+} g_hostwords = {0, GOPERL_HOSTWORDS_MAGIC, 0};
+#define g_interrupt (g_hostwords.interrupt)
 
 /* pp hooks: a host-native module (via the go-perl XS SDK) can claim op
  * types, as a module replaces PL_ppaddr[type] on perl: the interpreter's
@@ -2345,7 +2360,58 @@ uint32_t perl_run_program(uint64_t h, const char *program, uint32_t program_len)
 
 uint64_t perl_interrupt_addr(uint64_t h) {
     (void)h;
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_interrupt));
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_hostwords));
+}
+
+/* ---- addresses of the process: pack and unpack 'p' and 'P' -----------------
+ * A pointer pack 'p' or 'P' makes is for native code (FFI::Platypus passes
+ * the string buffer of scalar_to_buffer to a C function), which reads
+ * memory where the process has it: the address of a string of this memory
+ * is its address here plus the host's base of the memory. unpack 'p' and
+ * 'P' read at such an address: in this memory when it falls there, and
+ * otherwise in the memory of the process, which the host reads (a buffer a
+ * C function returned). Without a base from the host the addresses are
+ * this memory's own. pp_pack.c calls these (scripts/wasi-configure.sh). */
+extern "C" const char *goperl_pack_address(const char *p) {
+    const uint64_t base = g_hostwords.membase;
+    if (!p || !base) return p;
+    return reinterpret_cast<const char *>(static_cast<uintptr_t>(
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) + base));
+}
+
+extern "C" SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len) {
+    const uint64_t base = g_hostwords.membase;
+    const uint64_t a = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
+    if (p && base) {
+        const uint64_t size = static_cast<uint64_t>(__builtin_wasm_memory_size(0)) << 16;
+        if (a >= base && a - base < size) {
+            p = reinterpret_cast<const char *>(static_cast<uintptr_t>(a - base));
+        } else {
+            /* [address][length, or -1 for the string up to its NUL] ->
+             * [1] and the bytes, or [0] and a message */
+            if (!g_go_cb)
+                Perl_croak(aTHX_ "goperl: no host to read the memory of the process at 0x%" UVxf,
+                           (UV)a);
+            goperl_gword_t req[2] = {a, static_cast<goperl_gword_t>(static_cast<int64_t>(len))};
+            const int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_PROCMEM_METHOD_ID, req, sizeof req);
+            if (rc == GOPERL_CALLBACK_JUMPED) return &PL_sv_undef;
+            uint32_t resp_len;
+            unsigned char *resp = goperl_callback_response(rc, &resp_len);
+            if (resp == nullptr || resp_len < 1)
+                Perl_croak(aTHX_ "goperl: reading the memory of the process: empty response");
+            if (resp[0] != GOPERL_RESP_OK) {
+                SV *const msg = newSVpvn_flags(reinterpret_cast<const char *>(resp + 1), resp_len - 1,
+                                               SVs_TEMP);
+                free(resp);
+                Perl_croak(aTHX_ "%" SVf, SVfARG(msg));
+            }
+            SV *const sv = newSVpvn(reinterpret_cast<const char *>(resp + 1), resp_len - 1);
+            free(resp);
+            return sv;
+        }
+    }
+    /* newSVpv and newSVpvn make undef of a null pointer */
+    return len < 0 ? newSVpv(p, 0) : newSVpvn(p, static_cast<STRLEN>(len));
 }
 
 /* ---- protected operation driver ------------------------------------------
@@ -5282,10 +5348,18 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             died = call.returned ? 0u : 1u;
         }
         SPAGAIN;
+        /* The results as perl leaves them on the stack for the caller: no
+         * reference is taken on them, and the array that hands them over
+         * does not own them. A sub called for its effect alone can leave
+         * values that are gone by now (Future::XS's callbacks end with a
+         * bare return, after the scope of the call freed what they had
+         * pushed), and perl leaves them alone; taking a reference on one
+         * and dropping it with the array freed it a second time. */
         AV *res = newAV();
+        AvREAL_off(res);
         av_extend(res, count > 0 ? count - 1 : 0);
         for (I32 i = count - 1; i >= 0; i--)
-            av_store(res, i, SvREFCNT_inc(POPs));
+            av_store(res, i, POPs);
         PUTBACK;
         sv_2mortal((SV *)res);
         /* -> the mortal array of the results; second: died<<63 | count */

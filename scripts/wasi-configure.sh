@@ -1089,6 +1089,44 @@ else:
     open(path, "w").write(t)
     print(f"Unix-domain address lengths applied to {path}")
 PYPATCH
+# ---- pp_pack.c: 'p' and 'P' are addresses of the process ----------------------
+# A pointer pack 'p' or 'P' makes is for native code, which reads the
+# process's memory; unpack 'p' and 'P' read at such an address
+# (goperl_pack_address / goperl_unpack_address in perl.cc). Idempotent.
+python3 - <<'PYPATCH'
+path = "pp_pack.c"
+t = open(path).read()
+if "goperl_pack_address" in t:
+    print(f"process addresses of 'p' and 'P' already present in {path}")
+else:
+    for old, new in [
+        ("#define PERL_IN_PP_PACK_C\n#include \"perl.h\"\n",
+         "#define PERL_IN_PP_PACK_C\n#include \"perl.h\"\n\n"
+         "extern const char *goperl_pack_address(const char *p);\n"
+         "extern SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len);\n"),
+        ("                SHIFT_VAR(utf8, s, strend, aptr, datumtype, needs_swap);\n"
+         "                /* newSVpv generates undef if aptr is NULL */\n"
+         "                mPUSHs(newSVpv(aptr, 0));\n",
+         "                SHIFT_VAR(utf8, s, strend, aptr, datumtype, needs_swap);\n"
+         "                /* newSVpv generates undef if aptr is NULL */\n"
+         "                mPUSHs(goperl_unpack_address(aTHX_ aptr, -1));\n"),
+        ("                /* newSVpvn generates undef if aptr is NULL */\n"
+         "                PUSHs(newSVpvn_flags(aptr, len, SVs_TEMP));\n",
+         "                /* newSVpvn generates undef if aptr is NULL */\n"
+         "                PUSHs(sv_2mortal(goperl_unpack_address(aTHX_ aptr, len)));\n"),
+        ("                        aptr = SvPV_force_flags_nolen(fromstr, 0);\n"
+         "                }\n"
+         "                PUSH_VAR(utf8, cur, aptr, needs_swap);\n",
+         "                        aptr = SvPV_force_flags_nolen(fromstr, 0);\n"
+         "                }\n"
+         "                aptr = goperl_pack_address(aptr);\n"
+         "                PUSH_VAR(utf8, cur, aptr, needs_swap);\n"),
+    ]:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"process addresses of 'p' and 'P' applied to {path}")
+PYPATCH
 # ---- op.c: the ops whose memory goes back are reported -------------------------
 # The XS bridge tells the host which of the ops it described were freed
 # (perl.cc, goperl_op_released): only then can an address name another op,
