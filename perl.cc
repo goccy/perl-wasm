@@ -3467,7 +3467,8 @@ enum goperl_xs_op {
 /* INTERNAL selectors. */
 enum {
     GOPERL_INT_LAYOUT = 0,          /* -> the address of the offsets of the
-                                     * fields of the pad structures (below) */
+                                     * fields of the pad structures, and of
+                                     * the entries of hashes (below) */
     GOPERL_INT_SAVE_PLVAR = 1,      /* a: an interpreter variable (GOPERL_PL_);
                                      * b: a GOPERL_SAVEK_ kind */
     GOPERL_INT_SAVE_MEM = 2,        /* a: an address of this memory; b: the
@@ -4774,9 +4775,16 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
             w[20] = (uint32_t)sizeof(SSize_t);
             w[21] = (uint32_t)sizeof(PADOFFSET);
             w[22] = (uint32_t)sizeof(void *);
+            /* the entries of hashes and their keys, which native code
+             * reads and writes where they lie: the loader compares a
+             * module's layout of them with these */
             w[23] = (uint32_t)STRUCT_OFFSET(HE, hent_next);
             w[24] = (uint32_t)STRUCT_OFFSET(HE, hent_hek);
             w[25] = (uint32_t)STRUCT_OFFSET(HE, he_valu);
+            w[26] = (uint32_t)sizeof(HE);
+            w[27] = (uint32_t)STRUCT_OFFSET(HEK, hek_hash);
+            w[28] = (uint32_t)STRUCT_OFFSET(HEK, hek_len);
+            w[29] = (uint32_t)STRUCT_OFFSET(HEK, hek_key);
         }
         return (uint64_t)(uintptr_t)w;
     }
