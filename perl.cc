@@ -5526,9 +5526,23 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SV *sv = goperl_sv_arg(aTHX_ a, op, true);
         return SvROK(sv) ? (uint64_t)(uintptr_t)SvRV(sv) : 0;
     }
-    case GOPERL_OP_SV_TYPE: /* the raw svtype enum value (the SDK pins the same
-              * enum, so SVt_* comparisons agree across the boundary) */
-        return (uint64_t)SvTYPE(goperl_sv_arg(aTHX_ a, op, true));
+    case GOPERL_OP_SV_TYPE: { /* the raw svtype enum value (the SDK pins the
+              * same enum, so SVt_* comparisons agree across the boundary) */
+        /* SvTYPE of something that is no scalar reads the byte where a
+         * scalar's type would be, as perl's does: code asks it of what it
+         * has not checked is a scalar (XML::Bare: SvTYPE(SvRV(*svp)) of a
+         * string, whose SvRV is its buffer; Overload::FileCheck: of
+         * `arg + AvMAX(arg)`), and goes on by the answer. Reading it
+         * changes nothing; an address outside the memory is refused. */
+        const SV *const sv = (const SV *)(uintptr_t)a;
+        if (!a) return (uint64_t)SVt_NULL;
+        if (goperl_sv_head(aTHX_ sv)) return (uint64_t)SvTYPE(sv);
+        const uint64_t end = (uint64_t)__builtin_wasm_memory_size(0) << 16;
+        if (a >= end || end - a < sizeof(SV)) goperl_arg_refuse(aTHX_ op, a, "a scalar");
+        U32 flags;
+        memcpy(&flags, (const char *)sv + offsetof(SV, sv_flags), sizeof flags);
+        return (uint64_t)(flags & SVTYPEMASK);
+    }
     case GOPERL_OP_SV_ISA:
         return sv_isa(GOPERL_SVARG(a), s ? s : "") ? 1 : 0;
     case GOPERL_OP_SV_DERIVED_FROM:
