@@ -1200,7 +1200,10 @@ static void goperl_interrupt_now(pTHX) {
 }
 /* What PERL_ASYNC_CHECK delivers, as a sub: native code asks for it in the
  * middle of a call of its own, and a handler that dies must not unwind
- * past that call, so the delivery is called as code an eval catches. */
+ * past that call, so the delivery is called as code an eval catches. The
+ * sub is the bridge's, no code of the program's: the debugger's DB::sub is
+ * not entered for it (G_NODEBUG), as it is not on perl, which has no such
+ * sub. */
 XS(goperl_xs_deliver_pending) {
     dXSARGS;
     PERL_UNUSED_VAR(items);
@@ -1217,7 +1220,7 @@ static bool goperl_deliver_pending(pTHX) {
     SAVETMPS;
     PUSHMARK(SP);
     PUTBACK;
-    call_sv((SV *)deliver, G_VOID | G_DISCARD | G_NOARGS | G_EVAL);
+    call_sv((SV *)deliver, G_VOID | G_DISCARD | G_NOARGS | G_EVAL | G_NODEBUG);
     const bool died = SvTRUE(ERRSV);
     FREETMPS;
     LEAVE;
@@ -2569,8 +2572,9 @@ static std::string run_glue_body(pTHX_ const GlueCall &gc) {
     case TARGET_METHOD:
         count = call_method(gc.name, gc.gimme | G_EVAL);
         break;
-    default: /* TARGET_OP */
-        count = call_sv((SV *)g_op_cv[gc.op], gc.gimme | G_EVAL);
+    default: /* TARGET_OP: a sub of the bridge's, which the debugger's
+              * DB::sub is not entered for */
+        count = call_sv((SV *)g_op_cv[gc.op], gc.gimme | G_EVAL | G_NODEBUG);
         break;
     }
     SPAGAIN;
@@ -5777,8 +5781,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             call.flags = flags & ~G_DISCARD;
             call.returned = false;
             goperl_plain_call_pending = &call;
+            /* the eval around the call is the bridge's: the debugger's
+             * DB::sub is entered for the sub native code calls, as on perl,
+             * not for the sub that makes the eval (Devel::DebugHooks
+             * entered DB::sub for it at every cleanup Scope::Cleanup ran,
+             * and DB::sub established a cleanup of its own each time) */
             count = call_sv((SV *)goperl_plain_call_cv,
-                            (flags & (G_WANT | G_DISCARD)) | G_EVAL | G_KEEPERR);
+                            (flags & (G_WANT | G_DISCARD)) | G_EVAL | G_KEEPERR | G_NODEBUG);
             died = call.returned ? 0u : 1u;
         }
         SPAGAIN;
