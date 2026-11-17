@@ -987,6 +987,33 @@ patch("ext/B/typemap", "GOPERL_NUMBER_OP", [
      '\t    $var = GOPERL_NUMBER_OP($type,tmp);\n'),
 ])
 PYPATCH
+# ---- B: an op number that is no address of this memory dies -------------------
+# A number without bit 62 that B takes as an op is an address of this
+# memory, or one of the host process: a native module that makes a B::OP
+# object of an op of its own (B::CallChecker builds one on its C stack and
+# asks B for its next op) hands B an address outside this memory, and
+# reading it traps. B dies saying so instead. Idempotent.
+python3 - <<'PYPATCH'
+path = "ext/B/B.xs"
+t = open(path).read()
+if "goperl_number_op" in t:
+    print(f"op numbers outside the memory already refused in {path}")
+else:
+    old = ('#define GOPERL_NUMBER_OP(type, iv) INT2PTR(type, (iv) & ~GOPERL_OP_NUMBER_TAG)\n')
+    new = ('#define GOPERL_NUMBER_OP(type, iv) ((type)goperl_number_op(aTHX_ (iv)))\n'
+           'static void *goperl_number_op(pTHX_ IV iv) {\n'
+           '    const UV addr = (UV)iv & ~(UV)GOPERL_OP_NUMBER_TAG;\n'
+           '    if (!(iv & GOPERL_OP_NUMBER_TAG) &&\n'
+           '        addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
+           '        Perl_croak(aTHX_ "go-perl gives native code no access to this interpreter "\n'
+           '                         "internal: a B::OP object of an op of native code (0x%" UVxf ")",\n'
+           '                   addr);\n'
+           '    return INT2PTR(void *, addr);\n'
+           '}\n')
+    assert t.count(old) == 1, (path, t.count(old))
+    open(path, "w").write(t.replace(old, new))
+    print(f"op numbers outside the memory refused in {path}")
+PYPATCH
 # ---- $! and the status of a die are numbers the program sees ------------------
 # errno holds the error numbers of this C library. A program that is the
 # host process is shown the host's numbers (perl_numbers.cc), so the three
