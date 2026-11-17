@@ -57,6 +57,13 @@ static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_std
     int rc = posix_spawnp(&pid, file, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
+        /* What perl's child says when its exec fails (doio.c,
+         * S_exec_failed), for system, exec and a piped open alike; a file
+         * that is no program (ENOEXEC) goes to the shell instead. */
+        if (rc != ENOEXEC) {
+            dTHX;
+            Perl_ck_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s", file, Strerror(rc));
+        }
         errno = rc;
         return -1;
     }
@@ -519,13 +526,11 @@ extern "C" int execvp(const char *file, char *const argv[]) {
  * errno set. */
 extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
-    const char *what;
     if (!stacked && sp - mark == 1) {
         /* exec STRING */
         bool blank = false;
-        what = SvPV_nolen(*sp);
         wasi_host_proc_exec_next(1);
-        pid = wasi_spawn_command(what, -1, -1, &blank);
+        pid = wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank);
         if (blank) {
             wasi_host_proc_exec_next(0);
             return; /* nothing to run: exec fails, as perl's does */
@@ -548,16 +553,14 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         }
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
-        what = argv[0];
         wasi_host_proc_exec_next(1);
         pid = wasi_spawn_argv(argv, -1, -1);
         free(argv);
     }
     if (pid < 0) {
+        /* (the spawn has said "Can't exec") */
         const int e = errno;
         wasi_host_proc_exec_next(0);
-        Perl_ck_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s",
-                       what, Strerror(e));
         errno = e;
         return;
     }
