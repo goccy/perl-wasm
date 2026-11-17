@@ -627,8 +627,11 @@ XS(XS_goperl_plain_call) {
 }
 
 /* Native-XSUB request: GOPERL_NATIVE_HDR_WORDS header words (fn_id, the
- * CV, the item count) followed by the frame's SVs, a word each. */
-#define GOPERL_NATIVE_HDR_WORDS 3
+ * CV, the item count, the stack index of the first item (ax) and the
+ * address of the stack) followed by the frame's SVs, a word each. The
+ * native function's stack is this one by index: it reads what lies below
+ * its items here (an index it has from PL_markstack or a context). */
+#define GOPERL_NATIVE_HDR_WORDS 5
 
 /* Connects this module instance to the host's signal delivery
  * (perl_signal.cc). Every entry point that runs Perl code calls it: the
@@ -1718,6 +1721,8 @@ XS(XS_goperl_native_thunk) {
     payload[0] = (goperl_gword_t)(int64_t)fn_id;
     payload[1] = GOPERL_ADDR(cv); /* real XSUBs receive their CV */
     payload[2] = (goperl_gword_t)items;
+    payload[3] = (goperl_gword_t)ax;
+    payload[4] = GOPERL_ADDR(PL_stack_base);
     for (I32 i = 0; i < items; i++)
         payload[GOPERL_NATIVE_HDR_WORDS + i] = GOPERL_ADDR(ST(i));
 
