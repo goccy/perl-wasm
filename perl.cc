@@ -7004,7 +7004,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(int64_t)PerlIO_fill(n);
     }
     case GOPERL_OP_PERLIO_STATE: { /* b: 0 = eof|error<<1 of NEXT,
-                 * 1 = flush NEXT, 2 = flush SELF */
+                 * 1 = flush NEXT, 2 = flush SELF, 3 = the flags of NEXT */
         PerlIO *f = GOPERL_MEMARG(PerlIO, a);
         switch ((int)b) {
         case 0: {
@@ -7018,6 +7018,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case 2:
             return (uint64_t)(int64_t)PerlIO_flush(f);
+        case 3: {
+            PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
+            return PerlIOValid(n) ? (uint64_t)PerlIOBase(n)->flags : 0;
+        }
         }
         return 0;
     }
