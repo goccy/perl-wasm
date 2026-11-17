@@ -3712,6 +3712,8 @@ enum {
     GOPERL_CALL_SV_PEEK = 23,   /* a = the SV -> the address of sv_peek's text */
     GOPERL_CALL_SV_RECODE = 24, /* a = the SV, b = the encoding -> the address of
                                  * the string after, or 0 */
+    GOPERL_CALL_CV_NAME = 27,   /* a = the CV (or glob), b = the SV to set or
+                                 * 0, hi = flags -> cv_name's SV */
     GOPERL_CALL_MG_LIST = 26,   /* a = the SV -> the address of [number] and,
                                  * per MAGIC of the interpreter's own, in the
                                  * chain's order, the six words of MG_FIND */
@@ -4023,6 +4025,7 @@ enum {
                                 * the AMGf_ flags << 8; the result, or 0
                                 * when the operator is not overloaded */
     GOPERL_SVCALL_NUMCMP = 62, /* as CMP, numerically (sv_numcmp_flags) */
+    GOPERL_SVCALL_INC = 63,    /* sv_inc; b: 1 without get magic */
     GOPERL_SVCALL_AV_BODY = 59 /* the body of an array as it is in memory:
                  * AvARRAY; second: the number of elements (AvFILLp + 1).
                  * Native code reads the slots there in one go. */
@@ -7158,7 +7161,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVCALL_RVUNWEAKEN: sv_rvunweaken(sv); return 0;
         case GOPERL_SVCALL_UTF8_ENCODE: sv_utf8_encode(sv); return 0;
         case GOPERL_SVCALL_LEN_UTF8: return (uint64_t)sv_len_utf8(sv);
-        case GOPERL_SVCALL_DEC: sv_dec(sv); return 0;
+        case GOPERL_SVCALL_DEC:
+            if (b) sv_dec_nomg(sv); else sv_dec(sv);
+            return 0;
+        case GOPERL_SVCALL_INC:
+            if (b) sv_inc_nomg(sv); else sv_inc(sv);
+            return 0;
         case GOPERL_SVCALL_TAINTED: return sv_tainted(sv) ? 1 : 0;
         case GOPERL_SVCALL_TAINT: sv_taint(sv); return 0;
         case GOPERL_SVCALL_UNTAINT: sv_untaint(sv); return 0;
@@ -7769,6 +7777,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             }
             return 0;
         }
+        case GOPERL_CALL_CV_NAME:
+            return (uint64_t)(uintptr_t)cv_name((CV *)sv, b ? (SV *)(uintptr_t)b : NULL, hi);
         case GOPERL_CALL_MG_LIST: { /* every MAGIC of the interpreter's own on
                  * the SV, as MG_FIND has one */
             static std::vector<goperl_gword_t> w;
