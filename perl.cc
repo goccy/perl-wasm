@@ -352,6 +352,32 @@ XS(XS_Internals_site_directories) {
     PUTBACK;
 }
 
+/* ---- the directory the program starts in ---------------------------------
+ * Internals::start_directory(DIR) makes DIR the working directory, as the
+ * directory the process was started in: the C library keeps it as chdir
+ * does, but without the search permission chdir(2) needs, which a process
+ * started in a directory it may not search does not have (perl runs there,
+ * and its relative paths fail as they do there). The host is told, as
+ * after a chdir; the host process is there already. True, or false with $!
+ * set (DIR is no directory); DIR is an absolute path. The embedder sets the
+ * program up with it. */
+extern "C" int __real_chdir(const char *path);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_chdir")))
+extern "C" int wasi_host_proc_chdir(const char *path, int len);
+
+XS(XS_Internals_start_directory) {
+    dXSARGS;
+    if (items != 1) croak_xs_usage(cv, "dir");
+    STRLEN len;
+    const char *dir = SvPV_const(ST(0), len);
+    if (len == 0 || dir[0] != '/' || strlen(dir) != len)
+        croak("Internals::start_directory: %s is not an absolute path", dir);
+    if (__real_chdir(dir) != 0) XSRETURN_NO;
+    (void)wasi_host_proc_chdir(dir, (int)len);
+    XSRETURN_YES;
+}
+
 static void xs_init(pTHX) {
     static const char file[] = __FILE__;
     dXSUB_SYS;
@@ -363,6 +389,7 @@ static void xs_init(pTHX) {
     newXS("Internals::site_directories", XS_Internals_site_directories, file);
     newXS("Internals::archname", XS_Internals_archname, file);
     newXS("Internals::host_numbers", XS_Internals_host_numbers, file);
+    newXS("Internals::start_directory", XS_Internals_start_directory, file);
 }
 
 /* ---- interpreter state --------------------------------------------------- */
