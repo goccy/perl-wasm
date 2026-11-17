@@ -3559,8 +3559,11 @@ enum {
     GOPERL_INT_SIGHANDLER = 37,     /* b: a signal: the interpreter's own
                                      * handler of it (native code calls the
                                      * handler PL_sighandlerp had) */
-    GOPERL_INT_SCAN_VSTRING = 38    /* a: an SV; s+b: a v-string's spelling ->
+    GOPERL_INT_SCAN_VSTRING = 38,   /* a: an SV; s+b: a v-string's spelling ->
                                      * the bytes scan_vstring read */
+    GOPERL_INT_SAVE_SVREF = 39      /* a: the address of a slot of this
+                                     * memory (an element's, HeVAL) ->
+                                     * save_svref's new SV */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4953,6 +4956,9 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SIGHANDLER:
         Perl_sighandler((int)(int64_t)b);
         return 0;
+    case GOPERL_INT_SAVE_SVREF:
+        if (!lo) Perl_croak(aTHX_ "save_svref of no slot");
+        return (uint64_t)(uintptr_t)save_svref((SV **)(uintptr_t)lo);
     case GOPERL_INT_SCAN_VSTRING: {
         /* the spelling native code has, ending where it ends: scan_vstring
          * may look at the byte at the end */
@@ -5284,9 +5290,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     case GOPERL_OP_AV_LEN:
         return (uint64_t)(int64_t)av_len((AV *)(uintptr_t)a);
-    case GOPERL_OP_AV_FETCH: {
+    case GOPERL_OP_AV_FETCH: { /* -> the element; second: the address of
+                 * the slot av_fetch gave (native code's SV** is that slot) */
         SV **slot = av_fetch((AV *)(uintptr_t)a, (SSize_t)(int64_t)b, FALSE);
-        return slot ? (uint64_t)(uintptr_t)*slot : 0;
+        return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_STORE: { /* steals a ref */
         hv_store((HV *)(uintptr_t)a, s ? s : "", (I32)strlen(s ? s : ""),
@@ -5450,7 +5457,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     case GOPERL_OP_AV_READ: { /* like AV_FETCH but lval-safe (never NULL slot) */
         SV **slot = av_fetch((AV *)(uintptr_t)a, (SSize_t)(int64_t)b, TRUE);
-        return slot ? (uint64_t)(uintptr_t)*slot : 0;
+        return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_FETCH_ENT: { /* (b = keysv, c = lval) -> HE token */
         HE *he = hv_fetch_ent((HV *)(uintptr_t)a, (SV *)(uintptr_t)b, c ? TRUE : FALSE, 0U);
@@ -6309,14 +6316,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
                                     (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val, 0);
-        return svp ? (uint64_t)(uintptr_t)*svp : 0;
+        /* second: the address of the slot (HeVAL of the entry) */
+        return goperl_two(svp ? (uint64_t)(uintptr_t)*svp : 0, GOPERL_ADDR(svp));
     }
     case GOPERL_OP_HV_FETCH_KLEN: { /* a = hv, b = lval, c = utf8<<32 | key
                  * length, s = the key's bytes */
         SV **svp = (SV **)hv_common((HV *)(uintptr_t)a, NULL, s ? s : "",
                                     (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_JUST_SV | (b ? HV_FETCH_LVALUE : 0), NULL, 0);
-        return svp ? (uint64_t)(uintptr_t)*svp : 0;
+        /* second: the address of the slot (HeVAL of the entry) */
+        return goperl_two(svp ? (uint64_t)(uintptr_t)*svp : 0, GOPERL_ADDR(svp));
     }
     case GOPERL_OP_HV_DELETE_ENT: { /* b = keysv, c = flags */
         SV *r = hv_delete_ent((HV *)(uintptr_t)a, (SV *)(uintptr_t)b, (I32)(int64_t)c, 0);
