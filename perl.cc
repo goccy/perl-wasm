@@ -1707,6 +1707,7 @@ XS(XS_goperl_go_thunk) {
 /* Generic thunk backing every host-native XSUB (see pl.h "Native XS
  * support"). Marshals the call frame's SV tokens to the host over the
  * wasmify callback import and pushes the returned (mortal) SVs. */
+static inline SV *goperl_static_immortal(pTHX_ uint64_t v);
 XS(XS_goperl_native_thunk);
 XS(XS_goperl_native_thunk) {
     dXSARGS;
@@ -1757,8 +1758,11 @@ XS(XS_goperl_native_thunk) {
     }
     XSprePUSH;
     EXTEND(SP, (SSize_t)nret);
-    for (goperl_gword_t k = 0; k < nret; k++)
-        ST(k) = (SV *)(uintptr_t)goperl_resp_word(resp, resp_len, (uint32_t)(1 + k));
+    for (goperl_gword_t k = 0; k < nret; k++) {
+        const uint64_t w = goperl_resp_word(resp, resp_len, (uint32_t)(1 + k));
+        SV *const imm = w < 0x40 ? goperl_static_immortal(aTHX_ w) : NULL;
+        ST(k) = imm ? imm : (SV *)(uintptr_t)w;
+    }
     free(resp);
     XSRETURN((IV)nret);
 }
@@ -5094,6 +5098,21 @@ static void goperl_arg_refuse_freed(pTHX_ int32_t op, uint64_t v) {
                v, goperl_op_name(op), (int)op);
 }
 
+/* &PL_sv_undef, &PL_sv_yes and &PL_sv_no as native code has them in code
+ * that ran before it was booted (a C++ static initializer of the module:
+ * GOPERL_STATIC_SV_UNDEF in the SDK), NULL for any other number. */
+#define GOPERL_STATIC_SV_UNDEF 0x18u
+#define GOPERL_STATIC_SV_YES 0x28u
+#define GOPERL_STATIC_SV_NO 0x38u
+static inline SV *goperl_static_immortal(pTHX_ uint64_t v) {
+    switch (v) {
+    case GOPERL_STATIC_SV_UNDEF: return &PL_sv_undef;
+    case GOPERL_STATIC_SV_YES: return &PL_sv_yes;
+    case GOPERL_STATIC_SV_NO: return &PL_sv_no;
+    }
+    return NULL;
+}
+
 /* The scalar a number native code handed an operation is, NULL for 0. A
  * freed scalar is refused unless the operation reads its head alone
  * (freed): a freed scalar has no flags left, and perl reads it as undef
@@ -5102,7 +5121,10 @@ static void goperl_arg_refuse_freed(pTHX_ int32_t op, uint64_t v) {
 static inline SV *goperl_sv_arg(pTHX_ uint64_t v, int32_t op, bool freed = false) {
     SV *const sv = (SV *)(uintptr_t)v;
     if (!v) return sv;
-    if (!goperl_sv_head(aTHX_ sv)) goperl_arg_refuse(aTHX_ op, v, "a scalar");
+    if (!goperl_sv_head(aTHX_ sv)) {
+        if (SV *const imm = goperl_static_immortal(aTHX_ v)) return imm;
+        goperl_arg_refuse(aTHX_ op, v, "a scalar");
+    }
     if (!freed && SvTYPE(sv) == (svtype)SVTYPEMASK) goperl_arg_refuse_freed(aTHX_ op, v);
     return sv;
 }
@@ -5131,7 +5153,11 @@ static inline void *goperl_mem_arg(pTHX_ uint64_t v, size_t size, int32_t op, co
 /* A value an operation only stores, into a slot of a container or of a
  * scalar, is not read there, by perl either: it passes as it is (a module
  * keeps structures of its own in an array, as Object::Pad does). */
-#define GOPERL_STORED(v) ((SV *)(uintptr_t)(v))
+#define GOPERL_STORED(v) goperl_stored(aTHX_ (v))
+static inline SV *goperl_stored(pTHX_ uint64_t v) {
+    SV *const imm = v < 0x40 ? goperl_static_immortal(aTHX_ v) : NULL;
+    return imm ? imm : (SV *)(uintptr_t)v;
+}
 
 static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64_t c,
                                    const char *s) {
