@@ -3712,6 +3712,12 @@ enum {
     GOPERL_CALL_SV_PEEK = 23,   /* a = the SV -> the address of sv_peek's text */
     GOPERL_CALL_SV_RECODE = 24, /* a = the SV, b = the encoding -> the address of
                                  * the string after, or 0 */
+    GOPERL_CALL_POS_GET = 28,   /* a = the SV, hi = flags -> [found][pos] */
+    GOPERL_CALL_POS_SET = 29,   /* a = the SV, b = pos, hi = flags */
+    GOPERL_CALL_POS_CLEAR = 30, /* a = the SV */
+    GOPERL_CALL_HASH_SEED = 31, /* -> the address of [count][the bytes] */
+    GOPERL_CALL_LVALUE_SUB = 32, /* b: 0 is_lvalue_sub(), 1 LVRET (of the
+                                  * entersub that called the XSUB) */
     GOPERL_CALL_CV_NAME = 27,   /* a = the CV (or glob), b = the SV to set or
                                  * 0, hi = flags -> cv_name's SV */
     GOPERL_CALL_MG_LIST = 26,   /* a = the SV -> the address of [number] and,
@@ -3799,7 +3805,25 @@ enum {
     GOPERL_FIELD_IO_IFP_SET = 20,
     GOPERL_FIELD_IO_OFP_SET = 21,
     GOPERL_FIELD_IO_TYPE_SET = 22,
-    GOPERL_FIELD_IO_FLAGS_SET = 23
+    GOPERL_FIELD_IO_FLAGS_SET = 23,
+    /* the other words of an IO's body, b = which (GOPERL_IOWORD_): the
+     * load gives the word (an address for a glob or a name), the store
+     * (which in the high half of c) takes b, or a copy of the text s for
+     * a name */
+    GOPERL_FIELD_IO_WORD = 24,
+    GOPERL_FIELD_IO_WORD_SET = 25
+};
+enum {
+    GOPERL_IOWORD_LINES = 0,
+    GOPERL_IOWORD_PAGE = 1,
+    GOPERL_IOWORD_PAGE_LEN = 2,
+    GOPERL_IOWORD_LINES_LEFT = 3,
+    GOPERL_IOWORD_TOP_GV = 4,
+    GOPERL_IOWORD_FMT_GV = 5,
+    GOPERL_IOWORD_BOTTOM_GV = 6,
+    GOPERL_IOWORD_TOP_NAME = 7,
+    GOPERL_IOWORD_FMT_NAME = 8,
+    GOPERL_IOWORD_BOTTOM_NAME = 9
 };
 static_assert(HvAUXf_IS_CLASS == 0x4, "the SDK's HvAUXf_IS_CLASS is this build's");
 
@@ -3895,7 +3919,11 @@ enum {
      * PerlIO_releaseFILE: the :stdio layer of that stream is popped. */
     GOPERL_PIO_FIND_FILE = 33,
     GOPERL_PIO_EXPORT_FILE = 34,
-    GOPERL_PIO_RELEASE_FILE = 35
+    GOPERL_PIO_RELEASE_FILE = 35,
+    GOPERL_PIO_OPENN = 36,  /* a = the old handle or 0; b = the length of s:
+                             * four words (fd, imode, perm, narg), narg
+                             * words of SVs, the layers NUL the mode NUL */
+    GOPERL_PIO_ISUTF8 = 37
 };
 
 /* SAVE_MISC selectors. */
@@ -7091,6 +7119,29 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PIO_RELEASE_FILE:
             PerlIO_releaseFILE(f, (FILE *)(uintptr_t)b);
             return 0;
+        case GOPERL_PIO_OPENN: {
+            goperl_gword_t head[4];
+            if (!s || b < sizeof head) Perl_croak(aTHX_ "goperl: PerlIO_openn: short request");
+            memcpy(head, s, sizeof head);
+            const size_t narg = (size_t)head[3];
+            if (narg > b / 8 || b < sizeof head + narg * 8 + 2)
+                Perl_croak(aTHX_ "goperl: PerlIO_openn: short request");
+            SV **args = NULL;
+            if (narg) {
+                Newx(args, narg, SV *);
+                SAVEFREEPV(args);
+                for (size_t i = 0; i < narg; i++) {
+                    goperl_gword_t tok;
+                    memcpy(&tok, s + sizeof head + i * 8, 8);
+                    args[i] = (SV *)(uintptr_t)tok;
+                }
+            }
+            const char *layers = s + sizeof head + narg * 8;
+            const char *mode = layers + strlen(layers) + 1;
+            return (uint64_t)(uintptr_t)PerlIO_openn(aTHX_ *layers ? layers : NULL, mode,
+                                                     (int)(int64_t)head[0], (int)(int64_t)head[1],
+                                                     (int)(int64_t)head[2], f, (int)narg, args);
+        }
         }
         /* Everything below works on an open handle; on anything else it
          * fails the way the function does on a closed one. */
@@ -7100,6 +7151,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         switch (fn) {
         case GOPERL_PIO_FILENO: return (uint64_t)(int64_t)PerlIO_fileno(f);
+        case GOPERL_PIO_ISUTF8: return PerlIO_isutf8(f) ? 1 : 0;
         case GOPERL_PIO_READ: { /* b = count -> the buffer; second: the count
                  * read (negative on error). The bytes stay valid until the
                  * next read operation. */
@@ -7550,6 +7602,43 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_FIELD_IO_FLAGS_SET:
             if (SvTYPE(sv) == SVt_PVIO) IoFLAGS((IO *)sv) = (U8)b;
             return 0;
+        case GOPERL_FIELD_IO_WORD: {
+            if (SvTYPE(sv) != SVt_PVIO) return 0;
+            IO *io = (IO *)sv;
+            switch ((int)b) {
+            case GOPERL_IOWORD_LINES: return (uint64_t)(int64_t)IoLINES(io);
+            case GOPERL_IOWORD_PAGE: return (uint64_t)(int64_t)IoPAGE(io);
+            case GOPERL_IOWORD_PAGE_LEN: return (uint64_t)(int64_t)IoPAGE_LEN(io);
+            case GOPERL_IOWORD_LINES_LEFT: return (uint64_t)(int64_t)IoLINES_LEFT(io);
+            case GOPERL_IOWORD_TOP_GV: return GOPERL_ADDR(IoTOP_GV(io));
+            case GOPERL_IOWORD_FMT_GV: return GOPERL_ADDR(IoFMT_GV(io));
+            case GOPERL_IOWORD_BOTTOM_GV: return GOPERL_ADDR(IoBOTTOM_GV(io));
+            case GOPERL_IOWORD_TOP_NAME: return GOPERL_ADDR(IoTOP_NAME(io));
+            case GOPERL_IOWORD_FMT_NAME: return GOPERL_ADDR(IoFMT_NAME(io));
+            case GOPERL_IOWORD_BOTTOM_NAME: return GOPERL_ADDR(IoBOTTOM_NAME(io));
+            }
+            Perl_croak(aTHX_ "goperl: unknown word %d of an IO", (int)b);
+        }
+        case GOPERL_FIELD_IO_WORD_SET: {
+            if (SvTYPE(sv) != SVt_PVIO) return 0;
+            IO *io = (IO *)sv;
+            /* a name the host gave as text is the interpreter's copy, which
+             * it frees with the IO, as perl frees the savepv it was given */
+            char *name = s ? savepv(s) : (char *)(uintptr_t)b;
+            switch ((int)(c >> 32)) {
+            case GOPERL_IOWORD_LINES: IoLINES(io) = (IV)(int64_t)b; return 0;
+            case GOPERL_IOWORD_PAGE: IoPAGE(io) = (IV)(int64_t)b; return 0;
+            case GOPERL_IOWORD_PAGE_LEN: IoPAGE_LEN(io) = (IV)(int64_t)b; return 0;
+            case GOPERL_IOWORD_LINES_LEFT: IoLINES_LEFT(io) = (IV)(int64_t)b; return 0;
+            case GOPERL_IOWORD_TOP_GV: IoTOP_GV(io) = (GV *)(uintptr_t)b; return 0;
+            case GOPERL_IOWORD_FMT_GV: IoFMT_GV(io) = (GV *)(uintptr_t)b; return 0;
+            case GOPERL_IOWORD_BOTTOM_GV: IoBOTTOM_GV(io) = (GV *)(uintptr_t)b; return 0;
+            case GOPERL_IOWORD_TOP_NAME: IoTOP_NAME(io) = name; return 0;
+            case GOPERL_IOWORD_FMT_NAME: IoFMT_NAME(io) = name; return 0;
+            case GOPERL_IOWORD_BOTTOM_NAME: IoBOTTOM_NAME(io) = name; return 0;
+            }
+            Perl_croak(aTHX_ "goperl: unknown word %d of an IO", (int)(c >> 32));
+        }
         }
         Perl_croak(aTHX_ "goperl: unknown field %d", (int)c);
     }
@@ -7784,6 +7873,28 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             }
             return 0;
         }
+        case GOPERL_CALL_POS_GET: {
+            STRLEN pos = 0;
+            const bool found = sv_regex_global_pos_get(sv, &pos, hi);
+            return goperl_two(found ? 1 : 0, (uint64_t)pos);
+        }
+        case GOPERL_CALL_POS_SET: sv_regex_global_pos_set(sv, (STRLEN)b, hi); return 0;
+        case GOPERL_CALL_POS_CLEAR: sv_regex_global_pos_clear(sv); return 0;
+        case GOPERL_CALL_HASH_SEED: {
+            /* the SDK's PERL_HASH_SEED_BYTES is this build's */
+            static_assert(PERL_HASH_SEED_BYTES == 32, "the SDK's PERL_HASH_SEED_BYTES");
+            static struct {
+                goperl_gword_t count;
+                U8 bytes[PERL_HASH_SEED_BYTES];
+            } seed;
+            seed.count = PERL_HASH_SEED_BYTES;
+            memcpy(seed.bytes, PL_hash_seed, PERL_HASH_SEED_BYTES);
+            return (uint64_t)(uintptr_t)&seed;
+        }
+        case GOPERL_CALL_LVALUE_SUB:
+            if (b == 1)
+                return (PL_op && (PL_op->op_private & OPpMAYBE_LVSUB) && is_lvalue_sub()) ? 1 : 0;
+            return (uint64_t)(int64_t)is_lvalue_sub();
         case GOPERL_CALL_CV_NAME:
             return (uint64_t)(uintptr_t)cv_name((CV *)sv, b ? (SV *)(uintptr_t)b : NULL, hi);
         case GOPERL_CALL_MG_LIST: { /* every MAGIC of the interpreter's own on
