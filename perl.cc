@@ -4390,6 +4390,8 @@ enum {
 #define GOPERL_PL_SIGHANDLERP 115  /* the host's id of the signal handler of
                                     * native code that is PL_sighandlerp, 0
                                     * for the interpreter's own */
+#define GOPERL_PL_SV_ARENAROOT 116 /* the first SV arena (read only): native
+                                    * code walks the arenas from it */
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -5971,6 +5973,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SORTCOP: return (uint64_t)(uintptr_t)PL_sortcop;
         case GOPERL_PL_SIGHANDLERP:
             return PL_sighandlerp == goperl_sighandler_native ? g_sighandler_native : 0;
+        case GOPERL_PL_SV_ARENAROOT: return (uint64_t)(uintptr_t)PL_sv_arenaroot;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -6486,8 +6489,20 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (!m) return 0;
         return (1ull << 32) | (uint32_t)m->pkg_gen;
     }
-    case GOPERL_OP_SV_REFCNT:
-        return (uint64_t)SvREFCNT(goperl_sv_arg(aTHX_ a, op, true));
+    case GOPERL_OP_SV_REFCNT: {
+        /* the count of something that is no scalar is the word where a
+         * scalar's count would be, as perl's SvREFCNT reads it: the header
+         * of an SV arena keeps the number of its slots there, which a walk
+         * of the arenas reads (Devel::Leak). Reading it changes nothing; an
+         * address outside the memory is refused. */
+        const SV *const sv = (const SV *)(uintptr_t)a;
+        if (!a || goperl_sv_head(aTHX_ sv)) return (uint64_t)SvREFCNT(goperl_sv_arg(aTHX_ a, op, true));
+        const uint64_t end = (uint64_t)__builtin_wasm_memory_size(0) << 16;
+        if (a >= end || end - a < sizeof(SV)) goperl_arg_refuse(aTHX_ op, a, "a scalar");
+        U32 refcnt;
+        memcpy(&refcnt, (const char *)sv + offsetof(SV, sv_refcnt), sizeof refcnt);
+        return (uint64_t)refcnt;
+    }
     case GOPERL_OP_GV_INIT: { /* expand a stash stub into a real glob
                  * (b = stash, c = flags, s = name) -> the gv token */
         GV *gv = GOPERL_GVARG(a);
