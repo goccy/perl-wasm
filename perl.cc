@@ -580,6 +580,11 @@ static void goperl_die_if_thrown(pTHX_ unsigned char *resp) {
     goperl_thrown_sv = NULL;
     free(resp);
     if (!thrown) Perl_croak(aTHX_ "native code: the thrown value is missing");
+    /* $SIG{__DIE__} has seen it where the native code croaked (see
+     * goperl_die_hook): it is not called again on the way out */
+    ENTER;
+    SAVESPTR(PL_diehook);
+    PL_diehook = NULL;
     croak_sv(sv_2mortal(thrown));
 }
 
@@ -624,6 +629,57 @@ XS(XS_goperl_plain_call) {
     call->returned = true;
     /* the results are where the arguments were */
     XSRETURN(count);
+}
+
+/* What perl's croak does before it unwinds: the exception, with the place
+ * of the statement added to a message, goes to $SIG{__DIE__} (PL_diehook)
+ * while the native code that croaks is still running, inside the scopes it
+ * opened (Text::Xslate sets PL_diehook for a render, and its hook names
+ * Text::Xslate in what dies there). A hook that dies makes its exception
+ * the one thrown. The hook is called as perl's invoke_exception_hook calls
+ * it, with the flag perl keeps while a hook runs (which for a die hook is
+ * PL_in_warnhook, as perl has it), so that a die in the hook does not run
+ * it again; with the exception as a read-only copy, on a stack of its own.
+ * Its die is caught here, where perl's would unwind the native code's C
+ * frames. Returns the exception to throw, which the caller takes a
+ * reference on. */
+static SV *goperl_die_hook(pTHX_ SV *msg) {
+    SV *const ex = mess_sv(msg, 0);
+    SV *const oldhook = PL_diehook;
+    if (!oldhook || oldhook == PERL_WARNHOOK_FATAL || PL_in_warnhook) return ex;
+    HV *stash;
+    GV *gv;
+    ENTER;
+    SAVEBOOL(PL_in_warnhook);
+    PL_in_warnhook = TRUE;
+    CV *const cv = sv_2cv(oldhook, &stash, &gv, 0);
+    LEAVE;
+    if (!cv || !(CvROOT(cv) || CvXSUB(cv))) return ex;
+    if (!goperl_plain_call_cv) goperl_plain_call_cv = newXS(NULL, XS_goperl_plain_call, __FILE__);
+    SV *thrown = ex;
+    dSP;
+    ENTER;
+    save_re_context();
+    SAVEBOOL(PL_in_warnhook);
+    PL_in_warnhook = TRUE;
+    SV *const exarg = newSVsv(ex);
+    SvREADONLY_on(exarg);
+    SAVEFREESV(exarg);
+    PUSHSTACKi(PERLSI_DIEHOOK);
+    PUSHMARK(SP);
+    XPUSHs(exarg);
+    PUTBACK;
+    goperl_plain_call call;
+    call.target = (SV *)cv;
+    call.method = NULL;
+    call.flags = G_VOID;
+    call.returned = false;
+    goperl_plain_call_pending = &call;
+    call_sv((SV *)goperl_plain_call_cv, G_VOID | G_DISCARD | G_EVAL | G_KEEPERR);
+    if (!call.returned) thrown = sv_mortalcopy(ERRSV);
+    POPSTACK;
+    LEAVE;
+    return thrown;
 }
 
 /* Native-XSUB request: GOPERL_NATIVE_HDR_WORDS header words (fn_id, the
@@ -7869,11 +7925,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVCALL_IO_TYPE: return (uint64_t)(U8)IoTYPE((IO *)sv);
         case GOPERL_SVCALL_IO_FLAGS: return (uint64_t)IoFLAGS((IO *)sv);
         case GOPERL_SVCALL_IO_LINES: return (uint64_t)(int64_t)IoLINES((IO *)sv);
-        case GOPERL_SVCALL_THROW: /* the exception the running native XSUB
-                 * ends with; a copy, as die takes one */
+        case GOPERL_SVCALL_THROW: { /* the exception the running native XSUB
+                 * ends with; a copy, as die takes one, which $SIG{__DIE__}
+                 * sees now */
+            SV *const thrown = goperl_die_hook(aTHX_ sv);
             SvREFCNT_dec(goperl_thrown_sv);
-            goperl_thrown_sv = newSVsv(sv);
+            goperl_thrown_sv = newSVsv(thrown);
             return 0;
+        }
         case GOPERL_SVCALL_SETPV_BUFSIZE: /* b = buffer size, hi = cur -> PVX */
             return GOPERL_ADDR(sv_setpv_bufsize(sv, (STRLEN)hi, (STRLEN)b));
         }
@@ -8007,11 +8066,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * encoding; the place and $SIG{__WARN__} are perl's */
             warn_sv(newSVpvn_flags(str, len, SVs_TEMP | ((flags & 1) ? SVf_UTF8 : 0)));
             return 0;
-        case GOPERL_SVSTR_THROW: /* the message the running native XSUB
+        case GOPERL_SVSTR_THROW: { /* the message the running native XSUB
                  * dies with (see GOPERL_SVCALL_THROW) */
+            SV *const thrown = goperl_die_hook(
+                aTHX_ newSVpvn_flags(str, len, SVs_TEMP | ((flags & 1) ? SVf_UTF8 : 0)));
             SvREFCNT_dec(goperl_thrown_sv);
-            goperl_thrown_sv = newSVpvn_flags(str, len, (flags & 1) ? SVf_UTF8 : 0);
+            goperl_thrown_sv = newSVsv(thrown);
             return 0;
+        }
         case GOPERL_SVSTR_GV_NAME_SET:
             gv_name_set((GV *)sv, str, (U32)len, flags);
             return 0;
