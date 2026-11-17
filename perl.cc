@@ -6134,8 +6134,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SvPOK_on(sv);
         return 0;
     }
-    case GOPERL_OP_SV_DUMP:
-        sv_dump(GOPERL_SVARG(a));
+    case GOPERL_OP_SV_DUMP: /* b: a handle to dump into, c: the depth of
+                 * nesting, as do_sv_dump has them; sv_dump without a handle */
+        if (b)
+            do_sv_dump(0, GOPERL_MEMARG(PerlIO, b), GOPERL_SVARG(a), 0, (I32)(int64_t)c, FALSE, 0);
+        else
+            sv_dump(GOPERL_SVARG(a));
         return 0;
     case GOPERL_OP_SV_REFCNT_DEC: /* a freed scalar is perl's to warn of */
         SvREFCNT_dec(goperl_sv_arg(aTHX_ a, op, true));
