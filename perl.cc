@@ -3922,6 +3922,33 @@ enum {
     GOPERL_SVSLOT_GV_CVGEN = 8
 };
 
+/* What the SDK stores in the buffer slot of an SV whose buffer is a
+ * pointer of native code's process (the SDK's perl.h): no buffer has the
+ * address. Native code keeps a structure of its own behind an SV that way,
+ * an SV that is no string. */
+#define GOPERL_PV_HOST ((char *)(uintptr_t)1)
+
+/* A scalar whose buffer slot holds GOPERL_PV_HOST cannot be a string: its
+ * bytes are in the memory of native code's process, which the interpreter
+ * has no access to, and it would read and write its own memory at that
+ * address instead (File::Map maps a file and makes the mapping the string
+ * of a scalar). The flags that make it one are refused, before they
+ * change, with an error that says so. */
+static bool goperl_pv_host_string(pTHX_ SV *sv, U32 flags, char *pv) {
+    if (!(flags & (SVf_POK | SVp_POK))) return false;
+    if (SvTYPE(sv) < SVt_PV || SvTYPE(sv) == SVt_PVAV || SvTYPE(sv) == SVt_PVHV ||
+        SvTYPE(sv) == SVt_PVCV || SvTYPE(sv) == SVt_PVFM || SvTYPE(sv) == SVt_PVIO)
+        return false;
+    if (isGV_with_GP(sv) || SvROK(sv)) return false;
+    return pv == GOPERL_PV_HOST;
+}
+static void goperl_pv_host_refuse(pTHX) __attribute__((noreturn));
+static void goperl_pv_host_refuse(pTHX) {
+    Perl_croak(aTHX_ "the string of a scalar cannot be in native memory on go-perl: native "
+                     "code set the scalar's buffer (SvPVX, SvPV_set) to an address outside "
+                     "the interpreter's memory and made it a string");
+}
+
 /* SV_CALL selectors. */
 enum {
     GOPERL_SVCALL_MG_GET = 0,
@@ -5811,9 +5838,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_SV_UTF8_ON:
         SvUTF8_on((SV *)(uintptr_t)a);
         return 0;
-    case GOPERL_OP_SV_POK_ON:
-        SvPOK_on((SV *)(uintptr_t)a);
+    case GOPERL_OP_SV_POK_ON: {
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SVf_POK, SvPVX(sv)))
+            goperl_pv_host_refuse(aTHX);
+        SvPOK_on(sv);
         return 0;
+    }
     case GOPERL_OP_SV_DUMP:
         sv_dump((SV *)(uintptr_t)a);
         return 0;
@@ -6841,6 +6872,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * macro of sv.h are this one operation. */
         SV *sv = (SV *)(uintptr_t)a;
         U32 clear = (U32)(b >> 32), set = (U32)b;
+        if ((set & (SVf_POK | SVp_POK)) && SvTYPE(sv) >= SVt_PV &&
+            goperl_pv_host_string(aTHX_ sv, (SvFLAGS(sv) & ~clear) | set, SvPVX(sv)))
+            goperl_pv_host_refuse(aTHX);
         if (clear || set) SvFLAGS(sv) = (SvFLAGS(sv) & ~clear) | set;
         return (uint64_t)SvFLAGS(sv);
     }
@@ -6869,7 +6903,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             SvNV_set(sv, nv);
             return 0;
         }
-        case GOPERL_SVSLOT_PV: SvPV_set(sv, (char *)(uintptr_t)b); return 0;
+        case GOPERL_SVSLOT_PV:
+            if (goperl_pv_host_string(aTHX_ sv, SvFLAGS(sv), (char *)(uintptr_t)b))
+                goperl_pv_host_refuse(aTHX);
+            SvPV_set(sv, (char *)(uintptr_t)b);
+            return 0;
         case GOPERL_SVSLOT_LEN: SvLEN_set(sv, (STRLEN)b); return 0;
         case GOPERL_SVSLOT_GV_STASH:
             if (isGV_with_GP(sv)) GvSTASH((GV *)sv) = (HV *)(uintptr_t)b;
