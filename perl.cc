@@ -3566,9 +3566,16 @@ enum {
     GOPERL_INT_SAVE_SVREF = 39,     /* a: the address of a slot of this
                                      * memory (an element's, HeVAL) ->
                                      * save_svref's new SV */
-    GOPERL_INT_SIGACTION = 40       /* b: a signal -> the program's action
+    GOPERL_INT_SIGACTION = 40,      /* b: a signal -> the program's action
                                      * of it: 0 the default, 1 ignored, 2 a
                                      * handler */
+    GOPERL_INT_WAIT_MASK = 41       /* a: 1 a wait of native code with a
+                                     * signal mask begins, 0 it has ended;
+                                     * b: the mask (the one to put back at
+                                     * the end), or with c's high half 1 the
+                                     * address of a sigset_t of this memory
+                                     * -> the mask before; second: 1 when a
+                                     * handler ran */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4882,6 +4889,8 @@ static uint64_t goperl_runops_with_stack(pTHX_ OP *start, const char *s, size_t 
  * address are kept here and brought up to date from the head of the chain
  * whenever it has moved: telling a scalar is a search of them, where perl
  * keeps nothing to find an arena by an address in it. */
+extern "C" int perl_signal_wait_mask(int begin, uint64_t mask, uint64_t *old);
+
 static std::vector<const SV *> g_sv_arenas;
 static const SV *g_sv_arenas_head;
 /* the arena the last scalar was found in: the scalars an operation is
@@ -5108,6 +5117,21 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SIGHANDLER:
         Perl_sighandler((int)(int64_t)b);
         return 0;
+    case GOPERL_INT_WAIT_MASK: {
+        /* the sigset_t of POSIX::SigSet, which native code hands its wait
+         * as it is: one byte here, naming a set (perl_signal.cc) */
+        uint64_t mask = b;
+        if (c_hi & 1) {
+            const sigset_t *set = (const sigset_t *)goperl_mem_arg(aTHX_ b, 1, GOPERL_OP_INTERNAL,
+                                                                   "a sigset_t");
+            mask = 0;
+            for (int sig = 1; sig <= 64; sig++)
+                if (sigismember(set, sig) == 1) mask |= (uint64_t)1 << (sig - 1);
+        }
+        uint64_t old = 0;
+        const int ran = perl_signal_wait_mask(lo != 0, mask, &old);
+        return goperl_two(old, (uint64_t)ran);
+    }
     case GOPERL_INT_SIGACTION: {
         /* native code shares the process's signals with the program, whose
          * actions are its C library's: the action native code finds where

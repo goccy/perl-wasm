@@ -550,4 +550,30 @@ void wasi_signal_fork_child(pTHX) {
     wasi_signal_attach(aTHX);
 }
 
+/* A wait of native code with a signal mask of its own (epoll_pwait, ppoll,
+ * pselect), which the kernel puts in place for the wait alone. begin:
+ * mask is the signal mask from now on, and the one before is put in *old;
+ * a signal that was held and is let in is delivered at once. Otherwise the
+ * wait has ended: what arrived while it ran is delivered, with its mask
+ * still in place, and then mask is the signal mask again. Returns whether
+ * a handler ran, which ends a wait with EINTR. */
+int perl_signal_wait_mask(int begin, uint64_t mask, uint64_t *old) {
+    const unsigned long runs = g_handler_runs;
+    if (begin) {
+        *old = g_blocked;
+    } else {
+        absorb_posted();
+        release_held();
+    }
+    if ((mask & ~kUnmaskable) != g_blocked) {
+        g_blocked = mask & ~kUnmaskable;
+        report_dispositions();
+        if (begin) {
+            absorb_posted();
+            release_held();
+        }
+    }
+    return g_handler_runs != runs;
+}
+
 } /* extern "C" */
