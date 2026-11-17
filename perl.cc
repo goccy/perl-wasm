@@ -5814,8 +5814,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SvCUR_set(sv, (STRLEN)b);
         return 0;
     }
-    case GOPERL_OP_SV_GROW: { /* -> new PVX (linear-memory offset) */
-        char *p = SvGROW(GOPERL_SVARG(a), (STRLEN)b);
+    case GOPERL_OP_SV_GROW: { /* (c: sv_grow, not SvGROW) -> new PVX
+                 * (linear-memory offset) */
+        SV *const sv = GOPERL_SVARG(a);
+        char *p = c ? sv_grow(sv, (STRLEN)b) : SvGROW(sv, (STRLEN)b);
         return GOPERL_ADDR(p);
     }
     case GOPERL_OP_SV_EQ:
