@@ -5076,6 +5076,11 @@ static inline void *goperl_mem_arg(pTHX_ uint64_t v, size_t size, int32_t op, co
 #define GOPERL_SVARG(v) goperl_sv_arg(aTHX_ (v), op)
 #define GOPERL_AVARG(v) ((AV *)goperl_sv_arg(aTHX_ (v), op))
 #define GOPERL_HVARG(v) ((HV *)goperl_sv_arg(aTHX_ (v), op))
+/* The hash of an operation perl's hv_common does (fetch, store, exists,
+ * delete): a freed one too, for which hv_common answers NULL (SvIS_FREED),
+ * as perl takes the freed hash of a module that tears its hashes down out
+ * of order (Prima's font cache, whose faces' hash went first). */
+#define GOPERL_HVARG_COMMON(v) ((HV *)goperl_sv_arg(aTHX_ (v), op, true))
 #define GOPERL_CVARG(v) ((CV *)goperl_sv_arg(aTHX_ (v), op))
 #define GOPERL_GVARG(v) ((GV *)goperl_sv_arg(aTHX_ (v), op))
 #define GOPERL_IOARG(v) ((IO *)goperl_sv_arg(aTHX_ (v), op))
@@ -5548,12 +5553,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_STORE: { /* steals a ref */
-        hv_store(GOPERL_HVARG(a), s ? s : "", (I32)strlen(s ? s : ""),
+        hv_store(GOPERL_HVARG_COMMON(a), s ? s : "", (I32)strlen(s ? s : ""),
                  GOPERL_STORED(b), 0);
         return 0;
     }
     case GOPERL_OP_HV_FETCH: {
-        SV **slot = hv_fetch(GOPERL_HVARG(a), s ? s : "",
+        SV **slot = hv_fetch(GOPERL_HVARG_COMMON(a), s ? s : "",
                              (I32)strlen(s ? s : ""), FALSE);
         return slot ? (uint64_t)(uintptr_t)*slot : 0;
     }
@@ -5739,21 +5744,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * entry made by the fetch has no value, HV_FETCH_EMPTY_HE)
                  * -> HE token */
         if (c & 2)
-            return (uint64_t)(uintptr_t)hv_common(GOPERL_HVARG(a), GOPERL_SVARG(b), NULL, 0, 0,
+            return (uint64_t)(uintptr_t)hv_common(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), NULL, 0, 0,
                                                   HV_FETCH_LVALUE | HV_FETCH_EMPTY_HE, NULL, 0);
-        HE *he = hv_fetch_ent(GOPERL_HVARG(a), GOPERL_SVARG(b), c ? TRUE : FALSE, 0U);
+        HE *he = hv_fetch_ent(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), c ? TRUE : FALSE, 0U);
         return (uint64_t)(uintptr_t)he;
     }
     case GOPERL_OP_HV_STORE_ENT: { /* b = keysv, c = sv; takes value
                  * ownership -> the HE token (callers treat NULL as failure
                  * and roll their reference back) */
-        HE *he = hv_store_ent(GOPERL_HVARG(a), GOPERL_SVARG(b), GOPERL_STORED(c), 0U);
+        HE *he = hv_store_ent(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), GOPERL_STORED(c), 0U);
         return (uint64_t)(uintptr_t)he;
     }
     case GOPERL_OP_HV_EXISTS_ENT: /* b = keysv; c = more of hv_common's action
                  * (HV_DISABLE_UVAR_XKEY: no uvar magic of the hash is asked,
                  * as English::Name's own lookups ask it not to be) */
-        return hv_common(GOPERL_HVARG(a), GOPERL_SVARG(b), NULL, 0, 0,
+        return hv_common(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), NULL, 0, 0,
                          HV_FETCH_ISEXISTS | ((int)c & HV_DISABLE_UVAR_XKEY), NULL, 0)
                    ? 1
                    : 0;
@@ -6499,7 +6504,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     case GOPERL_OP_HV_DELETE: { /* a = hv, s = the key's bytes, b = flags,
                  * c = the key's length */
-        SV *r = hv_delete(GOPERL_HVARG(a), s ? s : "", (I32)(int64_t)c, (I32)(int64_t)b);
+        SV *r = hv_delete(GOPERL_HVARG_COMMON(a), s ? s : "", (I32)(int64_t)c, (I32)(int64_t)b);
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_EXISTS:
@@ -6633,7 +6638,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * ref -> stored SV token. hv_common with JUST_SV returns
                  * the SLOT (SV**). */
         SV *val = GOPERL_STORED(b);
-        SV **svp = (SV **)hv_common(GOPERL_HVARG(a), NULL, s ? s : "",
+        SV **svp = (SV **)hv_common(GOPERL_HVARG_COMMON(a), NULL, s ? s : "",
                                     (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val, 0);
         /* second: the address of the slot (HeVAL of the entry) */
@@ -6641,14 +6646,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_HV_FETCH_KLEN: { /* a = hv, b = lval, c = utf8<<32 | key
                  * length, s = the key's bytes */
-        SV **svp = (SV **)hv_common(GOPERL_HVARG(a), NULL, s ? s : "",
+        SV **svp = (SV **)hv_common(GOPERL_HVARG_COMMON(a), NULL, s ? s : "",
                                     (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_JUST_SV | (b ? HV_FETCH_LVALUE : 0), NULL, 0);
         /* second: the address of the slot (HeVAL of the entry) */
         return goperl_two(svp ? (uint64_t)(uintptr_t)*svp : 0, GOPERL_ADDR(svp));
     }
     case GOPERL_OP_HV_DELETE_ENT: { /* b = keysv, c = flags */
-        SV *r = hv_delete_ent(GOPERL_HVARG(a), GOPERL_SVARG(b), (I32)(int64_t)c, 0);
+        SV *r = hv_delete_ent(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), (I32)(int64_t)c, 0);
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_POP:
