@@ -32,16 +32,25 @@ reads (Blocks.txt, SpecialCasing.txt, NamedSequences.txt). The other source
 serve the build and its tests; a program that finds a UCD source file under
 unicore/ takes that as an invitation to parse it.
 
-One manual page is shipped, as pod/perldiag.pod: the diagnostics pragma (and
-splain) read the explanations of perl's messages from that file in the
-library directory.
+perl's manual pages (the perl5/pod/ source directory, with the pages the
+build generates: perlapi.pod, perlmodlib.pod, perluniprops.pod, ...) are
+shipped under pod/, where perl installs them (installperl: <privlib>/pod):
+the diagnostics pragma (and splain) read the explanations of perl's messages
+from pod/perldiag.pod, perldoc finds perlfunc.pod there, and a program that
+browses the documentation of the installed perl looks there for perl.pod and
+the pages it names.
+
+perl's programs (prove, perldoc, pod2usage, enc2xs and the others utils.lst
+names, which installperl installs into the directory of the perl command)
+are shipped under bin/, with the #! line the build gave them: the embedding
+application puts them beside the path that runs it as the perl command,
+with that path on their #! line, and %Config names that directory (see
+below).
 
 The *.pod files perl installs into its library directory next to the modules
 ARE kept (Config.pod, CORE.pod, perlfaq*.pod, ...): they are part of an
 installed perl's library, and programs look for them there (a module's
-documentation is found beside its .pm). The manual pages of the perl5/pod/
-source directory (perlfunc.pod and the rest) are not in lib/ and so are not
-shipped.
+documentation is found beside its .pm).
 
 %Config names the library directory the library is in at run time. The
 build configures perl for a library under /usr/lib/perl5, where nothing is:
@@ -79,6 +88,19 @@ which config.sh holds, is not shown).
 The path of the perl command (perlpath, and startperl, the #! line for a
 program that is installed) is $^X when that is an absolute path: the
 embedding application sets $^X to what runs it as perl, if anything does.
+The directory of the perl command and of perl's programs (bin, scriptdir:
+the directory of $^X, as perl's relocatable installations have it) is then
+the directory $^X is in; what is installed goes to the site's directory of
+programs (installbin, installscript), as perl's own library does.
+
+An embedding application that runs the interpreter for a build on another
+system than the interpreter's (a native module built with the host's C
+compiler) gives %Config the values of that system in %Config::Override
+before Config.pm is loaded (from a preload that loads no module): Config.pm
+and Config_heavy.pl report them in every view of %Config (the hash, the
+text of config_sh, config_re and config_vars, myconfig, perl -V) in place of
+the values above, and perl -V says the library was built for the system
+%Config names (osname).
 
 The error numbers of Errno are those the program sees. Errno.pm holds the
 numbers of the C library perl was built with; a program that is shown the
@@ -110,8 +132,8 @@ ANYWHERE_DIR_EXCLUDES = {"t", "test", "tests", "pod"}
 UNICORE_TXT = {"Blocks.txt", "SpecialCasing.txt", "NamedSequences.txt"}
 UNICORE_OTHER = re.compile(r"\A(?:version|\w+\.p[lm])\Z")
 
-# The manual page that ships, by its path under perl5/pod.
-MANUAL_PAGES = ["perldiag.pod"]
+# The list of perl's programs, by their path under perl5 (installperl's).
+PROGRAMS_LIST = "utils.lst"
 
 # Fixed DOS timestamp (1980-01-01 00:00:00) for reproducible archives.
 FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
@@ -143,6 +165,18 @@ my $libdir = __FILE__;
 $libdir =~ s{/+[^/]*\\z}{} or $libdir = '.';
 $libdir = '/' if $libdir eq '';
 
+# The perl command is the path $^X names, when it names one: perl's
+# programs are beside it (scriptdir), as in perl's relocatable installations.
+my $bindir;
+if ($^X =~ m{\\A/}) {
+    ($bindir = $^X) =~ s{/+[^/]*\\z}{};
+    $bindir = '/' if $bindir eq '';
+}
+
+# The values an embedding application gave in place of the build's, by its
+# preload, before this file was loaded.
+our %Override;
+
 # The site directories are the ones the interpreter was started with, when
 # it was started with any.
 my %site = Internals::site_directories();
@@ -159,10 +193,14 @@ my $archname = Internals::archname();
 # for a directory with a single quote in its name, in double quotes, which
 # the reader of the text evaluates as a Perl string.
 CONFIG_HEAVY_LIBDIR = """\
-# The library directories are where the library is at run time: the answer
-# Config.pm found when it was loaded.
+# The library directories are where the library is at run time: the
+# directory this file was loaded from, which is the one Config.pm was loaded
+# from. (%Config is not asked: this file may be loaded while a method of the
+# tied hash runs, and the hash reads as empty then.)
 {
-    my $libdir = $Config::Config{privlibexp};
+    my $libdir = __FILE__;
+    $libdir =~ s{/+[^/]*\\z}{} or $libdir = '.';
+    $libdir = '/' if $libdir eq '';
     my $quoted = $libdir =~ /'/ ? '"' . quotemeta($libdir) . '"' : "'$libdir'";
     s/^((?:install)?(?:priv|arch)lib(?:exp)?)=.*$/$1=$quoted/mg;
 }
@@ -171,8 +209,9 @@ CONFIG_HEAVY_LIBDIR = """\
 {
     my $set = sub {
         my ($key, $value) = @_;
+        $value = 'undef' unless defined $value;
         my $quoted = $value =~ /'/ ? '"' . quotemeta($value) . '"' : "'$value'";
-        s/^\\Q$key\\E=.*$/$key=$quoted/m;
+        s/^\\Q$key\\E=.*$/$key=$quoted/m or $_ .= "$key=$quoted\\n";
     };
     my %site = Internals::site_directories();
     for my $key (keys %site) {
@@ -197,10 +236,17 @@ CONFIG_HEAVY_LIBDIR = """\
     # to install into.
     $set->('installprivlib', $site{installsitelib}) if defined $site{installsitelib};
     $set->('installarchlib', $site{installsitearch}) if defined $site{installsitearch};
-    # The perl command is the one this interpreter says it can be run by.
+    # The perl command is the one this interpreter says it can be run by,
+    # and perl's programs are beside it; what is installed goes to the site.
     if ($^X =~ m{\\A/}) {
         $set->('perlpath', $^X);
         $set->('startperl', "#!$^X");
+        (my $bindir = $^X) =~ s{/+[^/]*\\z}{};
+        $bindir = '/' if $bindir eq '';
+        # ($_ is the text the values are set in)
+        for my $key (qw(bin binexp scriptdir scriptdirexp)) { $set->($key, $bindir) }
+        $set->('installbin', $site{installsitebin}) if defined $site{installsitebin};
+        $set->('installscript', $site{installsitescript}) if defined $site{installsitescript};
     }
     # The signals have the numbers the program is shown, when those are
     # another system's than the build's: the names in the order of their
@@ -239,6 +285,9 @@ CONFIG_HEAVY_LIBDIR = """\
         $set->('sig_count', scalar @name);
         $set->('sig_size', scalar @names);
     }
+    # The values an embedding application gave in place of the build's,
+    # which Config.pm reports too.
+    for my $key (sort keys %Config::Override) { $set->($key, $Config::Override{$key}) }
 }
 """
 
@@ -328,6 +377,14 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
         text = replace_once(text, r"^    sitearchexp => '[^'\n]*',$",
                             f"    sitearchexp => $site{{sitearchexp}} // '{sitelib.group(1)}/' . $archname,",
                             "Config.pm: sitearchexp")
+        scriptdir = re.search(r"^    scriptdir => '([^'\n]*)',$", text, flags=re.M)
+        if scriptdir is None:
+            raise SystemExit("make-stdlib-zip: Config.pm: scriptdir was not found")
+        text = replace_once(text, r"^    scriptdir => '[^'\n]*',$",
+                            f"    scriptdir => $bindir // '{scriptdir.group(1)}',", "Config.pm: scriptdir")
+        # The overriding values come last in the hash, so that they win.
+        text = replace_once(text, r"^};\n(?![\s\S]*^};\n)", "    %Override,\n};\n",
+                            "Config.pm: the end of the tied hash")
         return text.encode("utf-8")
     if rel_path == "Errno.pm":
         return present_errno(data.decode("utf-8")).encode("utf-8")
@@ -350,8 +407,41 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
             l = re.search(rf"^{lib}='([^']*)'$", text[start:end], flags=re.M)
             if a is None or l is None or a.group(1) != l.group(1) + "/" + archname.group(1):
                 raise SystemExit(f"make-stdlib-zip: Config_heavy.pl: {arch} is not {lib}/archname")
-        return (text[:end] + CONFIG_HEAVY_LIBDIR + text[end:]).encode("utf-8")
+        text = text[:end] + CONFIG_HEAVY_LIBDIR + text[end:]
+        built = re.search(r"^    print \"  Built under (\w+)\\n\";$", text, flags=re.M)
+        if built is None:
+            raise SystemExit("make-stdlib-zip: Config_heavy.pl: the line of the system built under was not found")
+        osname = built.group(1)
+        text = replace_once(text, rf"^    die \"Perl lib was built for '{osname}' but is being run on '\$\^O'\"\n"
+                                  rf"        unless \"{osname}\" eq \$\^O;$",
+                            "    die \"Perl lib was built for '$Config{osname}' but is being run on '$^O'\"\n"
+                            "        unless $Config{osname} eq $^O;",
+                            "Config_heavy.pl: the comparison of the systems")
+        text = replace_once(text, r"^    print \"  Built under \w+\\n\";$",
+                            "    print \"  Built under $Config{osname}\\n\";", "Config_heavy.pl: built under")
+        return text.encode("utf-8")
     return data
+
+
+def programs(perl_dir: str) -> list[tuple[str, str]]:
+    """Returns perl's programs as installperl installs them: each name and
+    the file it is made of. utils.lst names a program by its path under
+    perl5, or a program and a second name for it (`path # link = path`),
+    one per line; a line that starts with # is a comment."""
+    out = []
+    with open(os.path.join(perl_dir, PROGRAMS_LIST)) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith("#") or not line.strip():
+                continue
+            m = re.match(r"(\S*)\s*#\s*link\s*=\s*(\S*)", line)
+            if m:
+                path = os.path.join(perl_dir, m.group(1))
+                out.append((os.path.basename(m.group(1)), path))
+                out.append((os.path.basename(m.group(2)), path))
+            else:
+                out.append((os.path.basename(line.strip()), os.path.join(perl_dir, line.strip())))
+    return out
 
 
 def collect(lib_dir: str) -> list[str]:
@@ -375,23 +465,34 @@ def main() -> int:
         sys.stderr.write(f"not a directory: {lib_dir}\n")
         return 1
 
-    sources = {rel: lib_dir for rel in collect(lib_dir)}
-    # The manual pages live beside lib/, in the source tree's pod/.
+    # Each archive entry and the file it is made of.
+    sources = {rel: os.path.join(lib_dir, rel) for rel in collect(lib_dir)}
+    # The manual pages and the programs live beside lib/, in the source tree.
     perl_dir = os.path.dirname(os.path.abspath(lib_dir))
-    for page in MANUAL_PAGES:
-        if not os.path.isfile(os.path.join(perl_dir, "pod", page)):
-            sys.stderr.write(f"missing manual page: {os.path.join(perl_dir, 'pod', page)}\n")
+    pod_dir = os.path.join(perl_dir, "pod")
+    for name in sorted(os.listdir(pod_dir)):
+        if name.endswith(".pod"):
+            if "pod/" + name in sources:
+                sys.stderr.write(f"lib/ has pod/{name} too\n")
+                return 1
+            sources["pod/" + name] = os.path.join(pod_dir, name)
+    for name, path in programs(perl_dir):
+        if not os.path.isfile(path):
+            sys.stderr.write(f"missing program: {path}\n")
             return 1
-        sources["pod/" + page] = perl_dir
+        if "bin/" + name in sources:
+            sys.stderr.write(f"lib/ has bin/{name} too\n")
+            return 1
+        sources["bin/" + name] = path
     rels = sorted(sources)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in rels:
             info = zipfile.ZipInfo(filename=rel, date_time=FIXED_DATE_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16  # regular file, rw-r--r--
-            with open(os.path.join(sources[rel], rel), "rb") as fh:
+            with open(sources[rel], "rb") as fh:
                 data = fh.read()
-            if sources[rel] == lib_dir:
+            if sources[rel] == os.path.join(lib_dir, rel):
                 data = relocate_config(rel, data)
             zf.writestr(info, data)
     sys.stderr.write(f"wrote {out_path}: {len(rels)} files\n")
