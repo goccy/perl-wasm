@@ -893,14 +893,16 @@ struct protoent *getprotobynumber(int number) {
 }
 
 /* ---- poll(2) ---------------------------------------------------------------
- * poll over poll_oneoff, as wasi-libc's ppoll, except that a descriptor asked
- * for neither reading nor writing is still watched for the events poll
- * reports whether asked or not: POLLNVAL (it is not open), POLLERR and
- * POLLHUP (its peer has hung up). wasi-libc refuses such a descriptor
- * (ENOSYS: it builds one subscription per POLLRDNORM and POLLWRNORM), and a
- * program that turns reading off for a while passes one: Danga::Socket's
- * poll loop asks POLLERR|POLLHUP|POLLNVAL of a client it has stopped
- * reading, got -1 for every wait and spun (Perlbal).
+ * poll over poll_oneoff, as wasi-libc's ppoll, except that a descriptor not
+ * asked for reading is still watched for the events poll reports whether
+ * asked or not: POLLNVAL (it is not open), POLLERR (nobody reads the pipe
+ * it writes to any more) and POLLHUP (its peer has hung up). wasi-libc
+ * refuses a descriptor asked for neither reading nor writing (ENOSYS: it
+ * builds one subscription per POLLRDNORM and POLLWRNORM), and a program
+ * that turns reading off for a while passes one: Danga::Socket's poll loop
+ * asks POLLERR|POLLHUP|POLLNVAL of a client it has stopped reading, got -1
+ * for every wait and spun (Perlbal). An event loop that watches the write
+ * end of a pipe for a hang-up (IO::Async) asks POLLHUP alone.
  *
  * Such a descriptor gets a subscription for reading whose readiness is not
  * reported, as it was not asked for: only its error (POLLNVAL, POLLERR) and
@@ -949,7 +951,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
                 sub.u.u.fd_write.file_descriptor = fds[i].fd;
                 subs.push_back(sub);
             }
-            if (!(asked & (POLLRDNORM | POLLWRNORM)) && !quiet[i]) {
+            if (!(asked & POLLRDNORM) && !quiet[i]) {
                 sub.userdata = poll_userdata(i, POLL_UNASKED);
                 sub.u.tag = __WASI_EVENTTYPE_FD_READ;
                 sub.u.u.fd_read.file_descriptor = fds[i].fd;
@@ -994,9 +996,9 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
             struct pollfd &p = fds[i];
             if (ev.error == __WASI_ERRNO_BADF) {
                 p.revents |= POLLNVAL;
-            } else if (ev.error == __WASI_ERRNO_PIPE) {
-                p.revents |= POLLHUP;
             } else if (ev.error != 0) {
+                /* in error: the reader of the pipe it writes to has closed
+                 * it, and a write fails at once */
                 p.revents |= POLLERR;
             } else {
                 const bool hangup = (ev.fd_readwrite.flags & __WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0;
@@ -1007,10 +1009,10 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
                 if (kind == POLL_UNASKED && !hangup) quiet[i] = true;
             }
         }
+        /* A socket whose peer has hung up is reported hung up and, when
+         * that was asked, writable (the write finds out), as on Linux. */
         int ready = 0;
         for (nfds_t i = 0; i < nfds; i++) {
-            /* POLLHUP contradicts POLLWRNORM */
-            if (fds[i].revents & POLLHUP) fds[i].revents &= ~POLLWRNORM;
             if (fds[i].revents) ready++;
         }
         if (ready > 0 || expired) return ready;
