@@ -4516,6 +4516,17 @@ static inline uint64_t goperl_two(uint64_t first, uint64_t second) {
     return first;
 }
 
+/* What an op is now, as a word: targ<<32 | private<<24 | flags<<16 | type
+ * (0 for no op). The shadow native code has of an op is described again
+ * when it says otherwise: the op may have been changed without native code
+ * being entered (the peephole optimizer rewrites ops a checker of native
+ * code was handed). */
+static inline uint64_t goperl_op_fields(const OP *o) {
+    if (!o) return 0;
+    return ((uint64_t)(uint32_t)o->op_targ << 32) | ((uint64_t)o->op_private << 24) |
+           ((uint64_t)o->op_flags << 16) | (uint64_t)o->op_type;
+}
+
 /* The IV and UV of native code and this interpreter's are the same 64 bits:
  * an integer crosses as it is, in both directions, and the flags native code
  * sees are the interpreter's own. */
@@ -5976,7 +5987,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SV_YES: return (uint64_t)(uintptr_t)&PL_sv_yes;
         case GOPERL_PL_SV_NO: return (uint64_t)(uintptr_t)&PL_sv_no;
         case GOPERL_PL_CURCOP: return (uint64_t)(uintptr_t)PL_curcop;
-        case GOPERL_PL_OP: return (uint64_t)(uintptr_t)PL_op;
+        case GOPERL_PL_OP: /* second: what the op is now */
+            return goperl_two((uint64_t)(uintptr_t)PL_op, goperl_op_fields(PL_op));
         case GOPERL_PL_PERLDB: return (uint64_t)(int64_t)PL_perldb;
         case GOPERL_PL_DBSUB: return (uint64_t)(uintptr_t)PL_DBsub;
         case GOPERL_PL_DBSINGLE: return (uint64_t)(uintptr_t)PL_DBsingle;
@@ -6330,17 +6342,15 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (b) PL_op = GOPERL_MEMARG(OP, b);
         if (t >= MAXO || !PL_op) return 0;
         OP *next = goperl_pp_original(t)(aTHX);
-        return (uint64_t)(uintptr_t)next;
+        /* second: what the next op is now, for the shadow a run loop of
+         * native code runs it by */
+        return goperl_two((uint64_t)(uintptr_t)next, goperl_op_fields(next));
     }
     case GOPERL_OP_SAVE_DESTRUCTOR: /* (a = host id) */
         save_destructor_x(goperl_dtor_thunk, (void *)(uintptr_t)a);
         return 0;
-    case GOPERL_OP_OP_FIELDS: { /* targ<<32 | private<<24 | flags<<16 | type */
-        OP *o = GOPERL_MEMARG(OP, a);
-        return ((uint64_t)(uint32_t)o->op_targ << 32) |
-               ((uint64_t)o->op_private << 24) | ((uint64_t)o->op_flags << 16) |
-               (uint64_t)o->op_type;
-    }
+    case GOPERL_OP_OP_FIELDS: /* targ<<32 | private<<24 | flags<<16 | type */
+        return goperl_op_fields(GOPERL_MEMARG(OP, a));
     case GOPERL_OP_OP_PTR: { /* b = a GOPERL_OPPTR_ selector */
         OP *o = GOPERL_MEMARG(OP, a);
         switch ((int)b) {
