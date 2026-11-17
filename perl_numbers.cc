@@ -1092,6 +1092,192 @@ const struct {
     {"IO", "IO::Seekable"},
 };
 
+/* The text of each error, by its name in C, as perl on Linux shows it in $!
+ * (glibc's), and, for the names glibc does not have, as perl on macOS does
+ * (darwin's). The C library of the interpreter words most of them
+ * otherwise ("I/O error" for EIO, "Message too large" for EMSGSIZE), and a
+ * program or its tests compare the text of $! with perl's. */
+const struct {
+    const char *name;
+    const char *text;
+} error_texts[] = {
+    {"EPERM", "Operation not permitted"},
+    {"ENOENT", "No such file or directory"},
+    {"ESRCH", "No such process"},
+    {"EINTR", "Interrupted system call"},
+    {"EIO", "Input/output error"},
+    {"ENXIO", "No such device or address"},
+    {"E2BIG", "Argument list too long"},
+    {"ENOEXEC", "Exec format error"},
+    {"EBADF", "Bad file descriptor"},
+    {"ECHILD", "No child processes"},
+    {"EAGAIN", "Resource temporarily unavailable"},
+    {"EWOULDBLOCK", "Resource temporarily unavailable"},
+    {"ENOMEM", "Cannot allocate memory"},
+    {"EACCES", "Permission denied"},
+    {"EFAULT", "Bad address"},
+    {"ENOTBLK", "Block device required"},
+    {"EBUSY", "Device or resource busy"},
+    {"EEXIST", "File exists"},
+    {"EXDEV", "Invalid cross-device link"},
+    {"ENODEV", "No such device"},
+    {"ENOTDIR", "Not a directory"},
+    {"EISDIR", "Is a directory"},
+    {"EINVAL", "Invalid argument"},
+    {"ENFILE", "Too many open files in system"},
+    {"EMFILE", "Too many open files"},
+    {"ENOTTY", "Inappropriate ioctl for device"},
+    {"ETXTBSY", "Text file busy"},
+    {"EFBIG", "File too large"},
+    {"ENOSPC", "No space left on device"},
+    {"ESPIPE", "Illegal seek"},
+    {"EROFS", "Read-only file system"},
+    {"EMLINK", "Too many links"},
+    {"EPIPE", "Broken pipe"},
+    {"EDOM", "Numerical argument out of domain"},
+    {"ERANGE", "Numerical result out of range"},
+    {"EDEADLK", "Resource deadlock avoided"},
+    {"EDEADLOCK", "Resource deadlock avoided"},
+    {"ENAMETOOLONG", "File name too long"},
+    {"ENOLCK", "No locks available"},
+    {"ENOSYS", "Function not implemented"},
+    {"ENOTEMPTY", "Directory not empty"},
+    {"ELOOP", "Too many levels of symbolic links"},
+    {"ENOMSG", "No message of desired type"},
+    {"EIDRM", "Identifier removed"},
+    {"ECHRNG", "Channel number out of range"},
+    {"EL2NSYNC", "Level 2 not synchronized"},
+    {"EL3HLT", "Level 3 halted"},
+    {"EL3RST", "Level 3 reset"},
+    {"ELNRNG", "Link number out of range"},
+    {"EUNATCH", "Protocol driver not attached"},
+    {"ENOCSI", "No CSI structure available"},
+    {"EL2HLT", "Level 2 halted"},
+    {"EBADE", "Invalid exchange"},
+    {"EBADR", "Invalid request descriptor"},
+    {"EXFULL", "Exchange full"},
+    {"ENOANO", "No anode"},
+    {"EBADRQC", "Invalid request code"},
+    {"EBADSLT", "Invalid slot"},
+    {"EBFONT", "Bad font file format"},
+    {"ENOSTR", "Device not a stream"},
+    {"ENODATA", "No data available"},
+    {"ETIME", "Timer expired"},
+    {"ENOSR", "Out of streams resources"},
+    {"ENONET", "Machine is not on the network"},
+    {"ENOPKG", "Package not installed"},
+    {"EREMOTE", "Object is remote"},
+    {"ENOLINK", "Link has been severed"},
+    {"EADV", "Advertise error"},
+    {"ESRMNT", "Srmount error"},
+    {"ECOMM", "Communication error on send"},
+    {"EPROTO", "Protocol error"},
+    {"EMULTIHOP", "Multihop attempted"},
+    {"EDOTDOT", "RFS specific error"},
+    {"EBADMSG", "Bad message"},
+    {"EOVERFLOW", "Value too large for defined data type"},
+    {"ENOTUNIQ", "Name not unique on network"},
+    {"EBADFD", "File descriptor in bad state"},
+    {"EREMCHG", "Remote address changed"},
+    {"ELIBACC", "Can not access a needed shared library"},
+    {"ELIBBAD", "Accessing a corrupted shared library"},
+    {"ELIBSCN", ".lib section in a.out corrupted"},
+    {"ELIBMAX", "Attempting to link in too many shared libraries"},
+    {"ELIBEXEC", "Cannot exec a shared library directly"},
+    {"EILSEQ", "Invalid or incomplete multibyte or wide character"},
+    {"ERESTART", "Interrupted system call should be restarted"},
+    {"ESTRPIPE", "Streams pipe error"},
+    {"EUSERS", "Too many users"},
+    {"ENOTSOCK", "Socket operation on non-socket"},
+    {"EDESTADDRREQ", "Destination address required"},
+    {"EMSGSIZE", "Message too long"},
+    {"EPROTOTYPE", "Protocol wrong type for socket"},
+    {"ENOPROTOOPT", "Protocol not available"},
+    {"EPROTONOSUPPORT", "Protocol not supported"},
+    {"ESOCKTNOSUPPORT", "Socket type not supported"},
+    {"ENOTSUP", "Operation not supported"},
+    {"EOPNOTSUPP", "Operation not supported"},
+    {"EPFNOSUPPORT", "Protocol family not supported"},
+    {"EAFNOSUPPORT", "Address family not supported by protocol"},
+    {"EADDRINUSE", "Address already in use"},
+    {"EADDRNOTAVAIL", "Cannot assign requested address"},
+    {"ENETDOWN", "Network is down"},
+    {"ENETUNREACH", "Network is unreachable"},
+    {"ENETRESET", "Network dropped connection on reset"},
+    {"ECONNABORTED", "Software caused connection abort"},
+    {"ECONNRESET", "Connection reset by peer"},
+    {"ENOBUFS", "No buffer space available"},
+    {"EISCONN", "Transport endpoint is already connected"},
+    {"ENOTCONN", "Transport endpoint is not connected"},
+    {"ESHUTDOWN", "Cannot send after transport endpoint shutdown"},
+    {"ETOOMANYREFS", "Too many references: cannot splice"},
+    {"ETIMEDOUT", "Connection timed out"},
+    {"ECONNREFUSED", "Connection refused"},
+    {"EHOSTDOWN", "Host is down"},
+    {"EHOSTUNREACH", "No route to host"},
+    {"EALREADY", "Operation already in progress"},
+    {"EINPROGRESS", "Operation now in progress"},
+    {"ESTALE", "Stale file handle"},
+    {"EUCLEAN", "Structure needs cleaning"},
+    {"ENOTNAM", "Not a XENIX named type file"},
+    {"ENAVAIL", "No XENIX semaphores available"},
+    {"EISNAM", "Is a named type file"},
+    {"EREMOTEIO", "Remote I/O error"},
+    {"EDQUOT", "Disk quota exceeded"},
+    {"ENOMEDIUM", "No medium found"},
+    {"EMEDIUMTYPE", "Wrong medium type"},
+    {"ECANCELED", "Operation canceled"},
+    {"ENOKEY", "Required key not available"},
+    {"EKEYEXPIRED", "Key has expired"},
+    {"EKEYREVOKED", "Key has been revoked"},
+    {"EKEYREJECTED", "Key was rejected by service"},
+    {"EOWNERDEAD", "Owner died"},
+    {"ENOTRECOVERABLE", "State not recoverable"},
+    {"ERFKILL", "Operation not possible due to RF-kill"},
+    {"EHWPOISON", "Memory page has hardware error"},
+    /* names glibc does not have: darwin's texts */
+    {"EAUTH", "Authentication error"},
+    {"EBADARCH", "Bad CPU type in executable"},
+    {"EBADEXEC", "Bad executable (or shared library)"},
+    {"EBADMACHO", "Malformed Mach-o file"},
+    {"EBADRPC", "RPC struct is bad"},
+    {"EDEVERR", "Device error"},
+    {"EFTYPE", "Inappropriate file type or format"},
+    {"ELAST", "Capabilities insufficient"},
+    {"ENEEDAUTH", "Need authenticator"},
+    {"ENOATTR", "Attribute not found"},
+    {"ENOPOLICY", "Policy not found"},
+    {"ENOTCAPABLE", "Capabilities insufficient"},
+    {"EPROCLIM", "Too many processes"},
+    {"EPROCUNAVAIL", "Bad procedure for program"},
+    {"EPROGMISMATCH", "Program version wrong"},
+    {"EPROGUNAVAIL", "RPC prog. not avail"},
+    {"EPWROFF", "Device power is off"},
+    {"EQFULL", "Interface output queue is full"},
+    {"ERPCMISMATCH", "RPC version wrong"},
+    {"ESHLIBVERS", "Shared library version mismatch"},
+};
+
+const char *error_text(const char *name) {
+    for (const auto &e : error_texts)
+        if (strcmp(e.name, name) == 0) return e.text;
+    return NULL;
+}
+
+/* The name in C of an error number of this C library, or NULL. */
+const char *guest_error_name(int number) {
+    for (const GuestNumber &g : guest_numbers)
+        if (g.family == FAMILY_errno && g.value == number) return g.name;
+    return NULL;
+}
+
+/* The name in C of an error number of the host's, or NULL. */
+const char *host_error_name(long long number) {
+    for (const auto &h : family(FAMILY_errno).host)
+        if (h.second == number) return h.first.c_str();
+    return NULL;
+}
+
 } /* namespace */
 
 extern "C" {
@@ -1119,14 +1305,28 @@ int guest_errno_of(long long host_errno) {
     return (int)enum_to_guest(FAMILY_errno, host_errno);
 }
 
-/* strerror as the interpreter calls it. The C library's own gives the text
- * of "no error" for a number that is none of its errors; such a number is
- * one the program assigned ($! = 9999), or an error of the host's that
- * this C library has no name for, and says so here, with the number the
- * program sees. (--wrap=strerror in wasmify.json.) */
+/* strerror as the interpreter calls it: the text of an error is glibc's
+ * for its name (error_texts). An error of the host's that this C library
+ * has no number for has the text of the host's name for it: one a system
+ * call failed with (marked HOST_ONLY_ERRNO), or one the program assigned to
+ * $! by the host's number; a program that is not shown the host's numbers
+ * sees the former as EIO. A number that is no error at all is one the
+ * program assigned ($! = 9999); the C library's own gives the text of "no
+ * error" for it, and it is "Unknown error" here, with the number the
+ * program sees, as glibc says. (--wrap=strerror in wasmify.json.) */
 char *__wrap_strerror(int number) {
-    if (number == 0 || is_guest_number(FAMILY_errno, number)) return __real_strerror(number);
-    if (is_host_only_errno(number) && !active()) return __real_strerror(EIO);
+    if (number == 0) return __real_strerror(number);
+    const char *name = NULL;
+    if (is_host_only_errno(number)) {
+        if (active()) name = host_error_name(number - HOST_ONLY_ERRNO);
+        else number = EIO;
+    }
+    if (!name) name = guest_error_name(number);
+    if (!name && active()) name = host_error_name(host_errno_of(number));
+    if (name) {
+        if (const char *text = error_text(name)) return (char *)text;
+        if (is_guest_number(FAMILY_errno, number)) return __real_strerror(number);
+    }
     static char text[40];
     snprintf(text, sizeof(text), "Unknown error %d", host_errno_of(number));
     return text;
