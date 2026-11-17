@@ -46,6 +46,14 @@ __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_group_
 int wasi_host_proc_group_by_name(const char *name, int name_len, void *buf, int buf_len,
                                  uint32_t *needed);
 
+/* The index-th entry of the host's user database (getpwent) and of its
+ * group database (getgrent), as the lookups above hand one back; -ENOENT
+ * past the last. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_user_at")))
+int wasi_host_proc_user_at(int index, void *buf, int len, uint32_t *needed);
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_group_at")))
+int wasi_host_proc_group_at(int index, void *buf, int len, uint32_t *needed);
+
 /* The setuid and setgid families, for a process that is the host process:
  * request names the call (the SET_ constants below), a, b and c are its
  * arguments. -ENOSYS when the process has no ids of the host's to change. */
@@ -279,15 +287,32 @@ struct group *getgrnam(const char *name) {
     }));
 }
 
-/* Walking the databases: the host looks entries up by id and by name but
- * has no way to enumerate them, so the walk is empty — getpwent and
- * getgrent report the end at once. */
-void setpwent(void) {}
-void endpwent(void) {}
-struct passwd *getpwent(void) { return NULL; }
-void setgrent(void) {}
-void endgrent(void) {}
-struct group *getgrent(void) { return NULL; }
+/* Walking the databases: the entries of the host's, one after the other,
+ * from the first again after setpwent, setgrent or the end of the walk. A
+ * process that is not the host process has none. */
+static int g_user_walk = 0;
+static int g_group_walk = 0;
+
+void setpwent(void) { g_user_walk = 0; }
+void endpwent(void) { g_user_walk = 0; }
+struct passwd *getpwent(void) {
+    const int index = g_user_walk++;
+    struct passwd *pw = decode_user(fetch(g_user_rec, [index](void *buf, int len, uint32_t *needed) {
+        return wasi_host_proc_user_at(index, buf, len, needed);
+    }));
+    if (!pw) g_user_walk = 0;
+    return pw;
+}
+void setgrent(void) { g_group_walk = 0; }
+void endgrent(void) { g_group_walk = 0; }
+struct group *getgrent(void) {
+    const int index = g_group_walk++;
+    struct group *gr = decode_group(fetch(g_group_rec, [index](void *buf, int len, uint32_t *needed) {
+        return wasi_host_proc_group_at(index, buf, len, needed);
+    }));
+    if (!gr) g_group_walk = 0;
+    return gr;
+}
 
 /* The login name is that of the user the process runs as. */
 char *getlogin(void) {
