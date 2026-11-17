@@ -406,6 +406,27 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
             dup2(wasi_fork_point.child_end, wasi_fork_point.stdio_fd);
             close(wasi_fork_point.child_end);
             close(wasi_fork_point.parent_end);
+            /* A standard handle that is opened anew keeps its file while
+             * it is: do_open6 takes the file out of the handle, and gives
+             * it back when the open fails, as it does in the child (open
+             * returns 0 there). The child does not return through
+             * do_open6, so it gives the handle its file back here: the
+             * child of open(STDERR, "|-") writes to its STDERR. The handle
+             * is pp_open's first argument. */
+            SV *const target = PL_stack_base[wasi_fork_point.return_sp + 1];
+            if (target && isGV_with_GP(target) && GvIOp((GV *)target) && !IoIFP(GvIOp((GV *)target))) {
+                IO *const io = GvIOp((GV *)target);
+                if ((GV *)target == PL_stdingv) {
+                    IoIFP(io) = PerlIO_stdin();
+                    IoTYPE(io) = IoTYPE_RDONLY;
+                } else if ((GV *)target == PL_stderrgv) {
+                    IoIFP(io) = IoOFP(io) = PerlIO_stderr();
+                    IoTYPE(io) = IoTYPE_WRONLY;
+                } else if ((GV *)target == gv_fetchpvs("STDOUT", GV_NOTQUAL, SVt_PVIO)) {
+                    IoIFP(io) = IoOFP(io) = PerlIO_stdout();
+                    IoTYPE(io) = IoTYPE_WRONLY;
+                }
+            }
             SP = PL_stack_base + wasi_fork_point.return_sp;
             XPUSHs(&PL_sv_zero);
         } else {
