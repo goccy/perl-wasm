@@ -5459,7 +5459,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SV **slot = av_fetch((AV *)(uintptr_t)a, (SSize_t)(int64_t)b, TRUE);
         return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
-    case GOPERL_OP_HV_FETCH_ENT: { /* (b = keysv, c = lval) -> HE token */
+    case GOPERL_OP_HV_FETCH_ENT: { /* (b = keysv, c: bit 0 lval, bit 1 an
+                 * entry made by the fetch has no value, HV_FETCH_EMPTY_HE)
+                 * -> HE token */
+        if (c & 2)
+            return (uint64_t)(uintptr_t)hv_common((HV *)(uintptr_t)a, (SV *)(uintptr_t)b, NULL, 0, 0,
+                                                  HV_FETCH_LVALUE | HV_FETCH_EMPTY_HE, NULL, 0);
         HE *he = hv_fetch_ent((HV *)(uintptr_t)a, (SV *)(uintptr_t)b, c ? TRUE : FALSE, 0U);
         return (uint64_t)(uintptr_t)he;
     }
