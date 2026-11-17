@@ -2964,7 +2964,16 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
                                              &id, sizeof(id));
         if (rc != GOPERL_CALLBACK_JUMPED) {
             uint32_t resp_len;
-            free(goperl_callback_response(rc, &resp_len));
+            unsigned char *resp = goperl_callback_response(rc, &resp_len);
+            /* a svt_free of native code died ([0]+message): the free dies
+             * with it, as perl's mg_free lets a die out */
+            if (resp != nullptr && resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
+                SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
+                free(resp);
+                mg->mg_ptr = NULL;
+                croak_sv(msg);
+            }
+            free(resp);
         }
     }
     mg->mg_ptr = NULL; /* not a real pointer; never let core touch it */
