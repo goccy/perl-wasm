@@ -1014,6 +1014,40 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"op numbers outside the memory refused in {path}")
 PYPATCH
+# ---- Encode: a table that is no address of this memory dies -------------------
+# An Encode::XS object holds the address of its encode_t table. A native
+# module made by enc2xs (Encode::EUCJPASCII, Encode::HanExtra) defines its
+# encodings with tables of its own, in the host process: an address outside
+# this memory, and reading it traps. Encode dies saying so instead.
+# Idempotent.
+python3 - <<'PYPATCH'
+path = "cpan/Encode/Encode.xs"
+t = open(path).read()
+if "goperl_encode_table" in t:
+    print(f"tables outside the memory already refused in {path}")
+else:
+    old = 'INT2PTR(encode_t *, SvIV(SvRV(obj)))'
+    n = t.count(old)
+    assert n >= 5, (path, n)
+    t = t.replace(old, 'goperl_encode_table(aTHX_ obj)')
+    anchor = '\nstatic void\nEncode_XSEncoding(pTHX_ encode_t * enc)\n'
+    assert t.count(anchor) == 1, path
+    t = t.replace(anchor,
+        '\n/* The table of an Encode::XS object: one of this memory (perl-wasm\n'
+        ' * scripts/wasi-configure.sh). */\n'
+        'static encode_t *\n'
+        'goperl_encode_table(pTHX_ SV *obj)\n'
+        '{\n'
+        '    const UV addr = (UV)SvIV(SvRV(obj));\n'
+        '    if (addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
+        '        Perl_croak(aTHX_ "go-perl gives native code no access to this interpreter "\n'
+        '                         "internal: an Encode::XS table of native code (0x%" UVxf ")",\n'
+        '                   addr);\n'
+        '    return INT2PTR(encode_t *, addr);\n'
+        '}\n' + anchor)
+    open(path, "w").write(t)
+    print(f"tables outside the memory refused in {path} ({n} places)")
+PYPATCH
 # ---- $! and the status of a die are numbers the program sees ------------------
 # errno holds the error numbers of this C library. A program that is the
 # host process is shown the host's numbers (perl_numbers.cc), so the three
