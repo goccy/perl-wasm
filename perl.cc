@@ -604,6 +604,29 @@ static uint64_t goperl_call_results(pTHX_ I32 count) {
     return GOPERL_ADDR(results.data());
 }
 
+/* The op native code has as PL_op (the SDK's goperl_plop_want: 4 | its
+ * want bits, or 0 while native code has not looked at PL_op). What the
+ * interpreter does that reads the context of PL_op reads that op's want
+ * bits: this is PL_op meanwhile with them, as native code has it
+ * (Algorithm::Heapify::XS makes a copy of PL_op with OPf_WANT_SCALAR PL_op
+ * around the overloading it calls). */
+struct goperl_native_plop {
+    OP op;
+    bool set;
+};
+static void goperl_native_plop_enter(pTHX_ goperl_native_plop *p, uint64_t want) {
+    p->set = want != 0 && PL_op;
+    if (!p->set) return;
+    Copy(PL_op, &p->op, 1, OP);
+    p->op.op_flags = (U8)((p->op.op_flags & ~OPf_WANT) | (want & OPf_WANT));
+    ENTER;
+    SAVEOP();
+    PL_op = &p->op;
+}
+static void goperl_native_plop_leave(pTHX_ goperl_native_plop *p) {
+    if (p->set) LEAVE;
+}
+
 /* What perl's croak does before it unwinds: the exception, with the place
  * of the statement added to a message, goes to $SIG{__DIE__} (PL_diehook)
  * while the native code that croaks is still running, inside the scopes it
@@ -6723,12 +6746,17 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (SvSMAGICAL(sv)) mg_set(sv);
         return 0;
     }
-    case GOPERL_OP_GIMME_V: /* the context the running XSUB was called in:
+    case GOPERL_OP_GIMME_V: { /* the context the running XSUB was called in:
                  * the want bits of the calling op, and only without them
                  * the context of the enclosing sub (an XSUB pushes no
                  * context of its own, so block_gimme alone answers for the
-                 * caller's caller) */
-        return (uint64_t)(int64_t)GIMME_V;
+                 * caller's caller). a: the op native code has as PL_op. */
+        goperl_native_plop plop;
+        goperl_native_plop_enter(aTHX_ &plop, a & 7);
+        const U8 gimme = GIMME_V;
+        goperl_native_plop_leave(aTHX_ &plop);
+        return (uint64_t)gimme;
+    }
     case GOPERL_OP_CKWARN: /* a = warning category; b = ckWARN_d variant */
         return (b ? ckWARN_d((U32)a) : ckWARN((U32)a)) ? 1 : 0;
     case GOPERL_OP_SV_LEN_BUF: /* SvLEN: the ALLOCATED buffer size */
@@ -7800,8 +7828,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case GOPERL_SVCALL_MAGIC_IS_VALUE:
             return PERL_MAGIC_TYPE_IS_VALUE_MAGIC((uint32_t)a) ? 1 : 0;
-        case GOPERL_SVCALL_AMAGIC:
-            return (uint64_t)(uintptr_t)amagic_call(sv, GOPERL_SVARG(b), (int)(hi & 0xff), (int)(hi >> 8));
+        case GOPERL_SVCALL_AMAGIC: { /* hi >> 24: the op native code has as
+                * PL_op, whose context amagic_call takes */
+            goperl_native_plop plop;
+            goperl_native_plop_enter(aTHX_ &plop, (hi >> 24) & 7);
+            SV *const res = amagic_call(sv, GOPERL_SVARG(b), (int)(hi & 0xff), (int)((hi >> 8) & 0xffff));
+            goperl_native_plop_leave(aTHX_ &plop);
+            return (uint64_t)(uintptr_t)res;
+        }
         case GOPERL_SVCALL_CLEAR_UNDEF: /* SvOK_off with its body release */
             SvOK_off(sv);
             return 0;
