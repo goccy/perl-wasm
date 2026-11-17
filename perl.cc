@@ -3930,14 +3930,17 @@ enum {
  * an SV that is no string. */
 #define GOPERL_PV_HOST ((char *)(uintptr_t)1)
 
-/* A scalar whose buffer slot holds GOPERL_PV_HOST cannot be a string: its
- * bytes are in the memory of native code's process, which the interpreter
- * has no access to, and it would read and write its own memory at that
- * address instead (File::Map maps a file and makes the mapping the string
- * of a scalar). The flags that make it one are refused, before they
- * change, with an error that says so. */
-static bool goperl_pv_host_string(pTHX_ SV *sv, U32 flags, char *pv) {
-    if (!(flags & (SVf_POK | SVp_POK))) return false;
+/* A scalar whose buffer slot holds GOPERL_PV_HOST cannot be a string of
+ * any length: its bytes are in the memory of native code's process, which
+ * the interpreter has no access to, and it would read and write its own
+ * memory at that address instead (File::Map maps a file and makes the
+ * mapping the string of a scalar). The flags, the buffer or the length
+ * that would make it one are refused, before they change, with an error
+ * that says so. An empty string is no such string: no byte of it is read
+ * (Object::Pad keeps a structure behind an SV that is an empty string, and
+ * so does File::Map with the mapping of an empty file). */
+static bool goperl_pv_host_string(pTHX_ SV *sv, U32 flags, char *pv, STRLEN cur) {
+    if (!(flags & (SVf_POK | SVp_POK)) || !cur) return false;
     if (SvTYPE(sv) < SVt_PV || SvTYPE(sv) == SVt_PVAV || SvTYPE(sv) == SVt_PVHV ||
         SvTYPE(sv) == SVt_PVCV || SvTYPE(sv) == SVt_PVFM || SvTYPE(sv) == SVt_PVIO)
         return false;
@@ -5377,9 +5380,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (SvNOKp(sv)) f |= 262144;            /* GOPERL_INFO_NOKp */
         return f;
     }
-    case GOPERL_OP_SV_CUR_SET:
-        SvCUR_set((SV *)(uintptr_t)a, (STRLEN)b);
+    case GOPERL_OP_SV_CUR_SET: {
+        SV *sv = (SV *)(uintptr_t)a;
+        if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SvFLAGS(sv), SvPVX(sv), (STRLEN)b))
+            goperl_pv_host_refuse(aTHX);
+        SvCUR_set(sv, (STRLEN)b);
         return 0;
+    }
     case GOPERL_OP_SV_GROW: { /* -> new PVX (linear-memory offset) */
         char *p = SvGROW((SV *)(uintptr_t)a, (STRLEN)b);
         return GOPERL_ADDR(p);
@@ -5843,7 +5850,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     case GOPERL_OP_SV_POK_ON: {
         SV *sv = (SV *)(uintptr_t)a;
-        if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SVf_POK, SvPVX(sv)))
+        if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SVf_POK, SvPVX(sv), SvCUR(sv)))
             goperl_pv_host_refuse(aTHX);
         SvPOK_on(sv);
         return 0;
@@ -6876,7 +6883,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SV *sv = (SV *)(uintptr_t)a;
         U32 clear = (U32)(b >> 32), set = (U32)b;
         if ((set & (SVf_POK | SVp_POK)) && SvTYPE(sv) >= SVt_PV &&
-            goperl_pv_host_string(aTHX_ sv, (SvFLAGS(sv) & ~clear) | set, SvPVX(sv)))
+            goperl_pv_host_string(aTHX_ sv, (SvFLAGS(sv) & ~clear) | set, SvPVX(sv), SvCUR(sv)))
             goperl_pv_host_refuse(aTHX);
         if (clear || set) SvFLAGS(sv) = (SvFLAGS(sv) & ~clear) | set;
         return (uint64_t)SvFLAGS(sv);
@@ -6907,7 +6914,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         }
         case GOPERL_SVSLOT_PV:
-            if (goperl_pv_host_string(aTHX_ sv, SvFLAGS(sv), (char *)(uintptr_t)b))
+            if (goperl_pv_host_string(aTHX_ sv, SvFLAGS(sv), (char *)(uintptr_t)b, SvCUR(sv)))
                 goperl_pv_host_refuse(aTHX);
             SvPV_set(sv, (char *)(uintptr_t)b);
             return 0;
