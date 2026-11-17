@@ -588,6 +588,22 @@ static void goperl_die_if_thrown(pTHX_ unsigned char *resp) {
     croak_sv(sv_2mortal(thrown));
 }
 
+/* The count results of a call on top of the stack, taken off it, as words
+ * native code reads (CALL_SV, CALL_METHOD, EVAL_SV): -> their address, 0
+ * for none. One buffer serves every call: native code reads the words as
+ * soon as the operation returns, and a call nested in the callee is done
+ * with its own by then. No reference is taken on the results, as perl's
+ * call_sv takes none (see CALL_SV). */
+static uint64_t goperl_call_results(pTHX_ I32 count) {
+    static std::vector<goperl_gword_t> results;
+    dSP;
+    if (count <= 0) return 0;
+    results.resize((size_t)count);
+    for (I32 i = count - 1; i >= 0; i--) results[(size_t)i] = GOPERL_ADDR(POPs);
+    PUTBACK;
+    return GOPERL_ADDR(results.data());
+}
+
 /* A callback of native code that did not ask for G_EVAL (CALL_SV and
  * CALL_METHOD below). Its die cannot unwind the host's C frames, so the
  * call is made inside an eval scope all the same; but a call with G_EVAL
@@ -6062,16 +6078,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
          * values that are gone by now (Future::XS's callbacks end with a
          * bare return, after the scope of the call freed what they had
          * pushed), and perl leaves them alone; taking a reference on one
-         * and dropping it with the array freed it a second time. */
-        AV *res = newAV();
-        AvREAL_off(res);
-        av_extend(res, count > 0 ? count - 1 : 0);
-        for (I32 i = count - 1; i >= 0; i--)
-            av_store(res, i, POPs);
-        PUTBACK;
-        sv_2mortal((SV *)res);
-        /* -> the mortal array of the results; second: died<<63 | count */
-        return goperl_two(GOPERL_ADDR(res), (died << 63) | (uint32_t)count);
+         * and dropping it with the array freed it a second time.
+         *
+         * They go over as words (goperl_call_results), not in an array of
+         * the interpreter's: call_sv leaves no temporary of its own behind,
+         * and a mortal array was one more for every call made in one scope
+         * (HAMT's each, which calls back for each element). */
+        const uint64_t words = goperl_call_results(aTHX_ count);
+        /* -> the address of the results, a word each; second: died<<63 |
+         * count */
+        return goperl_two(words, (died << 63) | (uint32_t)count);
     }
     case GOPERL_OP_ERRSV:
         return (uint64_t)(uintptr_t)ERRSV;
@@ -6887,22 +6903,15 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         SvPOK_only(GOPERL_SVARG(a));
         return 0;
     case GOPERL_OP_EVAL_SV: { /* a = sv, c = flags; results like CALL_SV:
-                 * the mortal array; second: died<<63 | count */
+                 * their words; second: died<<63 | count */
         I32 flags = (I32)(int64_t)c;
-        dSP;
         I32 count = eval_sv(GOPERL_SVARG(a), flags);
-        SPAGAIN;
-        AV *res = newAV();
-        av_extend(res, count > 0 ? count - 1 : 0);
-        for (I32 i = count - 1; i >= 0; i--)
-            av_store(res, i, SvREFCNT_inc(POPs));
-        PUTBACK;
-        sv_2mortal((SV *)res);
+        const uint64_t words = goperl_call_results(aTHX_ count);
         /* eval_sv traps a die in $@ and with G_RETHROW throws it again
          * itself; the truth of $@ is not asked here, which would run the
          * bool overloading of an exception object. */
         const uint64_t died = 0;
-        return goperl_two(GOPERL_ADDR(res), (died << 63) | (uint32_t)count);
+        return goperl_two(words, (died << 63) | (uint32_t)count);
     }
     case GOPERL_OP_AV_SHIFT:
         return (uint64_t)(uintptr_t)av_shift(GOPERL_AVARG(a));
