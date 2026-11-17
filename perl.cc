@@ -7797,9 +7797,19 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVCALL_HV_TOTALKEYS: return (uint64_t)HvTOTALKEYS((HV *)sv);
         case GOPERL_SVCALL_HV_FILL: return (uint64_t)HvFILL((HV *)sv);
         case GOPERL_SVCALL_HV_MAX: return (uint64_t)HvMAX((HV *)sv);
-        case GOPERL_SVCALL_AV_MAX: return (uint64_t)(int64_t)AvMAX((AV *)sv);
+        case GOPERL_SVCALL_AV_MAX: /* of what is no array: no slot */
+            return (uint64_t)(int64_t)(SvTYPE(sv) == SVt_PVAV ? AvMAX((AV *)sv) : -1);
         case GOPERL_SVCALL_AV_BODY: {
-            if (SvTYPE(sv) != SVt_PVAV) return goperl_two(0, 0);
+            if (SvTYPE(sv) != SVt_PVAV) {
+                /* perl's AvARRAY reads the body slot of any SV, which of a
+                 * reference is the referent: its first word is what code
+                 * that takes AvARRAY of a reference for that of the array
+                 * reads (Array::Heap tests AvARRAY(ref)[0] before it takes
+                 * the array's first element), the referent's body, which
+                 * an array always has. That word goes over as one slot. */
+                if (SvROK(sv)) return goperl_two(GOPERL_ADDR(SvRV(sv)), 1);
+                return goperl_two(0, 0);
+            }
             AV *const av = (AV *)sv;
             const SSize_t n = AvFILLp(av) + 1;
             return goperl_two(GOPERL_ADDR(AvARRAY(av)), (uint64_t)(n > 0 ? n : 0));
