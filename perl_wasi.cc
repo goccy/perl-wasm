@@ -264,10 +264,24 @@ extern "C" int kill(pid_t pid, int sig) {
         errno = EINVAL;
         return -1;
     }
-    /* A signal to the process itself is delivered here and now
-     * (perl_signal.cc); any other process, and a process group (a pid of 0
+    /* A signal to the process itself is the host's to deliver when the
+     * process is one the host knows by that pid: the host process, whose
+     * action for the signal may be native code's handler and not the
+     * interpreter's, or a fork child. It is delivered by the time kill
+     * returns either way. Otherwise (no host process has the pid: the
+     * program is a process of its own) it is delivered here and now
+     * (perl_signal.cc). Any other process, and a process group (a pid of 0
      * or less), is the host's to find. */
-    if (pid > 0 && pid == getpid()) return raise(sig);
+    if (pid > 0 && pid == getpid()) {
+        if (sig == 0) return 0;
+        const int rc = wasi_host_proc_kill((int)pid, sig);
+        if (rc == 0) return 0;
+        if (rc != -ESRCH && rc != ESRCH) {
+            errno = rc < 0 ? -rc : rc;
+            return -1;
+        }
+        return raise(sig);
+    }
     int rc = wasi_host_proc_kill((int)pid, sig);
     if (rc != 0) {
         errno = rc < 0 ? -rc : rc;
