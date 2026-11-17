@@ -5706,9 +5706,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         for (size_t i = 0; i < n; i++) {
             goperl_gword_t tok;
             memcpy(&tok, args + i * 8, 8);
-            SV *const arg = GOPERL_SVARG(tok);
-            if (!arg) goperl_arg_refuse(aTHX_ op, tok, "an argument");
-            PUSHs(arg);
+            /* a null one too, as perl pushes it: the sub called finds that
+             * element of @_ missing (BEGIN::Lift calls with the null of a
+             * block it could not make) */
+            PUSHs(GOPERL_SVARG(tok));
         }
         PUTBACK;
         /* Context flags (G_SCALAR/G_LIST/G_VOID, G_DISCARD, ...) pass through
