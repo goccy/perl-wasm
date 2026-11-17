@@ -2966,11 +2966,13 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
             uint32_t resp_len;
             unsigned char *resp = goperl_callback_response(rc, &resp_len);
             /* a svt_free of native code died ([0]+message): the free dies
-             * with it, as perl's mg_free lets a die out */
+             * with it, as perl's mg_free lets a die out. The MAGIC is not
+             * touched: the hook may have had the value freed once more
+             * before it died (Variable::Magic's free does, for the rest of
+             * the chain), and that inner free has freed this MAGIC too. */
             if (resp != nullptr && resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
                 SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
                 free(resp);
-                mg->mg_ptr = NULL;
                 croak_sv(msg);
             }
             free(resp);
