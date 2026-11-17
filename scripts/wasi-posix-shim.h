@@ -156,6 +156,29 @@ struct sockaddr_un {
 #define SO_ACCEPTCONN 30
 #endif
 
+/* More names programs import from Socket and POSIX at compile time, which
+ * wasi-libc's headers leave out, with Linux's numbers: the socket options
+ * that bind a socket to a device and attach a packet filter (Linux::Event,
+ * Linux::PacketFilter), the control message that passes descriptors over
+ * a Unix-domain socket (SCM_RIGHTS), and the range of the real-time
+ * signals (POSIX::SIGRTMIN, SIGRTMAX). A program that sets one of the
+ * options the host socket layer does not carry gets ENOPROTOOPT there. */
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
+#endif
+#ifndef SO_ATTACH_FILTER
+#define SO_ATTACH_FILTER 26
+#endif
+#ifndef SCM_RIGHTS
+#define SCM_RIGHTS 1
+#endif
+#ifndef SIGRTMIN
+#define SIGRTMIN 34
+#endif
+#ifndef SIGRTMAX
+#define SIGRTMAX 64
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
