@@ -4988,6 +4988,15 @@ static void goperl_arg_refuse(pTHX_ int32_t op, uint64_t v, const char *what) {
                v, what, goperl_op_name(op), (int)op);
 }
 
+/* A scalar of the interpreter's that was freed already: native code kept
+ * it past its last reference. */
+static void goperl_arg_refuse_freed(pTHX_ int32_t op, uint64_t v) __attribute__((noreturn));
+static void goperl_arg_refuse_freed(pTHX_ int32_t op, uint64_t v) {
+    Perl_croak(aTHX_ "native code handed the interpreter 0x%" PRIx64 " as a scalar in the "
+                     "operation %s (%d), and that scalar was freed already",
+               v, goperl_op_name(op), (int)op);
+}
+
 /* The scalar a number native code handed an operation is, NULL for 0. A
  * freed scalar is refused unless the operation reads its head alone
  * (freed): a freed scalar has no flags left, and perl reads it as undef
@@ -4995,8 +5004,9 @@ static void goperl_arg_refuse(pTHX_ int32_t op, uint64_t v, const char *what) {
  * it frees, and asks SvROK and SvPOK of it). */
 static inline SV *goperl_sv_arg(pTHX_ uint64_t v, int32_t op, bool freed = false) {
     SV *const sv = (SV *)(uintptr_t)v;
-    if (v && (!goperl_sv_head(aTHX_ sv) || (!freed && SvTYPE(sv) == (svtype)SVTYPEMASK)))
-        goperl_arg_refuse(aTHX_ op, v, "a scalar");
+    if (!v) return sv;
+    if (!goperl_sv_head(aTHX_ sv)) goperl_arg_refuse(aTHX_ op, v, "a scalar");
+    if (!freed && SvTYPE(sv) == (svtype)SVTYPEMASK) goperl_arg_refuse_freed(aTHX_ op, v);
     return sv;
 }
 
