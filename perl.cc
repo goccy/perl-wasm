@@ -3712,6 +3712,9 @@ enum {
     GOPERL_CALL_SV_PEEK = 23,   /* a = the SV -> the address of sv_peek's text */
     GOPERL_CALL_SV_RECODE = 24, /* a = the SV, b = the encoding -> the address of
                                  * the string after, or 0 */
+    GOPERL_CALL_MG_LIST = 26,   /* a = the SV -> the address of [number] and,
+                                 * per MAGIC of the interpreter's own, in the
+                                 * chain's order, the six words of MG_FIND */
     GOPERL_CALL_CASEMAP = 25,   /* a = which (0 upper, 1 lower, 2 title, 3 fold),
                                  * b = a code point -> the address of [the first
                                  * code point of the result][its length in
@@ -7728,6 +7731,23 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             }
             return 0;
         }
+        case GOPERL_CALL_MG_LIST: { /* every MAGIC of the interpreter's own on
+                 * the SV, as MG_FIND has one */
+            static std::vector<goperl_gword_t> w;
+            w.assign(1, 0);
+            if (SvTYPE(sv) < SVt_PVMG) return (uint64_t)(uintptr_t)w.data();
+            for (MAGIC *mg = SvMAGIC(sv); mg; mg = mg->mg_moremagic) {
+                if (goperl_is_anchor(mg)) continue;
+                w.push_back((goperl_gword_t)(unsigned char)mg->mg_type);
+                w.push_back(mg->mg_flags);
+                w.push_back((goperl_gword_t)(int64_t)mg->mg_len);
+                w.push_back(GOPERL_ADDR(mg->mg_obj));
+                w.push_back(GOPERL_ADDR(mg->mg_ptr));
+                w.push_back(mg->mg_private);
+                w[0]++;
+            }
+            return (uint64_t)(uintptr_t)w.data();
+        }
         case GOPERL_CALL_CASEMAP: {
             static struct {
                 goperl_gword_t first;
@@ -8184,7 +8204,24 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_internal_op(aTHX_ (int)(uint32_t)c, a, b, c, s);
     case GOPERL_OP_SV_MAGIC_STD: { /* real sv_magic: BEHAVIORAL core magic
                  * (ties and friends) must live guest-side to take effect
-                 * (b = obj token, c = how, s+len = name or empty) */
+                 * (b = obj token, c = how, s+len = name or empty; with c's
+                 * high half 1, s is a UTF-8 cache of positions, which the
+                 * magic owns a copy of: mg_len -1; with 2, s is the 8 bytes
+                 * of the name SV: HEf_SVKEY) */
+        if ((c >> 32) == 2) {
+            uint64_t name = 0;
+            if (s) memcpy(&name, s, sizeof name);
+            sv_magic((SV *)(uintptr_t)a, (SV *)(uintptr_t)b, (int)(uint32_t)c,
+                     (const char *)(uintptr_t)name, HEf_SVKEY);
+            return 0;
+        }
+        if ((c >> 32) == 1) {
+            STRLEN *cache;
+            Newxz(cache, PERL_MAGIC_UTF8_CACHESIZE * 2, STRLEN);
+            if (s) memcpy(cache, s, PERL_MAGIC_UTF8_CACHESIZE * 2 * sizeof(STRLEN));
+            sv_magic((SV *)(uintptr_t)a, (SV *)(uintptr_t)b, (int)(uint32_t)c, (const char *)cache, -1);
+            return 0;
+        }
         sv_magic((SV *)(uintptr_t)a, (SV *)(uintptr_t)b, (int)(int64_t)c, s && *s ? s : NULL,
                  s ? (I32)strlen(s) : 0);
         return 0;
