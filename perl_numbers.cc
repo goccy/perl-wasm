@@ -1308,6 +1308,14 @@ int guest_errno_of(long long host_errno) {
     return (int)enum_to_guest(FAMILY_errno, host_errno);
 }
 
+/* The flags of open(2) as the program sees them, for flags this C library
+ * makes up for the program (dbmopen's, which TIEHASH takes in the
+ * program's numbers). */
+UV wasi_program_open_flags(UV flags) {
+    if (!active()) return flags;
+    return (UV)to_host(FAMILY_open, (long long)flags);
+}
+
 /* strerror as the interpreter calls it: the text of an error is glibc's
  * for its name (error_texts). An error of the host's that this C library
  * has no number for has the text of the host's name for it: one a system
