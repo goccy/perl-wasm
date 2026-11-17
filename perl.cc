@@ -5700,11 +5700,20 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_SV_RVWEAKEN:
         sv_rvweaken(GOPERL_SVARG(a));
         return 0;
-    case GOPERL_OP_SV_2CV: {
+    case GOPERL_OP_SV_2CV: { /* b = lref; c = 1: -> the address of [the cv]
+                 * [the glob][the stash], what sv_2cv answers in its
+                 * out-parameters too (a glob of a sub that is not defined
+                 * gives no cv and the glob: Devel::NYTProf names the sub of
+                 * a call that will die so); else the cv */
         HV *stash = NULL;
         GV *gv = NULL;
         CV *cv = sv_2cv(GOPERL_SVARG(a), &stash, &gv, (I32)(int64_t)b);
-        return (uint64_t)(uintptr_t)cv;
+        if (!c) return (uint64_t)(uintptr_t)cv;
+        static goperl_gword_t answer[3];
+        answer[0] = GOPERL_ADDR(cv);
+        answer[1] = GOPERL_ADDR(gv);
+        answer[2] = GOPERL_ADDR(stash);
+        return GOPERL_ADDR(answer);
     }
     case GOPERL_OP_GET_SV:
         return (uint64_t)(uintptr_t)get_sv(s ? s : "", (I32)(int64_t)a);
