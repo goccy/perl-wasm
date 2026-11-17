@@ -508,7 +508,7 @@ static const char *locale_with_data(const char *name, size_t len) {
         const char *name;
         const char *known_as;
     } locales[] = {
-        {"C", "C"},           {"POSIX", "POSIX"},   {"C.UTF-8", "C.UTF-8"},
+        {"C", "C"},           {"POSIX", "C"},       {"C.UTF-8", "C.UTF-8"},
         {"C.utf8", "C.UTF-8"}, {"C.UTF8", "C.UTF-8"}, {"C.utf-8", "C.UTF-8"},
     };
     for (const auto &l : locales)
@@ -538,8 +538,43 @@ static const char *locale_of_environment(const char *variable) {
     return known;
 }
 
+/* The name each of the six categories was set to, in the order of
+ * locale_categories. The C library keeps what a category's data is, but
+ * not the name it was given: its data of C.UTF-8 differs from C's in
+ * LC_CTYPE alone, and it reports every other category set to C.UTF-8 as
+ * "C" (glibc reports "C.UTF-8"; libintl-perl takes a category reported as
+ * "C" for one without translations). The names are the ones
+ * locale_with_data gives, which live as long as the program. */
+static const char *locale_names[6] = {"C", "C", "C", "C", "C", "C"};
+
+/* The name setlocale reports for a category: that of the category, or for
+ * LC_ALL the one name of all six, or else theirs separated by ";" in the
+ * order of the categories (the C library's form, which setlocale takes
+ * back). */
+static char *locale_name_of(int category) {
+    for (size_t i = 0; i < 6; i++)
+        if (locale_categories[i].category == category) return (char *)locale_names[i];
+    if (category != LC_ALL) return __real_setlocale(category, NULL);
+    static std::string all;
+    all = locale_names[0];
+    bool same = true;
+    for (size_t i = 1; i < 6; i++) same = same && strcmp(locale_names[i], locale_names[0]) == 0;
+    if (same) return (char *)all.c_str();
+    for (size_t i = 1; i < 6; i++) {
+        all += ';';
+        all += locale_names[i];
+    }
+    return (char *)all.c_str();
+}
+
+/* Records the name a category (LC_ALL: every one) was set to. */
+static void locale_name_set(int category, const char *known) {
+    for (size_t i = 0; i < 6; i++)
+        if (category == LC_ALL || locale_categories[i].category == category) locale_names[i] = known;
+}
+
 char *__wrap_setlocale(int category, const char *name) {
-    if (!name) return __real_setlocale(category, NULL);
+    if (!name) return locale_name_of(category);
     if (!*name) {
         /* every category asked for has to be there before one is set */
         for (const auto &c : locale_categories)
@@ -551,15 +586,19 @@ char *__wrap_setlocale(int category, const char *name) {
         for (const auto &c : locale_categories) {
             if (category != LC_ALL && c.category != category) continue;
             one_of_the_six = true;
-            if (!__real_setlocale(c.category, locale_of_environment(c.variable))) return NULL;
+            const char *known = locale_of_environment(c.variable);
+            if (!__real_setlocale(c.category, known)) return NULL;
+            locale_name_set(c.category, known);
         }
         if (!one_of_the_six) return __real_setlocale(category, name);
-        return __real_setlocale(category, NULL);
+        return locale_name_of(category);
     }
     /* A name, or for LC_ALL also one name per category separated by ";"
      * (the form setlocale(LC_ALL, NULL) reports them in): every one has to
      * be a locale there is data for. */
     std::string known;
+    const char *parts[6];
+    size_t count = 0;
     for (const char *part = name;;) {
         const size_t len = category == LC_ALL ? strcspn(part, ";") : strlen(part);
         const char *locale = locale_with_data(part, len);
@@ -569,10 +608,18 @@ char *__wrap_setlocale(int category, const char *name) {
         }
         if (!known.empty()) known += ';';
         known += locale;
+        if (count < 6) parts[count] = locale;
+        count++;
         if (!part[len]) break;
         part += len + 1;
     }
-    return __real_setlocale(category, known.c_str());
+    if (!__real_setlocale(category, known.c_str())) return NULL;
+    if (count == 1) {
+        locale_name_set(category, parts[0]);
+    } else if (count == 6) {
+        for (size_t i = 0; i < 6; i++) locale_names[i] = parts[i];
+    }
+    return locale_name_of(category);
 }
 
 /* ---- sockets ----------------------------------------------------------------
