@@ -704,7 +704,17 @@ extern "C" int do_aspawn(void *vreally, void **mark, void **sp) {
  * — interpreting bitmask bytes as that struct reads a garbage count and
  * walks off the stack. Convert the bits into real fd_sets, select, and
  * write the ready sets back as bits. The configure patch routes pp_sselect
- * here. */
+ * here.
+ *
+ * The timeout is left holding the time that was not waited, as select(2)
+ * does on Linux (perl returns it as the time left): 0 once the whole
+ * timeout has passed. wasi-libc's select leaves it as it was. */
+static long long select_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
 extern "C" int wasi_bitvec_select(int nbits, char *rbits, char *wbits,
                                   char *ebits, struct timeval *tbuf) {
     fd_set sets[3];
@@ -722,7 +732,15 @@ extern "C" int wasi_bitvec_select(int nbits, char *rbits, char *wbits,
             }
         }
     }
+    const long long started = tbuf ? select_now_ns() : 0;
     int nfound = select(maxfd + 1, use[0], use[1], use[2], tbuf);
+    if (tbuf) {
+        const long long timeout = (long long)tbuf->tv_sec * 1000000000LL + (long long)tbuf->tv_usec * 1000LL;
+        long long left = timeout - (select_now_ns() - started);
+        if (nfound == 0 || left < 0) left = 0;
+        tbuf->tv_sec = (time_t)(left / 1000000000LL);
+        tbuf->tv_usec = (suseconds_t)((left % 1000000000LL) / 1000LL);
+    }
     if (nfound < 0) return nfound;
     for (int i = 0; i < 3; i++) {
         if (!bits[i]) continue;
