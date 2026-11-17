@@ -604,98 +604,21 @@ static uint64_t goperl_call_results(pTHX_ I32 count) {
     return GOPERL_ADDR(results.data());
 }
 
-/* A callback of native code that did not ask for G_EVAL (CALL_SV and
- * CALL_METHOD below). Its die cannot unwind the host's C frames, so the
- * call is made inside an eval scope all the same; but a call with G_EVAL
- * empties $@ when it starts and again when the callee returns, which a
- * call without G_EVAL never does, and code relies on that: a method
- * implemented in C that calls back into Perl must not lose the $@ of the
- * eval before it.
- *
- * So the eval scope is opened with G_KEEPERR, which leaves $@ alone on the
- * way in and on the way out, and the call goes through the XSUB below,
- * which takes the scope out of keep-error mode again before it calls the
- * real target: a die in the callee then sets $@ as any die does, instead
- * of turning into an "(in cleanup)" warning. Whether the callee returned
- * is recorded here, not read out of $@, which may hold an older error or a
- * false exception value. */
-struct goperl_plain_call {
-    SV *target;         /* the code to call, or NULL for a method call */
-    const char *method; /* the method name then (the invocant is ST(0)) */
-    I32 flags;          /* the caller's flags, without G_DISCARD */
-    bool returned;
-};
-/* The call XS_goperl_plain_call is about to make: set right before the
- * call_sv that enters it and taken (cleared) on entry, so a callback
- * nested in the callee sets its own. */
-static goperl_plain_call *goperl_plain_call_pending = NULL;
-static CV *goperl_plain_call_cv = NULL;
-
-XS(XS_goperl_plain_call);
-XS(XS_goperl_plain_call) {
-    dXSARGS;
-    goperl_plain_call *call = goperl_plain_call_pending;
-    goperl_plain_call_pending = NULL;
-    if (!call) Perl_croak(aTHX_ "goperl: no native callback is pending");
-    PL_in_eval &= ~EVAL_KEEPERR;
-    /* the arguments stay where they are and become the callee's */
-    PUSHMARK(SP - items);
-    const I32 count = call->method ? call_method(call->method, call->flags)
-                                   : call_sv(call->target, call->flags);
-    call->returned = true;
-    /* the results are where the arguments were */
-    XSRETURN(count);
-}
-
 /* What perl's croak does before it unwinds: the exception, with the place
  * of the statement added to a message, goes to $SIG{__DIE__} (PL_diehook)
  * while the native code that croaks is still running, inside the scopes it
  * opened (Text::Xslate sets PL_diehook for a render, and its hook names
- * Text::Xslate in what dies there). A hook that dies makes its exception
- * the one thrown. The hook is called as perl's invoke_exception_hook calls
- * it, with the flag perl keeps while a hook runs (which for a die hook is
- * PL_in_warnhook, as perl has it), so that a die in the hook does not run
- * it again; with the exception as a read-only copy, on a stack of its own.
- * Its die is caught here, where perl's would unwind the native code's C
- * frames. Returns the exception to throw, which the caller takes a
- * reference on. */
+ * Text::Xslate in what dies there). It is perl's invoke_exception_hook that
+ * runs it; a hook that dies makes its exception the one thrown, leaving this
+ * operation by the jump a die inside any operation makes (the SDK's
+ * GOPERL_FAILED_JUMP). Returns the exception to throw, which the caller
+ * takes a reference on. */
+/* perl's own, which its headers declare for pp_ctl.c and util.c only */
+extern "C" bool Perl_invoke_exception_hook(pTHX_ SV *ex, bool warn);
 static SV *goperl_die_hook(pTHX_ SV *msg) {
     SV *const ex = mess_sv(msg, 0);
-    SV *const oldhook = PL_diehook;
-    if (!oldhook || oldhook == PERL_WARNHOOK_FATAL || PL_in_warnhook) return ex;
-    HV *stash;
-    GV *gv;
-    ENTER;
-    SAVEBOOL(PL_in_warnhook);
-    PL_in_warnhook = TRUE;
-    CV *const cv = sv_2cv(oldhook, &stash, &gv, 0);
-    LEAVE;
-    if (!cv || !(CvROOT(cv) || CvXSUB(cv))) return ex;
-    if (!goperl_plain_call_cv) goperl_plain_call_cv = newXS(NULL, XS_goperl_plain_call, __FILE__);
-    SV *thrown = ex;
-    dSP;
-    ENTER;
-    save_re_context();
-    SAVEBOOL(PL_in_warnhook);
-    PL_in_warnhook = TRUE;
-    SV *const exarg = newSVsv(ex);
-    SvREADONLY_on(exarg);
-    SAVEFREESV(exarg);
-    PUSHSTACKi(PERLSI_DIEHOOK);
-    PUSHMARK(SP);
-    XPUSHs(exarg);
-    PUTBACK;
-    goperl_plain_call call;
-    call.target = (SV *)cv;
-    call.method = NULL;
-    call.flags = G_VOID;
-    call.returned = false;
-    goperl_plain_call_pending = &call;
-    call_sv((SV *)goperl_plain_call_cv, G_VOID | G_DISCARD | G_EVAL | G_KEEPERR);
-    if (!call.returned) thrown = sv_mortalcopy(ERRSV);
-    POPSTACK;
-    LEAVE;
-    return thrown;
+    Perl_invoke_exception_hook(aTHX_ ex, FALSE);
+    return ex;
 }
 
 /* Native-XSUB request: GOPERL_NATIVE_HDR_WORDS header words (fn_id, the
@@ -6007,43 +5930,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             PUSHs(GOPERL_SVARG(tok));
         }
         PUTBACK;
-        /* Context flags (G_SCALAR/G_LIST/G_VOID, G_DISCARD, ...) pass through
-         * unchanged so wantarray in the callee is honest. G_EVAL is always
-         * forced: an uncaught longjmp would abandon the host callback protocol
-         * mid-flight. The host re-raises when the caller did not ask for
-         * G_EVAL.
+        /* The flags are the caller's, as they are (G_SCALAR/G_LIST/G_VOID,
+         * G_DISCARD, G_EVAL, ...): wantarray in the callee is honest. A
+         * caller that asked for G_EVAL reads $@ itself, as perl's call_sv
+         * leaves it to (the truth of $@ is not asked here, which would run
+         * the bool overloading of an exception object).
          *
-         * A caller that did not ask for G_EVAL gets a call that treats $@
-         * as a call without G_EVAL does (see goperl_plain_call). */
-        I32 count;
-        uint64_t died;
-        if (flags & G_EVAL) {
-            if (op == 66)
-                count = call_method(method, flags);
-            else
-                count = call_sv(GOPERL_SVARG(a), flags);
-            /* The caller asked for G_EVAL and reads $@ itself, as perl's
-             * call_sv leaves it to: the truth of $@ is not asked here, which
-             * would run the bool overloading of an exception object. */
-            died = 0;
-        } else {
-            if (!goperl_plain_call_cv)
-                goperl_plain_call_cv = newXS(NULL, XS_goperl_plain_call, __FILE__);
-            goperl_plain_call call;
-            call.target = op == 66 ? NULL : GOPERL_SVARG(a);
-            call.method = method;
-            call.flags = flags & ~G_DISCARD;
-            call.returned = false;
-            goperl_plain_call_pending = &call;
-            /* the eval around the call is the bridge's: the debugger's
-             * DB::sub is entered for the sub native code calls, as on perl,
-             * not for the sub that makes the eval (Devel::DebugHooks
-             * entered DB::sub for it at every cleanup Scope::Cleanup ran,
-             * and DB::sub established a cleanup of its own each time) */
-            count = call_sv((SV *)goperl_plain_call_cv,
-                            (flags & (G_WANT | G_DISCARD)) | G_EVAL | G_KEEPERR | G_NODEBUG);
-            died = call.returned ? 0u : 1u;
-        }
+         * Without G_EVAL, a die in the callee unwinds as in perl: to the
+         * interpreter's catch point beyond the native call, $SIG{__DIE__}
+         * run once, no eval of the bridge's in caller(), the exception
+         * whole. It leaves this operation by the jump a die inside any
+         * operation makes (the host ends the native call and the
+         * interpreter goes on unwinding when it has returned: the SDK's
+         * GOPERL_FAILED_JUMP). */
+        const I32 count = op == 66 ? call_method(method, flags)
+                                   : call_sv(GOPERL_SVARG(a), flags);
         SPAGAIN;
         /* The results as perl leaves them on the stack for the caller: no
          * reference is taken on them, and the array that hands them over
@@ -6058,9 +5959,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
          * and a mortal array was one more for every call made in one scope
          * (HAMT's each, which calls back for each element). */
         const uint64_t words = goperl_call_results(aTHX_ count);
-        /* -> the address of the results, a word each; second: died<<63 |
-         * count */
-        return goperl_two(words, (died << 63) | (uint32_t)count);
+        /* -> the address of the results, a word each; second: the count */
+        return goperl_two(words, (uint32_t)count);
     }
     case GOPERL_OP_ERRSV:
         return (uint64_t)(uintptr_t)ERRSV;
