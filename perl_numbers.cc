@@ -1050,14 +1050,17 @@ long long shown_number(const GuestNumber &g) {
 }
 
 /* Names the extensions have for a number that the table knows under
- * another: the protocol families are the address families, and IO::Poll
- * has a name of its own for POLLRDNORM. */
+ * another: the protocol families are the address families, IO::Poll has a
+ * name of its own for POLLRDNORM, and Fcntl has old names of flags of open
+ * (wasi-posix-shim.h). */
 const struct {
     const char *name;
     const char *known_as;
 } constant_aliases[] = {
     {"PF_UNSPEC", "AF_UNSPEC"}, {"PF_INET", "AF_INET"},   {"PF_INET6", "AF_INET6"},
     {"PF_UNIX", "AF_UNIX"},     {"PF_LOCAL", "AF_LOCAL"}, {"POLLNORM", "POLLRDNORM"},
+    {"O_NDELAY", "O_NONBLOCK"}, {"FNDELAY", "O_NONBLOCK"}, {"FNONBLOCK", "O_NONBLOCK"},
+    {"FAPPEND", "O_APPEND"},
 };
 
 /* Gives the constant a package has under a name the number the program is

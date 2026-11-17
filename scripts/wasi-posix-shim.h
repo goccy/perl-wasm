@@ -179,6 +179,22 @@ struct sockaddr_un {
 #define SIGRTMAX 64
 #endif
 
+/* The old names of flags of open that Linux's headers keep, for the same
+ * flags: O_NDELAY, FNDELAY and FNONBLOCK are O_NONBLOCK, FAPPEND is
+ * O_APPEND. Fcntl exports them where they are defined. */
+#ifndef O_NDELAY
+#define O_NDELAY O_NONBLOCK
+#endif
+#ifndef FNDELAY
+#define FNDELAY O_NONBLOCK
+#endif
+#ifndef FNONBLOCK
+#define FNONBLOCK O_NONBLOCK
+#endif
+#ifndef FAPPEND
+#define FAPPEND O_APPEND
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
