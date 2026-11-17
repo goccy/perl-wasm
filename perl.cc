@@ -512,9 +512,11 @@ enum {
     GOPERL_HOST_FILTER = 6, /* a source filter: [id][idx][buf][maxlen] -> [result] */
     GOPERL_HOST_RUNOPS = 7, /* a run loop: [id] */
     GOPERL_HOST_BHK = 8,    /* a block hook: [id][which][arg] -> [op] */
-    GOPERL_HOST_INFIX = 9   /* an infix operator of native code: [0][def][opdata]
+    GOPERL_HOST_INFIX = 9,  /* an infix operator of native code: [0][def][opdata]
                              * -> [opdata] (its parse), or [1][def][opdata][lhs]
                              * [rhs] -> [opdata][op] (its build_op) */
+    GOPERL_HOST_SIGHANDLER = 10 /* the signal handler of native code that is
+                                 * PL_sighandlerp: [id][signal] */
 };
 /* The hooks of GOPERL_HOST_MAGIC, and the bits of an anchor's mask. */
 enum {
@@ -1247,6 +1249,21 @@ static int goperl_runops_native(pTHX) {
     free(goperl_host_call(aTHX_ GOPERL_HOST_RUNOPS, words, 1, &rlen));
     TAINT_NOT;
     return 0;
+}
+
+/* The signal handler of native code that is PL_sighandlerp (Tk's Event
+ * marks a handler of its own with it): the host's id of the function. The
+ * interpreter calls it for a signal that has arrived, where it would run
+ * the %SIG handler. */
+static uint32_t g_sighandler_native = 0;
+static Signal_t goperl_sighandler_native(int sig) {
+    if (g_go_cb == 0 || g_sighandler_native == 0) {
+        Perl_sighandler(sig);
+        return;
+    }
+    const goperl_gword_t words[2] = {g_sighandler_native, (goperl_gword_t)sig};
+    uint32_t rlen = 0;
+    free(goperl_host_call(aTHX_ GOPERL_HOST_SIGHANDLER, words, 2, &rlen));
 }
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -3533,10 +3550,17 @@ enum {
                                      * have it */
     GOPERL_INT_PUSHSTACK = 33,      /* b: the stackinfo type: PUSHSTACKi */
     GOPERL_INT_POPSTACK = 34,       /* POPSTACK */
-    GOPERL_INT_WAITPID = 35         /* a: a pid; b: 1 for WNOHANG -> the pid
+    GOPERL_INT_WAITPID = 35,        /* a: a pid; b: 1 for WNOHANG -> the pid
                                      * waitpid returned (0: none has ended),
                                      * second: the status word; or -1, second:
                                      * errno */
+    GOPERL_INT_MY_EXIT = 36,        /* a: 0, b: a status: my_exit; a: 1:
+                                     * my_failure_exit */
+    GOPERL_INT_SIGHANDLER = 37,     /* b: a signal: the interpreter's own
+                                     * handler of it (native code calls the
+                                     * handler PL_sighandlerp had) */
+    GOPERL_INT_SCAN_VSTRING = 38    /* a: an SV; s+b: a v-string's spelling ->
+                                     * the bytes scan_vstring read */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4143,7 +4167,8 @@ enum {
     GOPERL_CC_WORDCHAR = 2,
     GOPERL_CC_SPACE = 3,
     GOPERL_CC_DIGIT = 4,
-    GOPERL_CC_ALPHA = 5
+    GOPERL_CC_ALPHA = 5,
+    GOPERL_CC_UPPER = 6
 };
 
 /* PLVAR_GET / PLVAR_SET interpreter-variable ids (the `a` argument). */
@@ -4268,6 +4293,12 @@ enum {
 #define GOPERL_PL_ORIGARGC 111      /* read only */
 #define GOPERL_PL_ORIGARGV 112      /* read only: the address of the vector */
 #define GOPERL_PL_ORS 113          /* PL_ors_sv, the output record separator */
+#define GOPERL_PL_SORTCOP 114      /* PL_sortcop, as the word it is: native code
+                                    * keeps what it likes there while it sorts
+                                    * with a comparator of its own */
+#define GOPERL_PL_SIGHANDLERP 115  /* the host's id of the signal handler of
+                                    * native code that is PL_sighandlerp, 0
+                                    * for the interpreter's own */
 
 /* SV_INFO result bitset. SYNTHETIC flags - deliberately NOT perl's real
  * SvFLAGS bits; both sides pin these values so host-side SvOK/SvPOK/...
@@ -4632,6 +4663,7 @@ static void goperl_save_plvar(pTHX_ int id, int kind) {
     case GOPERL_PL_DEFOUTGV: GOPERL_SAVE_PTRVAR(PL_defoutgv);
     case GOPERL_PL_RS: GOPERL_SAVE_PTRVAR(PL_rs);
     case GOPERL_PL_ORS: GOPERL_SAVE_PTRVAR(PL_ors_sv);
+    case GOPERL_PL_SORTCOP: save_vptr((void *)&PL_sortcop); return;
     case GOPERL_PL_ERRORS: GOPERL_SAVE_PTRVAR(PL_errors);
     case GOPERL_PL_CURPAD: GOPERL_SAVE_PTRVAR(PL_curpad);
     /* Making a pad the one in use makes its values PL_curpad too (see
@@ -4849,6 +4881,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         errno = saved;
         if (got < 0) return goperl_two((uint64_t)(int64_t)-1, (uint64_t)failure);
         return goperl_two((uint64_t)(int64_t)got, (uint64_t)(uint32_t)st);
+    }
+    case GOPERL_INT_MY_EXIT:
+        if (lo) my_failure_exit();
+        my_exit((U32)b);
+        return 0;
+    case GOPERL_INT_SIGHANDLER:
+        Perl_sighandler((int)(int64_t)b);
+        return 0;
+    case GOPERL_INT_SCAN_VSTRING: {
+        /* the spelling native code has, ending where it ends: scan_vstring
+         * may look at the byte at the end */
+        SV *sv = (SV *)(uintptr_t)lo;
+        if (!sv) Perl_croak(aTHX_ "goperl: scan_vstring into no SV");
+        std::string spelling(s ? s : "", s ? (size_t)b : 0);
+        const char *begin = spelling.c_str();
+        const char *end = Perl_scan_vstring(aTHX_ begin, begin + spelling.size(), sv);
+        return (uint64_t)(end - begin);
     }
     case GOPERL_INT_SAVE_FIELD: {
         /* the fields are numbered as the host's lvalue slots of them */
@@ -5605,6 +5654,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_DEFOUTGV: return (uint64_t)(uintptr_t)PL_defoutgv;
         case GOPERL_PL_RS: return (uint64_t)(uintptr_t)PL_rs;
         case GOPERL_PL_ORS: return (uint64_t)(uintptr_t)PL_ors_sv;
+        case GOPERL_PL_SORTCOP: return (uint64_t)(uintptr_t)PL_sortcop;
+        case GOPERL_PL_SIGHANDLERP:
+            return PL_sighandlerp == goperl_sighandler_native ? g_sighandler_native : 0;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -5681,6 +5733,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_DEFOUTGV: PL_defoutgv = (GV *)val; return 0;
         case GOPERL_PL_RS: PL_rs = val; return 0;
         case GOPERL_PL_ORS: PL_ors_sv = val; return 0;
+        case GOPERL_PL_SORTCOP: PL_sortcop = (OP *)(uintptr_t)b; return 0;
+        case GOPERL_PL_SIGHANDLERP:
+            g_sighandler_native = (uint32_t)b;
+            PL_sighandlerp = b ? goperl_sighandler_native : Perl_sighandler;
+            return 0;
         case GOPERL_PL_CURSTASH: PL_curstash = (HV *)val; return 0;
         case GOPERL_PL_TAINTED: TAINT_set(cBOOL(b)); return 0;
         case GOPERL_PL_TAINTING: TAINTING_set(cBOOL(b)); return 0;
@@ -6731,6 +6788,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CC_SPACE: return isSPACE_uni(cp) ? 1 : 0;
         case GOPERL_CC_DIGIT: return isDIGIT_uni(cp) ? 1 : 0;
         case GOPERL_CC_ALPHA: return isALPHA_uni(cp) ? 1 : 0;
+        case GOPERL_CC_UPPER: return isUPPER_uni(cp) ? 1 : 0;
         }
         return 0;
     }
