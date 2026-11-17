@@ -4228,7 +4228,8 @@ enum {
     GOPERL_PAD_NAMELIST = 8,     /* b = padnamelist -> the address of [max][maxnamed][names...] */
     GOPERL_PAD_NAME = 9,         /* b = padname -> the address of [pv][len][flags]
                                   * [refcnt][low][high][ourstash][type] */
-    GOPERL_PAD_SAVE_CLEARSV = 10 /* b = pad index */
+    GOPERL_PAD_SAVE_CLEARSV = 10, /* b = pad index */
+    GOPERL_PAD_NAMELIST_STORE = 11 /* b = padnamelist, c = key, s = a word: the padname */
 };
 enum {
     GOPERL_CC_IDFIRST = 0,
@@ -7006,6 +7007,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PAD_SAVE_CLEARSV:
             save_clearsv(&PAD_SVl((PADOFFSET)b));
             return 0;
+        case GOPERL_PAD_NAMELIST_STORE: {
+            goperl_gword_t pn = 0;
+            if (s && slen >= sizeof pn) memcpy(&pn, s, sizeof pn);
+            padnamelist_store(GOPERL_MEMARG(PADNAMELIST, b), (SSize_t)(int64_t)c,
+                              GOPERL_MEMARG(PADNAME, pn));
+            return 0;
+        }
         }
         Perl_croak(aTHX_ "goperl: unknown pad call %d", (int)a);
     }
