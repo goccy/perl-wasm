@@ -8553,10 +8553,26 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * [old_eval_root]; loop [my_op] */
             static goperl_gword_t w[16];
             const I32 ix = (I32)(int64_t)b;
-            if (!si || ix < 0 || ix > si->si_cxix) return 0;
+            /* the context above the top is the one perl popped last, which
+             * it leaves as it was (Variable::Magic reads its type): its type
+             * and numbers, and none of its ops or scalars, which may be gone
+             * by now */
+            const bool ghost = si && ix == si->si_cxix + 1 && ix <= si->si_cxmax;
+            if (!si || ix < 0 || (ix > si->si_cxix && !ghost)) return 0;
             PERL_CONTEXT *cx = &si->si_cxstack[ix];
             memset(w, 0, sizeof w);
             w[0] = cx->cx_type;
+            if (ghost) {
+                if (CxTYPE(cx) == CXt_SUBST) return (uint64_t)(uintptr_t)w;
+                w[1] = cx->blk_gimme;
+                w[2] = cx->blk_u16;
+                w[3] = (goperl_gword_t)cx->blk_oldsaveix;
+                w[4] = (goperl_gword_t)(int64_t)cx->blk_oldsp;
+                w[5] = (goperl_gword_t)cx->blk_oldmarksp;
+                w[6] = (goperl_gword_t)cx->blk_oldscopesp;
+                w[9] = (goperl_gword_t)(int64_t)cx->blk_old_tmpsfloor;
+                return (uint64_t)(uintptr_t)w;
+            }
             if (CxTYPE(cx) == CXt_SUBST) return (uint64_t)(uintptr_t)w;
             w[1] = cx->blk_gimme;
             w[2] = cx->blk_u16;
