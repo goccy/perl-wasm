@@ -690,19 +690,29 @@ extern "C" PerlIO *wasi_spawn_popen_list(pTHX_ const char *mode, int n,
 
 /* The platform spawn helpers pp_system's non-fork branch calls (the role
  * win32's do_spawn/do_aspawn play — embed.h maps the calls to the Perl_
- * names): run and wait, returning the native wait status. */
+ * names): run and wait, returning the native wait status.
+ *
+ * The wait is perl's (wait4pid): a signal that interrupts it has its
+ * handler run there, as pp_system's own wait does, and a handler that dies
+ * (an alarm that times the command out) leaves system with the command
+ * still running. */
+static int wasi_spawn_wait(pTHX_ pid_t pid) {
+    int status = 0;
+    I32 r;
+    do {
+        r = Perl_wait4pid(aTHX_ pid, &status, 0);
+    } while (r == -1 && errno == EINTR);
+    return r == -1 ? -1 : status;
+}
+
 extern "C" int do_spawn(char *cmd) {
+    dTHX;
     bool blank = false;
     pid_t pid = wasi_spawn_command(cmd, -1, -1, &blank);
     /* perl's forked child finds nothing to exec and exits with status 255 */
     if (blank) return 255 << 8;
     if (pid < 0) return -1;
-    int status = 0;
-    pid_t r;
-    do {
-        r = waitpid(pid, &status, 0);
-    } while (r == -1 && errno == EINTR);
-    return r == -1 ? -1 : status;
+    return wasi_spawn_wait(aTHX_ pid);
 }
 
 extern "C" int do_aspawn(void *vreally, void **mark, void **sp) {
@@ -722,12 +732,7 @@ extern "C" int do_aspawn(void *vreally, void **mark, void **sp) {
     pid_t pid = wasi_spawn_argv(argv, -1, -1);
     free(argv);
     if (pid < 0) return -1;
-    int status = 0;
-    pid_t r;
-    do {
-        r = waitpid(pid, &status, 0);
-    } while (r == -1 && errno == EINTR);
-    return r == -1 ? -1 : status;
+    return wasi_spawn_wait(aTHX_ pid);
 }
 
 /* ---- 4-arg select for pp_sselect (PERL_WASI_SELECT) ----------------------
