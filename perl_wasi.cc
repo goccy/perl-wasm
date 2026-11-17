@@ -445,6 +445,15 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     case 0:
     redo_body:
         if (PL_op) CALLRUNOPS(aTHX);
+        /* A process forked while a file was being compiled (in a BEGIN
+         * block, or in the code of a module a use loads) comes here when
+         * that BEGIN block returns. It cannot go on compiling the file: the
+         * compiler ran in frames of the parent that this copy of the
+         * process does not have (perlfork, "BEGIN blocks"). It ends as a
+         * die does, saying so; one that exits or execs inside the block
+         * does not come here. */
+        if (PL_parser)
+            Perl_croak(aTHX_ "fork inside BEGIN: the child process cannot compile the rest of the file");
         /* The program (or the nested level the fork happened in) ran to
          * its end. */
         my_exit(0);
