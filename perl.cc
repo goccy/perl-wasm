@@ -3469,6 +3469,10 @@ enum goperl_xs_op {
     GOPERL_OP_INTERNAL = 204
 };
 
+/* the C library's waitpid, which the link otherwise gives to the program's
+ * (perl_numbers.cc) */
+extern "C" pid_t __real_waitpid(pid_t pid, int *status, int options);
+
 /* INTERNAL selectors. */
 enum {
     GOPERL_INT_LAYOUT = 0,          /* -> the address of the offsets of the
@@ -3528,7 +3532,11 @@ enum {
                                      * as the keys of this interpreter's hashes
                                      * have it */
     GOPERL_INT_PUSHSTACK = 33,      /* b: the stackinfo type: PUSHSTACKi */
-    GOPERL_INT_POPSTACK = 34        /* POPSTACK */
+    GOPERL_INT_POPSTACK = 34,       /* POPSTACK */
+    GOPERL_INT_WAITPID = 35         /* a: a pid; b: 1 for WNOHANG -> the pid
+                                     * waitpid returned (0: none has ended),
+                                     * second: the status word; or -1, second:
+                                     * errno */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -4825,6 +4833,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
          * (one into the stack popped) may be stored after it. */
         pop_stackinfo();
         return 0;
+    case GOPERL_INT_WAITPID: {
+        /* native code's waitpid, wait and wait4: the program's own, as
+         * Perl's waitpid is (the C library of this interpreter knows the
+         * processes its fork made and the commands it started). Nothing of
+         * the interpreter's changes: not $?, and not errno, which native
+         * code gets the failure in. The status word is the C library's,
+         * with its numbers of signals, not the program's (the waitpid the
+         * interpreter calls gives it the host's numbers): native code maps
+         * it to the host's, as it maps errno. */
+        const int saved = errno;
+        int st = 0;
+        const pid_t got = __real_waitpid((pid_t)(int64_t)lo, &st, (b & 1) ? WNOHANG : 0);
+        const int failure = errno;
+        errno = saved;
+        if (got < 0) return goperl_two((uint64_t)(int64_t)-1, (uint64_t)failure);
+        return goperl_two((uint64_t)(int64_t)got, (uint64_t)(uint32_t)st);
+    }
     case GOPERL_INT_SAVE_FIELD: {
         /* the fields are numbered as the host's lvalue slots of them */
         enum { GOPERL_SVF_IV = 0, GOPERL_SVF_UV = 1, GOPERL_SVF_NV = 2, GOPERL_SVF_RV = 6,
