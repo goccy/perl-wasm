@@ -6615,13 +6615,15 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_CV_INFO: { /* depth<<32 | isxsub */
         CV *cv = GOPERL_CVARG(a);
-        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        /* a format is a CV to perl's macros as a sub is */
+        if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         return ((uint64_t)(uint32_t)CvDEPTH(cv) << 32) |
                (CvISXSUB(cv) ? 1u : 0u);
     }
     case GOPERL_OP_CV_PTR: { /* b = a GOPERL_CVPTR_ selector */
         CV *cv = GOPERL_CVARG(a);
-        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        /* a format is a CV to perl's macros as a sub is */
+        if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         switch ((int)b) {
         case GOPERL_CVPTR_START: return CvISXSUB(cv) ? 0 : (uint64_t)(uintptr_t)CvSTART(cv);
         case GOPERL_CVPTR_GV: return (uint64_t)(uintptr_t)CvGV(cv);
@@ -6712,7 +6714,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_CV_FILE: { /* CvFILE */
         CV *cv = GOPERL_CVARG(a);
-        if (SvTYPE((SV *)cv) != SVt_PVCV) return 0;
+        /* a format is a CV to perl's macros as a sub is */
+        if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         const char *f = CvFILE(cv);
         if (!f) return 0;
         return goperl_two(GOPERL_ADDR(f), (uint64_t)strlen(f));
