@@ -54,7 +54,7 @@
   ],
   "build_commands": {
     "configure": "bash scripts/wasi-configure.sh",
-    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs && (cd dist/Devel-PPPort && ../../miniperl -I../../lib PPPort_pm.PL && cp PPPort.pm ../../lib/Devel/PPPort.pm) && mkdir -p lib/Sys/Syslog && cp cpan/Sys-Syslog/win32/Win32.pm lib/Sys/Syslog/Win32.pm'"
+    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs && (cd dist/Devel-PPPort && ../../miniperl -I../../lib PPPort_pm.PL && cp PPPort.pm ../../lib/Devel/PPPort.pm) && mkdir -p lib/Sys/Syslog && cp cpan/Sys-Syslog/win32/Win32.pm lib/Sys/Syslog/Win32.pm && sh ../scripts/programs-and-pods.sh'"
   },
   "wasm_build": {
     "wasm64": true,
