@@ -3563,9 +3563,12 @@ enum {
                                      * handler PL_sighandlerp had) */
     GOPERL_INT_SCAN_VSTRING = 38,   /* a: an SV; s+b: a v-string's spelling ->
                                      * the bytes scan_vstring read */
-    GOPERL_INT_SAVE_SVREF = 39      /* a: the address of a slot of this
+    GOPERL_INT_SAVE_SVREF = 39,     /* a: the address of a slot of this
                                      * memory (an element's, HeVAL) ->
                                      * save_svref's new SV */
+    GOPERL_INT_SIGACTION = 40       /* b: a signal -> the program's action
+                                     * of it: 0 the default, 1 ignored, 2 a
+                                     * handler */
 };
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
@@ -5103,6 +5106,17 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SIGHANDLER:
         Perl_sighandler((int)(int64_t)b);
         return 0;
+    case GOPERL_INT_SIGACTION: {
+        /* native code shares the process's signals with the program, whose
+         * actions are its C library's: the action native code finds where
+         * the runtime's handler is the process's */
+        struct sigaction act;
+        const int saved = errno;
+        const int r = sigaction((int)(int64_t)b, NULL, &act);
+        errno = saved;
+        if (r != 0 || act.sa_handler == SIG_DFL) return 0;
+        return act.sa_handler == SIG_IGN ? 1 : 2;
+    }
     case GOPERL_INT_SAVE_SVREF:
         if (!lo) Perl_croak(aTHX_ "save_svref of no slot");
         return (uint64_t)(uintptr_t)save_svref((SV **)goperl_mem_arg(aTHX_ lo, sizeof(SV *), op,
