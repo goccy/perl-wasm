@@ -319,17 +319,82 @@ void report_env(const char *name, size_t name_len, const char *value) {
                           value ? (int)strlen(value) : 0, value != NULL);
 }
 
-/* The protocols database: the entries every /etc/protocols starts with. */
+/* The protocols database: the file /etc/protocols, as the C library of
+ * the system reads it (netbase's on Debian: gre, sctp and the others), or,
+ * where there is no such file (an in-memory filesystem), the entries every
+ * /etc/protocols starts with. */
 char *no_aliases[] = {NULL};
 char proto_ip[] = "ip", proto_icmp[] = "icmp", proto_tcp[] = "tcp", proto_udp[] = "udp",
      proto_ipv6[] = "ipv6", proto_icmpv6[] = "ipv6-icmp";
-struct protoent protocols[] = {
+struct protoent builtin_protocols[] = {
     {proto_ip, no_aliases, 0},      {proto_icmp, no_aliases, 1},
     {proto_tcp, no_aliases, 6},     {proto_udp, no_aliases, 17},
     {proto_ipv6, no_aliases, 41},   {proto_icmpv6, no_aliases, 58},
 };
-const size_t protocol_count = sizeof(protocols) / sizeof(protocols[0]);
-size_t protocol_next = 0; /* getprotoent's position */
+FILE *protocol_file = NULL; /* getprotoent's position in /etc/protocols */
+size_t protocol_next = 0;   /* ... or in the entries above */
+bool protocol_from_file = false;
+
+/* The next entry of the open protocols file: protocols(5), a name, a
+ * number and aliases a line, white space between them, # to the end of
+ * the line a comment. The entry lives in static storage. */
+struct protoent *next_protocol_line(FILE *f) {
+    static char line[1024];
+    static char *aliases[32];
+    static struct protoent ent;
+    while (fgets(line, sizeof(line), f)) {
+        if (char *hash = strchr(line, '#')) *hash = '\0';
+        char *save = NULL;
+        char *name = strtok_r(line, " \t\r\n", &save);
+        char *number = name ? strtok_r(NULL, " \t\r\n", &save) : NULL;
+        if (!number) continue;
+        char *end = NULL;
+        const long value = strtol(number, &end, 10);
+        if (*end != '\0' || value < 0 || value > 255) continue;
+        size_t n = 0;
+        while (n + 1 < sizeof(aliases) / sizeof(aliases[0])) {
+            char *alias = strtok_r(NULL, " \t\r\n", &save);
+            if (!alias) break;
+            aliases[n++] = alias;
+        }
+        aliases[n] = NULL;
+        ent.p_name = name;
+        ent.p_aliases = aliases;
+        ent.p_proto = (int)value;
+        return &ent;
+    }
+    return NULL;
+}
+
+/* The next entry of the database from where the walk is: the file when it
+ * can be read, the built-in entries otherwise. */
+struct protoent *next_protocol() {
+    if (!protocol_file && !protocol_from_file && protocol_next == 0) {
+        protocol_file = fopen("/etc/protocols", "re");
+        protocol_from_file = protocol_file != NULL;
+    }
+    if (protocol_from_file) return protocol_file ? next_protocol_line(protocol_file) : NULL;
+    const size_t count = sizeof(builtin_protocols) / sizeof(builtin_protocols[0]);
+    return protocol_next < count ? &builtin_protocols[protocol_next++] : NULL;
+}
+
+void rewind_protocols() {
+    if (protocol_file) fclose(protocol_file);
+    protocol_file = NULL;
+    protocol_from_file = false;
+    protocol_next = 0;
+}
+
+/* A lookup walks the database from its start, as glibc's does (and leaves
+ * a walk of getprotoent's where it starts over). */
+template <typename Match> struct protoent *find_protocol(Match match) {
+    rewind_protocols();
+    struct protoent *p;
+    while ((p = next_protocol()) != NULL && !match(p)) {
+    }
+    rewind_protocols();
+    return p;
+}
 
 } /* namespace */
 
@@ -871,25 +936,80 @@ struct servent *getservbyport(int port, const char *proto) {
     return find_service("", (int)ntohs((uint16_t)port), 1, proto);
 }
 
-/* Protocols: the table above. */
+/* Protocols: the database above, by name or alias, or by number. */
 void setprotoent(int stayopen) {
     (void)stayopen;
-    protocol_next = 0;
+    rewind_protocols();
 }
-void endprotoent(void) { protocol_next = 0; }
+void endprotoent(void) { rewind_protocols(); }
 struct protoent *getprotoent(void) {
-    return protocol_next < protocol_count ? &protocols[protocol_next++] : NULL;
+    struct protoent *p = next_protocol();
+    if (!p) rewind_protocols();
+    return p;
 }
 struct protoent *getprotobyname(const char *name) {
     if (!name) return NULL;
-    for (size_t i = 0; i < protocol_count; i++)
-        if (strcmp(protocols[i].p_name, name) == 0) return &protocols[i];
-    return NULL;
+    return find_protocol([name](struct protoent *p) {
+        if (strcmp(p->p_name, name) == 0) return true;
+        for (char **a = p->p_aliases; *a; a++)
+            if (strcmp(*a, name) == 0) return true;
+        return false;
+    });
 }
 struct protoent *getprotobynumber(int number) {
-    for (size_t i = 0; i < protocol_count; i++)
-        if (protocols[i].p_proto == number) return &protocols[i];
-    return NULL;
+    return find_protocol([number](struct protoent *p) { return p->p_proto == number; });
+}
+
+/* inet_ntop(3) as glibc words an address: an IPv6 address whose first 96
+ * bits are zero (an IPv4-compatible address, ::1.2.3.4) or that is an
+ * IPv4-mapped one (::ffff:1.2.3.4) ends in the dotted IPv4 notation, the
+ * longest run of zero groups (two at least) is "::", and the groups are
+ * hexadecimal without leading zeros. wasi-libc words the IPv4-compatible
+ * addresses in hexadecimal (::102:304). */
+const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    const unsigned char *b = (const unsigned char *)src;
+    char out[INET6_ADDRSTRLEN];
+    if (af == AF_INET) {
+        snprintf(out, sizeof(out), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    } else if (af == AF_INET6) {
+        unsigned int words[8];
+        for (int i = 0; i < 8; i++) words[i] = (unsigned int)b[2 * i] << 8 | b[2 * i + 1];
+        int best_base = -1, best_len = 0, cur_base = -1, cur_len = 0;
+        for (int i = 0; i < 8; i++) {
+            if (words[i] == 0) {
+                if (cur_base == -1) cur_base = i, cur_len = 1;
+                else cur_len++;
+            } else if (cur_base != -1) {
+                if (best_base == -1 || cur_len > best_len) best_base = cur_base, best_len = cur_len;
+                cur_base = -1;
+            }
+        }
+        if (cur_base != -1 && (best_base == -1 || cur_len > best_len)) best_base = cur_base, best_len = cur_len;
+        if (best_base != -1 && best_len < 2) best_base = -1;
+        char *tp = out;
+        for (int i = 0; i < 8; i++) {
+            if (best_base != -1 && i >= best_base && i < best_base + best_len) {
+                if (i == best_base) *tp++ = ':';
+                continue;
+            }
+            if (i != 0) *tp++ = ':';
+            if (i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && words[5] == 0xffff))) {
+                tp += snprintf(tp, sizeof(out) - (size_t)(tp - out), "%u.%u.%u.%u", b[12], b[13], b[14], b[15]);
+                break;
+            }
+            tp += snprintf(tp, sizeof(out) - (size_t)(tp - out), "%x", words[i]);
+        }
+        if (best_base != -1 && best_base + best_len == 8) *tp++ = ':';
+        *tp = '\0';
+    } else {
+        errno = EAFNOSUPPORT;
+        return NULL;
+    }
+    if (strlen(out) + 1 > (size_t)size) {
+        errno = ENOSPC;
+        return NULL;
+    }
+    return strcpy(dst, out);
 }
 
 /* ---- poll(2) ---------------------------------------------------------------
