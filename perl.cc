@@ -5186,6 +5186,53 @@ static inline SV *goperl_stored(pTHX_ uint64_t v) {
     return imm ? imm : (SV *)(uintptr_t)v;
 }
 
+/* A value stored in a container that lies outside the interpreter's memory
+ * (a structure the module allocated: Text::KnuthPlass keeps its list of
+ * breakpoints in its object's hash) is one perl must not drop. perl drops
+ * what a container holds when the container is freed and when a store
+ * replaces it, and its SvREFCNT_dec reads the value's head: perl reads the
+ * module's memory there and gets by, the interpreter reads outside its own
+ * and traps. Such a value is taken out of the container first: the
+ * container gets magic whose free takes them out before perl frees what it
+ * holds (mg_free runs before the body is cleared), and a store over one
+ * takes it out of the slot. Native code reads it back as it stored it. */
+static bool goperl_foreign(const SV *v) {
+    return v && (uint64_t)(uintptr_t)v >= ((uint64_t)__builtin_wasm_memory_size(0) << 16);
+}
+static int goperl_foreign_free(pTHX_ SV *sv, MAGIC *mg) {
+    PERL_UNUSED_ARG(mg);
+    if (SvTYPE(sv) == SVt_PVAV && AvARRAY((AV *)sv)) {
+        SV **const a = AvARRAY((AV *)sv);
+        for (SSize_t i = 0; i <= AvFILLp((AV *)sv); i++)
+            if (goperl_foreign(a[i])) a[i] = NULL;
+    } else if (SvTYPE(sv) == SVt_PVHV && HvARRAY((HV *)sv)) {
+        for (STRLEN b = 0; b <= HvMAX((HV *)sv); b++)
+            for (HE *he = HvARRAY((HV *)sv)[b]; he; he = HeNEXT(he))
+                if (goperl_foreign(HeVAL(he))) HeVAL(he) = NULL;
+    }
+    return 0;
+}
+static MGVTBL goperl_foreign_vtbl = {NULL, NULL, NULL, NULL, goperl_foreign_free,
+                                     NULL, NULL, NULL};
+/* v is stored in the container: one outside the memory marks it. */
+static SV *goperl_store_into(pTHX_ SV *container, SV *v) {
+    /* a freed hash takes nothing (hv_common answers NULL for it) */
+    if (goperl_foreign(v) && !SvIS_FREED(container) &&
+        !mg_findext(container, PERL_MAGIC_ext, &goperl_foreign_vtbl))
+        sv_magicext(container, NULL, PERL_MAGIC_ext, &goperl_foreign_vtbl, NULL, 0);
+    return v;
+}
+/* Whether the container may hold such values: a store into it looks at
+ * the slot it replaces first. */
+static bool goperl_holds_foreign(SV *container) {
+    return SvRMAGICAL(container) && mg_findext(container, PERL_MAGIC_ext, &goperl_foreign_vtbl);
+}
+/* The slot a store is about to replace: a value outside the memory in it
+ * is taken out, for the store not to drop it. */
+static void goperl_slot_unforeign(SV **slot) {
+    if (slot && goperl_foreign(*slot)) *slot = NULL;
+}
+
 static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64_t c,
                                    const char *s) {
     const int32_t op = GOPERL_OP_INTERNAL;
@@ -5638,9 +5685,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(uintptr_t)(SV *)newHV();
     case GOPERL_OP_NEW_RV_INC:
         return (uint64_t)(uintptr_t)newRV_inc(GOPERL_SVARG(a));
-    case GOPERL_OP_AV_PUSH: /* steals a ref, like the C API */
-        av_push(GOPERL_AVARG(a), GOPERL_STORED(b));
+    case GOPERL_OP_AV_PUSH: { /* steals a ref, like the C API */
+        AV *const av = GOPERL_AVARG(a);
+        av_push(av, goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b)));
         return 0;
+    }
     case GOPERL_OP_AV_LEN:
         return (uint64_t)(int64_t)av_len(GOPERL_AVARG(a));
     case GOPERL_OP_AV_FETCH: { /* -> the element; second: the address of
@@ -5649,8 +5698,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_STORE: { /* steals a ref */
-        hv_store(GOPERL_HVARG_COMMON(a), s ? s : "", (I32)strlen(s ? s : ""),
-                 GOPERL_STORED(b), 0);
+        HV *const hv = GOPERL_HVARG_COMMON(a);
+        const I32 klen = (I32)strlen(s ? s : "");
+        if (goperl_holds_foreign((SV *)hv)) goperl_slot_unforeign(hv_fetch(hv, s ? s : "", klen, 0));
+        hv_store(hv, s ? s : "", klen, goperl_store_into(aTHX_ (SV *)hv, GOPERL_STORED(b)), 0);
         return 0;
     }
     case GOPERL_OP_HV_FETCH: {
@@ -5823,9 +5874,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_GV_FETCH: /* a = flags, b = svtype */
         return (uint64_t)(uintptr_t)gv_fetchpv(s ? s : "", (I32)(int64_t)a,
                                                (svtype)(int64_t)b);
-    case GOPERL_OP_AV_STORE: /* b = sv, c = idx; takes ownership like the C API */
-        av_store(GOPERL_AVARG(a), (SSize_t)(int64_t)c, GOPERL_STORED(b));
+    case GOPERL_OP_AV_STORE: { /* b = sv, c = idx; takes ownership like the C API */
+        AV *const av = GOPERL_AVARG(a);
+        if (goperl_holds_foreign((SV *)av)) goperl_slot_unforeign(av_fetch(av, (SSize_t)(int64_t)c, 0));
+        av_store(av, (SSize_t)(int64_t)c, goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b)));
         return 0;
+    }
     case GOPERL_OP_AV_EXTEND:
         av_extend(GOPERL_AVARG(a), (SSize_t)(int64_t)b);
         return 0;
@@ -5848,7 +5902,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_HV_STORE_ENT: { /* b = keysv, c = sv; takes value
                  * ownership -> the HE token (callers treat NULL as failure
                  * and roll their reference back) */
-        HE *he = hv_store_ent(GOPERL_HVARG_COMMON(a), GOPERL_SVARG(b), GOPERL_STORED(c), 0U);
+        HV *const hv = GOPERL_HVARG_COMMON(a);
+        SV *const key = GOPERL_SVARG(b);
+        if (goperl_holds_foreign((SV *)hv)) {
+            HE *const was = hv_fetch_ent(hv, key, 0, 0U);
+            if (was) goperl_slot_unforeign(&HeVAL(was));
+        }
+        HE *he = hv_store_ent(hv, key, goperl_store_into(aTHX_ (SV *)hv, GOPERL_STORED(c)), 0U);
         return (uint64_t)(uintptr_t)he;
     }
     case GOPERL_OP_HV_EXISTS_ENT: /* b = keysv; c = more of hv_common's action
@@ -6401,7 +6461,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         AV *av = GOPERL_AVARG(a);
         SSize_t idx = (SSize_t)(int64_t)c;
         if (SvTYPE((SV *)av) == SVt_PVAV && idx >= 0 && idx <= AvMAX(av))
-            AvARRAY(av)[idx] = GOPERL_STORED(b);
+            AvARRAY(av)[idx] = goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b));
         return 0;
     }
 
@@ -6735,9 +6795,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * key length, s = the key's bytes; takes over the value
                  * ref -> stored SV token. hv_common with JUST_SV returns
                  * the SLOT (SV**). */
-        SV *val = GOPERL_STORED(b);
-        SV **svp = (SV **)hv_common(GOPERL_HVARG_COMMON(a), NULL, s ? s : "",
-                                    (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
+        HV *const hv = GOPERL_HVARG_COMMON(a);
+        const int kflags = (c >> 32) ? HVhek_UTF8 : 0;
+        if (goperl_holds_foreign((SV *)hv))
+            goperl_slot_unforeign((SV **)hv_common(hv, NULL, s ? s : "", (STRLEN)(uint32_t)c,
+                                                   kflags, HV_FETCH_JUST_SV, NULL, 0));
+        SV *val = goperl_store_into(aTHX_ (SV *)hv, GOPERL_STORED(b));
+        SV **svp = (SV **)hv_common(hv, NULL, s ? s : "",
+                                    (STRLEN)(uint32_t)c, kflags,
                                     HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val, 0);
         /* second: the address of the slot (HeVAL of the entry) */
         return goperl_two(svp ? (uint64_t)(uintptr_t)*svp : 0, GOPERL_ADDR(svp));
