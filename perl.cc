@@ -4981,7 +4981,9 @@ static void goperl_arg_refuse(pTHX_ int32_t op, uint64_t v, const char *what) {
 
 /* The scalar a number native code handed an operation is, NULL for 0. A
  * freed scalar is refused unless the operation reads its head alone
- * (freed). */
+ * (freed): a freed scalar has no flags left, and perl reads it as undef
+ * there, as Tk reads one it has freed (its Tcl_SetVar returns the scalar
+ * it frees, and asks SvROK and SvPOK of it). */
 static inline SV *goperl_sv_arg(pTHX_ uint64_t v, int32_t op, bool freed = false) {
     SV *const sv = (SV *)(uintptr_t)v;
     if (v && (!goperl_sv_head(aTHX_ sv) || (!freed && SvTYPE(sv) == (svtype)SVTYPEMASK)))
@@ -5475,7 +5477,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(uintptr_t)sv_bless(GOPERL_SVARG(a),
                                              GOPERL_HVARG(b));
     case GOPERL_OP_SV_RV: { /* SvRV token when SvROK, else 0 */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = goperl_sv_arg(aTHX_ a, op, true);
         return SvROK(sv) ? (uint64_t)(uintptr_t)SvRV(sv) : 0;
     }
     case GOPERL_OP_SV_TYPE: /* the raw svtype enum value (the SDK pins the same
@@ -5547,7 +5549,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return SvTRUE(GOPERL_SVARG(a)) ? 1 : 0;
     case GOPERL_OP_SV_INFO: { /* flag bitset (mirrored by the SDK's synthetic
                 * SVf_ / GOPERL_INFO_ constants) */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = goperl_sv_arg(aTHX_ a, op, true);
         uint64_t f = 0;
         if (SvOK(sv)) f |= GOPERL_INFO_OK;
         if (SvROK(sv)) f |= GOPERL_INFO_ROK;
