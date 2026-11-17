@@ -3679,14 +3679,35 @@ enum {
     GOPERL_INT_SIGACTION = 40,      /* b: a signal -> the program's action
                                      * of it: 0 the default, 1 ignored, 2 a
                                      * handler */
-    GOPERL_INT_WAIT_MASK = 41       /* a: 1 a wait of native code with a
+    GOPERL_INT_WAIT_MASK = 41,      /* a: 1 a wait of native code with a
                                      * signal mask begins, 0 it has ended;
                                      * b: the mask (the one to put back at
                                      * the end), or with c's high half 1 the
                                      * address of a sigset_t of this memory
                                      * -> the mask before; second: 1 when a
                                      * handler ran */
+    GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
+                                     * functions; a: the flags, and in its
+                                     * high half the operation
+                                     * (GOPERL_UTF8_*) | GOPERL_UTF8_MSGS
+                                     * when the messages are wanted; s+b:
+                                     * the bytes (up to the length the start
+                                     * byte announces), or b: the code point
+                                     * to encode -> the address of words:
+                                     * the result, the length (or -1), the
+                                     * errors, the messages (an AV or HV the
+                                     * caller owns, or 0), then the bytes of
+                                     * an encoded character */
 };
+/* The operations of INTERNAL UTF8, and the bit asking for the messages. */
+enum {
+    GOPERL_UTF8_DECODE = 0,     /* utf8n_to_uvchr_msgs of s+b with the flags */
+    GOPERL_UTF8_DECODE_BUF = 1, /* utf8_to_uvchr_buf of s+b */
+    GOPERL_UTF8_CHAR = 2,       /* isUTF8_CHAR_flags of s+b */
+    GOPERL_UTF8_PARTIAL = 3,    /* is_utf8_valid_partial_char_flags of s+b */
+    GOPERL_UTF8_ENCODE = 4      /* uvchr_to_utf8_flags_msgs of the code point b */
+};
+#define GOPERL_UTF8_MSGS 0x100
 /* The fields of PL_statcache (INTERNAL STATCACHE), in this order: dev, ino,
  * mode, nlink, uid, gid, rdev, size, atime, mtime, ctime, blksize, blocks. */
 #define GOPERL_STATCACHE_WORDS 13
@@ -5301,6 +5322,51 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SAVE_PLVAR:
         goperl_save_plvar(aTHX_ (int)lo, (int)b);
         return 0;
+    case GOPERL_INT_UTF8: {
+        /* perl's own, for what native code decodes, measures or encodes
+         * that perl's fast paths do not take: a malformation, a surrogate,
+         * a noncharacter, a code point above Unicode. Its warnings are
+         * perl's, at the statement running. */
+        static uint64_t w[4 + 2];
+        const U8 *const p = (const U8 *)(s ? s : "");
+        const uint32_t what = (uint32_t)(lo >> 32);
+        const U32 flags = (U32)lo;
+        STRLEN retlen = 0;
+        U32 errors = 0;
+        w[0] = w[1] = w[2] = w[3] = 0;
+        switch (what & 0xff) {
+        case GOPERL_UTF8_DECODE: {
+            AV *msgs = NULL;
+            w[0] = (uint64_t)utf8n_to_uvchr_msgs(p, (STRLEN)b, &retlen, flags, &errors,
+                                                 (what & GOPERL_UTF8_MSGS) ? &msgs : NULL);
+            w[3] = (uint64_t)(uintptr_t)msgs;
+            break;
+        }
+        case GOPERL_UTF8_DECODE_BUF:
+            w[0] = (uint64_t)utf8_to_uvchr_buf(p, p + b, &retlen);
+            break;
+        case GOPERL_UTF8_CHAR:
+            w[0] = (uint64_t)isUTF8_CHAR_flags(p, p + b, flags);
+            break;
+        case GOPERL_UTF8_PARTIAL:
+            w[0] = is_utf8_valid_partial_char_flags(p, p + b, flags) ? 1 : 0;
+            break;
+        case GOPERL_UTF8_ENCODE: {
+            HV *msgs = NULL;
+            U8 *const d = (U8 *)(w + 4);
+            const U8 *const end = uvchr_to_utf8_flags_msgs(d, (UV)b, (UV)flags,
+                                                           (what & GOPERL_UTF8_MSGS) ? &msgs : NULL);
+            retlen = end ? (STRLEN)(end - d) : (STRLEN)-1;
+            w[3] = (uint64_t)(uintptr_t)msgs;
+            break;
+        }
+        default:
+            croak("goperl: no UTF-8 operation %u", (unsigned)(what & 0xff));
+        }
+        w[1] = (uint64_t)retlen;
+        w[2] = (uint64_t)errors;
+        return GOPERL_ADDR(w);
+    }
     case GOPERL_INT_HASH: {
         U32 hash;
         PERL_HASH(hash, s ? s : "", (STRLEN)b);
