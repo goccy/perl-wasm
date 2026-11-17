@@ -56,6 +56,11 @@ int wasi_host_proc_signal_dispositions(uint64_t handled, uint64_t ignored, uint6
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_take")))
 int wasi_host_proc_signal_take(uint64_t *mask);
 
+/* 1 when the process ignores sig by an action that code outside the guest
+ * set (a native library's sigaction), 0 otherwise. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_signal_ignored")))
+int wasi_host_proc_signal_ignored(int sig);
+
 /* The real-time interval timer. state receives what the timer was before
  * the call: the nanoseconds until it fires next (0: not set) and its reload
  * interval (0: it fires once). When set is non-zero the timer is replaced
@@ -152,9 +157,25 @@ void report_dispositions() {
 
 void release_held();
 
+/* The process's action of a signal the program left at its default, when
+ * code outside the guest has made it SIG_IGN: native code shares the
+ * process with the program, and a network library ignores SIGPIPE when it
+ * is loaded, so that a reset peer is an error of the write. The action is
+ * the program's from then on, as it is in a process of one C library:
+ * sigaction reports it ($SIG{PIPE} reads IGNORE) and the signal is not
+ * delivered. */
+void adopt_process_action(int sig) {
+    if (g_actions[sig].handler != SIG_DFL || wasi_host_proc_signal_ignored(sig) != 1) return;
+    g_actions[sig].handler = SIG_IGN;
+    g_actions[sig].flags = 0;
+    g_actions[sig].mask = 0;
+    report_dispositions();
+}
+
 /* Delivers a signal that is not blocked: runs its handler, or takes its
  * default action. */
 void deliver(int sig) {
+    adopt_process_action(sig);
     const action act = g_actions[sig];
     if (act.handler == SIG_IGN) return;
     if (act.handler == SIG_DFL) {
@@ -335,6 +356,7 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
         errno = EINVAL;
         return -1;
     }
+    adopt_process_action(sig);
     const action prev = g_actions[sig];
     if (act) {
         if (sig == SIGKILL || sig == SIGSTOP) {
