@@ -3094,6 +3094,13 @@ static MAGIC *goperl_anchor_of(pTHX_ SV *sv) {
     return NULL;
 }
 
+/* The calls of uvar magic of native code's that are running: perl's hash
+ * access holds the uvar MAGIC across the call and writes to it after it
+ * (hv_magic_uvar_xkey), so the MAGIC must outlive the call whatever native
+ * code does in it (see goperl_uvar_drop). The scope of the call puts the
+ * count back, also when the call dies. */
+static I32 g_uvar_calls = 0;
+
 /* uvar magic of native code (sv_magic(sv, NULL, PERL_MAGIC_uvar, &uf, ...)):
  * the functions of the ufuncs this interpreter is given are these, and the
  * module's own are the host's to call. A hash calls uf_val with the kind
@@ -3102,6 +3109,9 @@ static MAGIC *goperl_anchor_of(pTHX_ SV *sv) {
  * ufuncs, which the host knows. */
 static I32 goperl_uvar_call(pTHX_ goperl_gword_t is_set, IV arg, SV *sv) {
     if (g_go_cb == 0) return 0;
+    ENTER;
+    SAVEI32(g_uvar_calls);
+    g_uvar_calls++;
     MAGIC *mg = mg_find(sv, PERL_MAGIC_uvar);
     const goperl_gword_t words[4] = {is_set, (goperl_gword_t)(int64_t)arg, GOPERL_ADDR(sv),
                                      GOPERL_ADDR(mg ? mg->mg_obj : NULL)};
@@ -3116,10 +3126,37 @@ static I32 goperl_uvar_call(pTHX_ goperl_gword_t is_set, IV arg, SV *sv) {
     /* the MAGIC may be another one by now */
     mg = mg_find(sv, PERL_MAGIC_uvar);
     if (mg) mg->mg_obj = (SV *)(uintptr_t)key;
+    LEAVE;
     return (I32)(int64_t)result;
 }
 static I32 goperl_uvar_val(pTHX_ IV arg, SV *sv) { return goperl_uvar_call(aTHX_ 0, arg, sv); }
 static I32 goperl_uvar_set(pTHX_ IV arg, SV *sv) { return goperl_uvar_call(aTHX_ 1, arg, sv); }
+
+/* The uvar magic of the value that stands for native code's (made by
+ * GOPERL_CALL_UVAR: its functions are the two above) goes once native code
+ * has taken its own off by relinking its chain (Variable::Magic's dispell
+ * unlinks its uvar MAGIC and calls mg_magical): on perl the value has no
+ * uvar magic left then. Freed as mg_free frees a uvar MAGIC that has the
+ * copy of its ufuncs that sv_magic made. Not while a call of uvar magic
+ * runs, which holds the MAGIC (g_uvar_calls): native code that dispells
+ * from its own uvar callback (Variable::Magic t/15-self.t) leaves the
+ * MAGIC, which calls nothing of native code's any more, to a later
+ * mg_magical. */
+static void goperl_uvar_drop(pTHX_ SV *sv) {
+    if (g_uvar_calls || SvTYPE(sv) < SVt_PVMG) return;
+    for (MAGIC *prev = NULL, *mg = SvMAGIC(sv); mg; prev = mg, mg = mg->mg_moremagic) {
+        if (mg->mg_type != PERL_MAGIC_uvar || !mg->mg_ptr) continue;
+        const struct ufuncs *uf = (const struct ufuncs *)mg->mg_ptr;
+        if (uf->uf_val != goperl_uvar_val && uf->uf_set != goperl_uvar_set) continue;
+        if (prev)
+            prev->mg_moremagic = mg->mg_moremagic;
+        else
+            SvMAGIC_set(sv, mg->mg_moremagic);
+        if (mg->mg_len > 0) Safefree(mg->mg_ptr);
+        Safefree(mg);
+        return;
+    }
+}
 
 /* ---- host-backed PerlIO layers (v7) --------------------------------------
  * A native module defines a layer with custom Pushed/Fill (the
@@ -7508,7 +7545,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVCALL_MG_GET: return (uint64_t)(int64_t)mg_get(sv);
         case GOPERL_SVCALL_MG_CLEAR: return (uint64_t)(int64_t)mg_clear(sv);
         case GOPERL_SVCALL_MG_FREE: return (uint64_t)(int64_t)mg_free(sv);
-        case GOPERL_SVCALL_MG_MAGICAL: mg_magical(sv); return 0;
+        case GOPERL_SVCALL_MG_MAGICAL: /* b bit 0: native code's chain has
+                 * no uvar magic any more (goperl_uvar_drop) */
+            if (b & 1) goperl_uvar_drop(aTHX_ sv);
+            mg_magical(sv);
+            return 0;
         case GOPERL_SVCALL_MG_SIZE: return (uint64_t)mg_size(sv);
         case GOPERL_SVCALL_BACKOFF: sv_backoff(sv); return 0;
         case GOPERL_SVCALL_UNREF: sv_unref_flags(sv, (U32)b); return 0;
