@@ -5636,8 +5636,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         HE *he = hv_store_ent(GOPERL_HVARG(a), GOPERL_SVARG(b), GOPERL_STORED(c), 0U);
         return (uint64_t)(uintptr_t)he;
     }
-    case GOPERL_OP_HV_EXISTS_ENT: /* b = keysv */
-        return hv_exists_ent(GOPERL_HVARG(a), GOPERL_SVARG(b), 0U) ? 1 : 0;
+    case GOPERL_OP_HV_EXISTS_ENT: /* b = keysv; c = more of hv_common's action
+                 * (HV_DISABLE_UVAR_XKEY: no uvar magic of the hash is asked,
+                 * as English::Name's own lookups ask it not to be) */
+        return hv_common(GOPERL_HVARG(a), GOPERL_SVARG(b), NULL, 0, 0,
+                         HV_FETCH_ISEXISTS | ((int)c & HV_DISABLE_UVAR_XKEY), NULL, 0)
+                   ? 1
+                   : 0;
     case GOPERL_OP_HE_VAL:
         return (uint64_t)(uintptr_t)HeVAL(GOPERL_MEMARG(HE, a));
     case GOPERL_OP_HV_ITERINIT:
