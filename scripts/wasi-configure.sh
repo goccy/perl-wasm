@@ -777,6 +777,11 @@ e = ("    PERL_FLUSHALL_FOR_CHILD;\n"
      "        value = (I32)do_aexec(really, MARK, SP);\n")
 g = "PP_wrapped(pp_fork, 0, 0)\n{\n#ifdef HAS_FORK\n    dSP; dTARGET;\n    Pid_t childpid;\n"
 o = "    tmps = SvPV_const(sv, len);\n    ok = do_open6(gv, tmps, len, NULL, MARK+1, (SP-MARK));\n"
+# dbmopen hands the open flags it ties with to TIEHASH, which takes the
+# numbers the program sees (a program that shows the host's numbers passes
+# the host's flags, and SDBM_File's TIEHASH turns them into the C
+# library's): the flags dbmopen makes are the program's numbers too.
+dbm = "PP_wrapped(pp_dbmopen, 3, 0)\n{\n"
 patch("pp_sys.c", [
     (g, g + "#ifdef PERL_WASI_SPAWN\n"
         "    {\n"
@@ -808,6 +813,15 @@ patch("pp_sys.c", [
         "    if (PL_op->op_flags & OPf_STACKED) {\n"
         "        SV * const really = *++MARK;\n"
         "        value = (I32)do_aexec(really, MARK, SP);\n", 1),
+    (dbm, "#ifdef PERL_WASI_SPAWN\n"
+        "extern UV wasi_program_open_flags(UV flags);\n"
+        "#define DBM_OPEN_FLAGS(f) wasi_program_open_flags(f)\n"
+        "#else\n"
+        "#define DBM_OPEN_FLAGS(f) (f)\n"
+        "#endif\n" + dbm, 1),
+    ("        mPUSHu(O_RDWR|O_CREAT);\n", "        mPUSHu(DBM_OPEN_FLAGS(O_RDWR|O_CREAT));\n", 1),
+    ("        mPUSHu(O_RDWR);\n", "        mPUSHu(DBM_OPEN_FLAGS(O_RDWR));\n", 1),
+    ("        mPUSHu(O_RDONLY);\n", "        mPUSHu(DBM_OPEN_FLAGS(O_RDONLY));\n", 1),
     (o, "    tmps = SvPV_const(sv, len);\n"
         "#ifdef PERL_WASI_SPAWN\n"
         "    {\n"
