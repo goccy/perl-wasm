@@ -558,6 +558,9 @@ OP *builtin_socket(pTHX) {
     slot_to_guest(aTHX_ SP - 2, FAMILY_af);
     SV *const type = *(SP - 1);
     *(SP - 1) = sv_2mortal(newSViv((IV)socktype_to_guest((long long)SvIV(type))));
+    /* The protocol of a Unix-domain socket is 0 or the number of its
+     * protocol family (PF_UNIX), which is a number of that family. */
+    if (SvIV(*(SP - 2)) == AF_UNIX) slot_to_guest(aTHX_ SP, FAMILY_af);
     return behind(aTHX);
 }
 
