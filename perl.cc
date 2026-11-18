@@ -4752,6 +4752,8 @@ enum {
 #define GOPERL_PL_SAVESTACK_MAX 121
 #define GOPERL_PL_TMPS_MAX 122
 #define GOPERL_PL_CATCH 123            /* CATCH_GET */
+#define GOPERL_PL_TOP_ENV 125          /* the address of PL_top_env's JMPENV */
+#define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
                                         * variables of the two stacks are
                                         * (goperl_pp_vars) */
@@ -6495,6 +6497,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_TMPS_MAX: return (uint64_t)(int64_t)PL_tmps_max;
         case GOPERL_PL_CATCH: return CATCH_GET ? 1 : 0;
         case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
+        case GOPERL_PL_TOP_ENV: return GOPERL_ADDR(PL_top_env);
+        case GOPERL_PL_RESTARTJMPENV: return GOPERL_ADDR(PL_restartjmpenv);
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -6638,6 +6642,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_LASTSTYPE: PL_laststype = (U16)b; return 0;
         case GOPERL_PL_STATNAME: PL_statname = GOPERL_SVARG(b); return 0;
         case GOPERL_PL_TMPS_FLOOR: PL_tmps_floor = (SSize_t)(int64_t)b; return 0;
+        /* native code that suspends a frame moves the index by itself (the
+         * scopes it takes along are left at the next unwind) */
+        case GOPERL_PL_SCOPESTACK_IX:
+            if ((int64_t)b < 0 || (int64_t)b > (int64_t)PL_scopestack_max)
+                Perl_croak(aTHX_ "goperl: PL_scopestack_ix set beyond the scope stack");
+            PL_scopestack_ix = (I32)(int64_t)b;
+            return 0;
         /* the indices of the two stacks, which native code moves when it
          * takes entries off itself or has added them in place */
         case GOPERL_PL_SAVESTACK_IX:
@@ -6652,6 +6663,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             PL_tmps_ix = (SSize_t)(int64_t)b;
             return 0;
         case GOPERL_PL_CURPM: PL_curpm = GOPERL_MEMARG(PMOP, b); return 0;
+        case GOPERL_PL_RESTARTJMPENV: PL_restartjmpenv = (JMPENV *)(uintptr_t)b; return 0;
         case GOPERL_PL_DEFSTASH: PL_defstash = GOPERL_HVARG(b); return 0;
         case GOPERL_PL_PARSER:
             if (!b) PL_parser = NULL;
@@ -9273,8 +9285,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * [oldscopesp][oldcop][oldpm][old_tmpsfloor], then by type:
                  * sub and format [cv][retop][olddepth][savearray]
                  * [prevcomppad]; eval [retop][old_namesv][cur_text][cv]
-                 * [old_eval_root]; loop [my_op] */
-            static goperl_gword_t w[16];
+                 * [old_eval_root], and at 15 [cur_top_env]; loop [my_op],
+                 * and at 15 [itervar_u][itersave][the two words of state_u] */
+            static goperl_gword_t w[20];
             const I32 ix = (I32)(int64_t)b;
             /* the context above the top is the one perl popped last, which
              * it leaves as it was (Variable::Magic reads its type): its type
@@ -9324,10 +9337,17 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 w[12] = GOPERL_ADDR(cx->blk_eval.cur_text);
                 w[13] = GOPERL_ADDR(cx->blk_eval.cv);
                 w[14] = GOPERL_ADDR(cx->blk_eval.old_eval_root);
+                w[15] = GOPERL_ADDR(cx->blk_eval.cur_top_env);
                 break;
             default:
-                if (CxTYPE_is_LOOP(cx))
+                if (CxTYPE_is_LOOP(cx)) {
                     w[10] = GOPERL_ADDR(cx->blk_loop.my_op);
+                    w[15] = GOPERL_ADDR(cx->blk_loop.itervar_u.svp);
+                    w[16] = GOPERL_ADDR(cx->blk_loop.itersave);
+                    static_assert(sizeof cx->blk_loop.state_u == 2 * sizeof(goperl_gword_t),
+                                  "state_u is two words");
+                    memcpy(&w[17], &cx->blk_loop.state_u, sizeof cx->blk_loop.state_u);
+                }
                 break;
             }
             return (uint64_t)(uintptr_t)w;
@@ -9422,12 +9442,25 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 case 12: cx->blk_eval.cur_text = GOPERL_SVARG(v); return 1;
                 case 13: cx->blk_eval.cv = GOPERL_CVARG(v); return 1;
                 case 14: cx->blk_eval.old_eval_root = GOPERL_MEMARG(OP, v); return 1;
+                case 15: cx->blk_eval.cur_top_env = (JMPENV *)(uintptr_t)v; return 1;
                 }
                 break;
             default:
-                if (CxTYPE_is_LOOP(cx) && w[1] == 10) {
-                    cx->blk_loop.my_op = (LOOP *)(uintptr_t)v;
+                if (!CxTYPE_is_LOOP(cx)) break;
+                switch (w[1]) {
+                case 10: cx->blk_loop.my_op = (LOOP *)(uintptr_t)v; return 1;
+                /* the iteration variable: the address of a pad slot, a glob
+                 * or a scalar, as the loop's flags say */
+                case 15: cx->blk_loop.itervar_u.svp = (SV **)(uintptr_t)v; return 1;
+                case 16: cx->blk_loop.itersave = (SV *)(uintptr_t)v; return 1;
+                case 17:
+                case 18: {
+                    goperl_gword_t st[2];
+                    memcpy(st, &cx->blk_loop.state_u, sizeof st);
+                    st[w[1] - 17] = v;
+                    memcpy(&cx->blk_loop.state_u, st, sizeof st);
                     return 1;
+                }
                 }
                 break;
             }
