@@ -3686,6 +3686,9 @@ enum {
                                      * address of a sigset_t of this memory
                                      * -> the mask before; second: 1 when a
                                      * handler ran */
+    GOPERL_INT_PADNAMELIST_NEW = 60, /* b: max -> newPADNAMELIST's list */
+    GOPERL_INT_PADNAMELIST_FREE = 61, /* a: the list: PadnamelistREFCNT_dec */
+    GOPERL_INT_PADNAME_OUTER = 62,  /* a: a pad name -> newPADNAMEouter's */
     GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
                                      * functions; a: the flags, and in its
                                      * high half the operation
@@ -3836,7 +3839,11 @@ enum {
     GOPERL_CALL_COP_SET = 6,      /* b = value, c = field<<32 */
     GOPERL_CALL_MESS_SV = 7,
     GOPERL_CALL_MG_FIND = 8, /* b = type -> the address of the words, or 0 */
-    GOPERL_CALL_ATOF = 9,    /* s = the text -> the bits of the NV */
+    GOPERL_CALL_ATOF = 9,    /* s = the text -> the bits of the NV; hi 1:
+                              * my_atof3 of the slen bytes of s, starting
+                              * from the NV whose bits are b -> the bits of
+                              * the NV; second: 1 + how many bytes the
+                              * number took, 0 where my_atof3 answers NULL */
     GOPERL_CALL_AMT = 10,    /* a = stash -> the address of the overload table's
                               * words: [flags][fallback][was_ok_sub][n], n CVs */
     GOPERL_CALL_UVAR = 11,   /* uvar magic whose functions are the host's */
@@ -3864,6 +3871,15 @@ enum {
     GOPERL_CALL_HASH_SEED = 31, /* -> the address of [count][the bytes] */
     GOPERL_CALL_LVALUE_SUB = 32, /* b: 0 is_lvalue_sub(), 1 LVRET (of the
                                   * entersub that called the XSUB) */
+    GOPERL_CALL_CALL_LIST = 100, /* a = the AV, b = oldscope: call_list */
+    GOPERL_CALL_HV_SCALAR = 101, /* a = the HV -> hv_scalar's SV */
+    GOPERL_CALL_PACKLIST = 102,  /* a = the SV packed into; s = [the length
+                                  * of the pattern][the number of values],
+                                  * the values (a word each), the pattern */
+    GOPERL_CALL_UNPACKSTRING = 103, /* s = [the length of the pattern], the
+                                  * pattern, then the string; hi = flags ->
+                                  * the address of the values, a word each;
+                                  * second: how many */
     GOPERL_CALL_CV_NAME = 27,   /* a = the CV (or glob), b = the SV to set or
                                  * 0, hi = flags -> cv_name's SV */
     GOPERL_CALL_MG_LIST = 26,   /* a = the SV -> the address of [number] and,
@@ -4398,7 +4414,17 @@ enum {
     GOPERL_CC_SPACE = 3,
     GOPERL_CC_DIGIT = 4,
     GOPERL_CC_ALPHA = 5,
-    GOPERL_CC_UPPER = 6
+    GOPERL_CC_UPPER = 6,
+    GOPERL_CC_LOWER = 100,
+    GOPERL_CC_CNTRL = 101,
+    GOPERL_CC_GRAPH = 102,
+    GOPERL_CC_PRINT = 103,
+    GOPERL_CC_PUNCT = 104,
+    GOPERL_CC_XDIGIT = 105,
+    GOPERL_CC_ALPHANUMERIC = 106,
+    GOPERL_CC_BLANK = 107,
+    GOPERL_CC_PSXSPC = 108,
+    GOPERL_CC_ASCII = 109
 };
 
 /* PLVAR_GET / PLVAR_SET interpreter-variable ids (the `a` argument). */
@@ -5549,6 +5575,13 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_PADNAME_FREE:
         if (lo) PadnameREFCNT_dec(GOPERL_MEMARG(PADNAME, lo));
         return 0;
+    case GOPERL_INT_PADNAMELIST_NEW:
+        return (uint64_t)(uintptr_t)newPADNAMELIST((size_t)b);
+    case GOPERL_INT_PADNAMELIST_FREE:
+        if (lo) PadnamelistREFCNT_dec(GOPERL_MEMARG(PADNAMELIST, lo));
+        return 0;
+    case GOPERL_INT_PADNAME_OUTER:
+        return lo ? (uint64_t)(uintptr_t)newPADNAMEouter(GOPERL_MEMARG(PADNAME, lo)) : 0;
     case GOPERL_INT_SAVE_FREEOP:
         if (lo) save_freeop(GOPERL_MEMARG(OP, lo));
         return 0;
@@ -6836,8 +6869,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     case GOPERL_OP_SV_UTF8_DECODE:
         return sv_utf8_decode(GOPERL_SVARG(a)) ? 1 : 0;
-    case GOPERL_OP_SV_UTF8_DOWNGRADE: /* b = fail_ok */
-        return sv_utf8_downgrade(GOPERL_SVARG(a), b ? TRUE : FALSE) ? 1 : 0;
+    case GOPERL_OP_SV_UTF8_DOWNGRADE: /* b = fail_ok; c: 0 (SV_GMAGIC), or
+                 * with its high half 1 the flags in its low half */
+        return sv_utf8_downgrade_flags(GOPERL_SVARG(a), b ? TRUE : FALSE,
+                                       (c >> 32) ? (U32)c : SV_GMAGIC)
+                   ? 1
+                   : 0;
     case GOPERL_OP_MG_SET: { /* SvSETMAGIC semantics: only a set-magical
                  * SV has a magic chain to run (SvMAGIC on smaller bodies
                  * reads past the struct). */
@@ -7433,6 +7470,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CC_DIGIT: return isDIGIT_uni(cp) ? 1 : 0;
         case GOPERL_CC_ALPHA: return isALPHA_uni(cp) ? 1 : 0;
         case GOPERL_CC_UPPER: return isUPPER_uni(cp) ? 1 : 0;
+        case GOPERL_CC_LOWER: return isLOWER_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_CNTRL: return isCNTRL_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_GRAPH: return isGRAPH_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_PRINT: return isPRINT_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_PUNCT: return isPUNCT_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_XDIGIT: return isXDIGIT_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_ALPHANUMERIC: return isALPHANUMERIC_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_BLANK: return isBLANK_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_PSXSPC: return isPSXSPC_uvchr(cp) ? 1 : 0;
+        case GOPERL_CC_ASCII: return isASCII_uvchr(cp) ? 1 : 0;
         }
         return 0;
     }
@@ -8468,6 +8515,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_PARSER:
         case GOPERL_CALL_ATOF:
         case GOPERL_CALL_COP_SET:
+        case GOPERL_CALL_UNPACKSTRING:
             break;
         default: (void)GOPERL_SVARG(a);
         }
@@ -8746,10 +8794,56 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return (uint64_t)(uintptr_t)w;
         }
         case GOPERL_CALL_ATOF: {
+            if (hi == 1) {
+                NV nv;
+                memcpy(&nv, &b, sizeof nv);
+                const char *const from = s ? s : "";
+                const char *const end = my_atof3(from, &nv, slen);
+                uint64_t bits;
+                memcpy(&bits, &nv, sizeof bits);
+                return goperl_two(bits, end ? (uint64_t)(end - from) + 1 : 0);
+            }
             const NV nv = my_atof(s ? s : "");
             uint64_t bits;
             memcpy(&bits, &nv, sizeof bits);
             return bits;
+        }
+        case GOPERL_CALL_CALL_LIST:
+            if (SvTYPE(sv) != SVt_PVAV)
+                Perl_croak(aTHX_ "call_list: native code passed a value that is not an array");
+            call_list((I32)(int64_t)b, (AV *)sv);
+            return 0;
+        case GOPERL_CALL_HV_SCALAR:
+            if (SvTYPE(sv) != SVt_PVHV)
+                Perl_croak(aTHX_ "hv_scalar: native code passed a value that is not a hash");
+            return (uint64_t)(uintptr_t)hv_scalar((HV *)sv);
+        case GOPERL_CALL_PACKLIST: {
+            static std::vector<SV *> values;
+            goperl_gword_t w[2];
+            if (!s || slen < sizeof w) return 0;
+            memcpy(w, s, sizeof w);
+            const size_t plen = (size_t)w[0], n = (size_t)w[1];
+            if (n > (slen - sizeof w) / sizeof(goperl_gword_t) ||
+                plen > slen - sizeof w - n * sizeof(goperl_gword_t))
+                return 0;
+            values.resize(n + 1);
+            for (size_t i = 0; i < n; i++) {
+                goperl_gword_t t;
+                memcpy(&t, s + sizeof w + i * sizeof t, sizeof t);
+                values[i] = GOPERL_SVARG(t);
+            }
+            const char *const pat = s + sizeof w + n * sizeof(goperl_gword_t);
+            packlist(sv, pat, pat + plen, values.data(), values.data() + n);
+            return 0;
+        }
+        case GOPERL_CALL_UNPACKSTRING: {
+            goperl_gword_t plen;
+            if (!s || slen < sizeof plen) return 0;
+            memcpy(&plen, s, sizeof plen);
+            if (plen > slen - sizeof plen) return 0;
+            const char *const pat = s + sizeof plen;
+            const SSize_t count = unpackstring(pat, pat + plen, pat + plen, s + slen, hi);
+            return goperl_two(goperl_call_results(aTHX_ (I32)count), (uint32_t)count);
         }
         case GOPERL_CALL_AMT: {
             static goperl_gword_t w[4 + NofAMmeth];
