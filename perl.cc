@@ -40,6 +40,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <malloc.h>
 
 extern "C" {
 #include <EXTERN.h>
@@ -4352,7 +4353,9 @@ enum {
     GOPERL_SVSLOT_PV = 5,
     GOPERL_SVSLOT_LEN = 6,
     GOPERL_SVSLOT_GV_STASH = 7,
-    GOPERL_SVSLOT_GV_CVGEN = 8
+    GOPERL_SVSLOT_GV_CVGEN = 8,
+    GOPERL_SVSLOT_AV_ARRAY_WORD = 9 /* AvARRAY given a word that is no body
+                                     * (Math::Pari's chain of objects) */
 };
 
 /* What the SDK stores in the buffer slot of an SV whose buffer is a
@@ -4461,8 +4464,11 @@ enum {
     GOPERL_SVCALL_NUMCMP = 62, /* as CMP, numerically (sv_numcmp_flags) */
     GOPERL_SVCALL_INC = 63,    /* sv_inc; b: 1 without get magic */
     GOPERL_SVCALL_AV_BODY = 59 /* the body of an array as it is in memory:
-                 * AvARRAY; second: the number of elements (AvFILLp + 1).
-                 * Native code reads the slots there in one go. */
+                 * AvARRAY; second: the number of elements (AvFILLp + 1),
+                 * or bit 63 when the slot holds a word that is no body of
+                 * the array's (native code keeps one of its own there:
+                 * Math::Pari). Native code reads the slots there in one
+                 * go. */
 };
 
 /* GV_CALL selectors: the ones below FIRST_CV take a glob, the rest a CV. */
@@ -7877,6 +7883,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVSLOT_GV_CVGEN:
             if (isGV_with_GP(sv)) GvCVGEN((GV *)sv) = (U32)b;
             return 0;
+        case GOPERL_SVSLOT_AV_ARRAY_WORD:
+            /* the slot holds the word: perl reads no element through it
+             * while AvFILLp says so, and frees AvALLOC, not AvARRAY */
+            if (SvTYPE(sv) != SVt_PVAV) Perl_croak(aTHX_ "goperl: AvARRAY of something that is no array");
+            AvARRAY((AV *)sv) = (SV **)(uintptr_t)b;
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown sv slot %d", (int)c);
     }
@@ -8211,6 +8223,15 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             }
             AV *const av = (AV *)sv;
             const SSize_t n = AvFILLp(av) + 1;
+            /* the body lies in the block AvALLOC allocated (both NULL for
+             * an array that never had one; its end for one whose elements were
+             * all shifted off); anything else in the slot is a
+             * word native code keeps there */
+            const char *const arr = (const char *)AvARRAY(av);
+            const char *const alloc = (const char *)AvALLOC(av);
+            const bool body = arr == alloc ||
+                              (alloc && arr > alloc && arr <= alloc + malloc_usable_size((void *)alloc));
+            if (!body) return goperl_two(GOPERL_ADDR(AvARRAY(av)), (uint64_t)1 << 63);
             return goperl_two(GOPERL_ADDR(AvARRAY(av)), (uint64_t)(n > 0 ? n : 0));
         }
         case GOPERL_SVCALL_UTF8_UPGRADE:
