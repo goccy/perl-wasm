@@ -67,7 +67,10 @@
       "-Wl,--wrap=clearenv",
       "-Wl,--wrap=setlocale",
       "-Wl,--wrap=waitpid",
-      "-Wl,--wrap=strerror"
+      "-Wl,--wrap=strerror",
+      "-Wl,--wrap=write",
+      "-Wl,--wrap=writev",
+      "-Wl,--wrap=send"
     ]
   },
   "user_selection": {

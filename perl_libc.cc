@@ -25,6 +25,8 @@
 #include <netdb.h> /* struct hostent */
 #include <sys/resource.h>
 #include <sys/utsname.h>
+#include <sys/uio.h>
+#include <sys/socket.h>
 #include "scripts/include/termios.h"
 #include <time.h>
 #include <unistd.h>
@@ -850,6 +852,43 @@ extern "C" long goperl_syscall(const unsigned long *a, int items, unsigned long 
                                          (unsigned int)(addresses >> 1), &result);
     if (rc != 0) return fail(-rc);
     return (long)result;
+}
+
+/* ---- the SIGPIPE of a write ----------------------------------------------
+ * A write into a pipe or socket nobody reads any more fails with EPIPE, and
+ * the host posts the program SIGPIPE as well. The kernel delivers that
+ * signal before the call returns: its default action ends the process
+ * there (perl dies of it, status 141, at the flush at its end), and
+ * perl's handler only marks it for the next op. So the posted signals are
+ * delivered as such a call returns (perl_signal.cc). The C library's calls
+ * are wrapped at link time (wasmify.json, --wrap). */
+extern "C" void perl_signal_after_call(void);
+extern "C" ssize_t __real_write(int fd, const void *buf, size_t count);
+extern "C" ssize_t __wrap_write(int fd, const void *buf, size_t count) {
+    const ssize_t r = __real_write(fd, buf, count);
+    if (r < 0 && errno == EPIPE) {
+        perl_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
+}
+extern "C" ssize_t __real_writev(int fd, const struct iovec *iov, int count);
+extern "C" ssize_t __wrap_writev(int fd, const struct iovec *iov, int count) {
+    const ssize_t r = __real_writev(fd, iov, count);
+    if (r < 0 && errno == EPIPE) {
+        perl_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
+}
+extern "C" ssize_t __real_send(int fd, const void *buf, size_t len, int flags);
+extern "C" ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
+    const ssize_t r = __real_send(fd, buf, len, flags);
+    if (r < 0 && errno == EPIPE) {
+        perl_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
 }
 
 int tcgetattr(int fd, struct termios *settings) {

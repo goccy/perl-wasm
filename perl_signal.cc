@@ -451,6 +451,14 @@ uint64_t perl_signal_native_mask(int kind, uint64_t mask) {
     return was;
 }
 
+/* What the host posted while a call of the program's was made, delivered
+ * as the call returns: a signal the call itself raised (SIGPIPE, which a
+ * write into a pipe nobody reads raises) is delivered before the call
+ * returns, as the kernel delivers it to a process of its own. */
+void perl_signal_after_call(void) {
+    absorb_posted();
+}
+
 int sigpending(sigset_t *set) {
     absorb_posted(); /* the host holds the blocked signals it recorded */
     return set_assign(set, g_held);
