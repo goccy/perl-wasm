@@ -3929,8 +3929,15 @@ enum {
     GOPERL_CX_DUMP = 0,     /* b = index -> address of the fields, or 0 */
     GOPERL_CX_DOUNWIND = 1, /* b = index */
     GOPERL_CX_MAX = 2,      /* cxstack_max */
-    GOPERL_CX_SET = 3       /* s = words [index][field][value]: a field of
+    GOPERL_CX_SET = 3,      /* s = words [index][field][value]: a field of
                              * the context, numbered as CX_DUMP's words */
+    GOPERL_CX_PUSHBLOCK = 4, /* s = words [type][gimme][saveix]: cx_pushblock
+                              * with the stack as it is -> the new index */
+    GOPERL_CX_PUSHEVAL = 5,  /* s = words [index][retop][namesv]: cx_pusheval
+                              * of the top context, which is index */
+    GOPERL_CX_POPEVAL = 6,   /* b = index of the top context: cx_popeval */
+    GOPERL_CX_POPBLOCK = 7,  /* b = index of the top context: cx_popblock */
+    GOPERL_CX_POP = 8        /* b = index of the top context: CX_POP */
 };
 
 /* PERLIO selectors: the handle functions of perlio.h. */
@@ -6111,6 +6118,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_DIEHOOK: PL_diehook = GOPERL_SVARG(b); return 0;
         case GOPERL_PL_WARNHOOK: PL_warnhook = GOPERL_SVARG(b); return 0;
         case GOPERL_PL_PERLDB: PL_perldb = (int)(int64_t)b; return 0;
+        case GOPERL_PL_IN_EVAL: PL_in_eval = (U8)b; return 0;
         case GOPERL_PL_DBSUB: PL_DBsub = GOPERL_GVARG(b); return 0;
         case GOPERL_PL_DBSINGLE: PL_DBsingle = GOPERL_SVARG(b); return 0;
         case GOPERL_PL_ENDAV: PL_endav = GOPERL_AVARG(b); return 0;
@@ -8723,6 +8731,45 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         case GOPERL_CX_MAX:
             return si ? (uint64_t)(int64_t)si->si_cxmax : 0;
+        case GOPERL_CX_PUSHBLOCK: { /* native code pushes a context, as
+                 * Syntax::Keyword::Defer pretends an eval {} around a defer
+                 * block: on the current stackinfo, with the stack as it is
+                 * (native code's own has been handed back) */
+            goperl_gword_t w[3] = {0, 0, 0};
+            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short context push");
+            memcpy(w, s, sizeof w);
+            if (si != PL_curstackinfo)
+                Perl_croak(aTHX_ "goperl: a context is pushed on the current stackinfo only");
+            cx_pushblock((U8)w[0], (U8)w[1], PL_stack_sp, (I32)(int64_t)w[2]);
+            return (uint64_t)(int64_t)cxstack_ix;
+        }
+        case GOPERL_CX_PUSHEVAL: {
+            goperl_gword_t w[3] = {0, 0, 0};
+            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short eval context push");
+            memcpy(w, s, sizeof w);
+            if (si != PL_curstackinfo || (I32)(int64_t)w[0] != cxstack_ix || cxstack_ix < 0)
+                Perl_croak(aTHX_ "goperl: cx_pusheval is given a context that is not the top one");
+            cx_pusheval(&cxstack[cxstack_ix], w[1] ? GOPERL_MEMARG(OP, w[1]) : NULL,
+                        w[2] ? GOPERL_SVARG(w[2]) : NULL);
+            return 0;
+        }
+        case GOPERL_CX_POPEVAL:
+        case GOPERL_CX_POPBLOCK:
+        case GOPERL_CX_POP: {
+            if (si != PL_curstackinfo || (I32)(int64_t)b != cxstack_ix || cxstack_ix < 0)
+                Perl_croak(aTHX_ "goperl: a context is popped from the top only");
+            PERL_CONTEXT *cx = &cxstack[cxstack_ix];
+            if (c == GOPERL_CX_POPEVAL) {
+                if (CxTYPE(cx) != CXt_EVAL)
+                    Perl_croak(aTHX_ "goperl: cx_popeval of a context that is not an eval");
+                cx_popeval(cx);
+            } else if (c == GOPERL_CX_POPBLOCK) {
+                cx_popblock(cx);
+            } else {
+                CX_POP(cx);
+            }
+            return 0;
+        }
         case GOPERL_CX_SET: { /* native code stored into a context, as code
                  * compiled against perl's headers does (cx->blk_sub.retop =
                  * op): the field takes the value, nothing else happens */
