@@ -36,12 +36,27 @@
 
 extern char **environ;
 
+/* Where the failure to start a command is told, as perl tells it (doio.c,
+ * S_exec_failed: "Can't exec", under the exec warnings). */
+enum wasi_exec_failure {
+    /* nowhere: libc's execv and execvp, whose callers say what they say */
+    WASI_EXEC_QUIET,
+    /* in this process: exec, whose failure leaves the program running */
+    WASI_EXEC_IN_PLACE,
+    /* in the child perl forks for the command: system, a piped open and
+     * backticks (wasi_exec_failed_in_child) */
+    WASI_EXEC_IN_CHILD
+};
+static void wasi_exec_failed_in_child(const char *file, int err, int child_stdout,
+                                      int child_stderr);
+
 /* Starts the program file with the arguments argv. child_stdin /
  * child_stdout / child_stderr name the fds of this process that become the
  * command's fds 0 / 1 / 2; a negative one stands for this process's own fd
- * of that number. Returns the pid, or -1 with errno set. */
+ * of that number. how says where a failure is told. Returns the pid, or -1
+ * with errno set. */
 static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_stdin,
-                             int child_stdout, int child_stderr = -1) {
+                             int child_stdout, int child_stderr, int how) {
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     /* Default the child's stdio to the guest's CURRENT fds 0/1/2, not the
@@ -57,12 +72,17 @@ static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_std
     int rc = posix_spawnp(&pid, file, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
-        /* What perl's child says when its exec fails (doio.c,
-         * S_exec_failed), for system, exec and a piped open alike; a file
-         * that is no program (ENOEXEC) goes to the shell instead. */
-        if (rc != ENOEXEC) {
+        /* What perl says when its exec fails (doio.c, S_exec_failed); a
+         * file that is no program (ENOEXEC) goes to the shell instead, as
+         * execvp does. */
+        if (rc != ENOEXEC && how != WASI_EXEC_QUIET) {
             dTHX;
-            Perl_ck_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s", file, Strerror(rc));
+            if (ckWARN(WARN_EXEC)) {
+                if (how == WASI_EXEC_IN_PLACE)
+                    Perl_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s", file, Strerror(rc));
+                else
+                    wasi_exec_failed_in_child(file, rc, child_stdout, child_stderr);
+            }
         }
         errno = rc;
         return -1;
@@ -72,18 +92,18 @@ static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_std
 
 /* The usual case: the program is named by the first argument. */
 static pid_t wasi_spawn_argv(char *const argv[], int child_stdin,
-                             int child_stdout, int child_stderr = -1) {
-    return wasi_spawn_file(argv[0], argv, child_stdin, child_stdout, child_stderr);
+                             int child_stdout, int child_stderr, int how) {
+    return wasi_spawn_file(argv[0], argv, child_stdin, child_stdout, child_stderr, how);
 }
 
 static pid_t wasi_spawn_shell(const char *cmd, int child_stdin,
-                              int child_stdout) {
+                              int child_stdout, int how) {
     char *argv[4];
     argv[0] = (char *)"/bin/sh";
     argv[1] = (char *)"-c";
     argv[2] = (char *)cmd;
     argv[3] = NULL;
-    return wasi_spawn_argv(argv, child_stdin, child_stdout);
+    return wasi_spawn_argv(argv, child_stdin, child_stdout, -1, how);
 }
 
 /* Starts a command given as ONE string, by the rule of perl's own exec of a
@@ -104,7 +124,7 @@ static pid_t wasi_spawn_shell(const char *cmd, int child_stdin,
  * Returns the pid, or -1 with errno set. A command with no word in it
  * starts nothing: -1 with errno 0, and *blank set. */
 static pid_t wasi_spawn_command(const char *incmd, int child_stdin,
-                                int child_stdout, bool *blank) {
+                                int child_stdout, bool *blank, int how) {
     *blank = false;
     while (*incmd && isSPACE(*incmd)) incmd++;
     const size_t len = strlen(incmd);
@@ -163,11 +183,11 @@ static pid_t wasi_spawn_command(const char *incmd, int child_stdin,
             *blank = true;
             errno = 0;
         } else {
-            pid = wasi_spawn_argv(argv, child_stdin, child_stdout, child_stderr);
+            pid = wasi_spawn_argv(argv, child_stdin, child_stdout, child_stderr, how);
             if (pid < 0 && errno == ENOEXEC) shell = true; /* a script without #! */
         }
     }
-    if (shell) pid = wasi_spawn_shell(incmd, child_stdin, child_stdout);
+    if (shell) pid = wasi_spawn_shell(incmd, child_stdin, child_stdout, how);
     const int e = errno;
     free(cmd);
     free(argv);
@@ -247,7 +267,7 @@ extern "C" int wasi_host_proc_exec_next(int on);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
 extern "C" void wasi_host_proc_terminate(int sig);
 
-enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2 };
+enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2, WASI_FORK_EXEC_FAILED = 3 };
 static struct {
     int kind;
     OP *resume_op;
@@ -257,6 +277,13 @@ static struct {
     int parent_end;
     int stdio_fd;
     SSize_t return_sp;
+    /* exec-failed only: the program that could not be started, why, and
+     * the fds of the parent that are the command's stdout and stderr (-1
+     * for the parent's own) */
+    const char *exec_file;
+    int exec_errno;
+    int exec_stdout;
+    int exec_stderr;
 } wasi_fork_point;
 
 /* Set by pp_open just before do_open6 (configure patch): the stack height
@@ -340,7 +367,7 @@ extern "C" clock_t times(struct tms *buf) {
  * Only the parent ever returns from this. */
 static pid_t wasi_fork_here(pTHX_ int kind) {
     wasi_fork_point.kind = kind;
-    wasi_fork_point.resume_op = PL_op->op_next;
+    wasi_fork_point.resume_op = PL_op ? PL_op->op_next : NULL;
     int pid = -1;
     int rc = wasi_host_proc_fork(&pid);
     wasi_fork_point.kind = WASI_FORK_NONE;
@@ -349,6 +376,33 @@ static pid_t wasi_fork_here(pTHX_ int kind) {
         return -1;
     }
     return (pid_t)pid;
+}
+
+/* A command that system, a piped open or backticks could not start. perl
+ * forks first, and the child's exec fails: the child says "Can't exec"
+ * (doio.c, S_exec_failed), in its copy of the program — its
+ * $SIG{__WARN__}, the warnings in scope — with the command's standard
+ * handles (a piped open's pipe, the stderr of a trailing 2>&1), and ends;
+ * nothing it does reaches the parent, whose handler records nothing. A
+ * pseudo-process is that child here (wasi_fork_child_run says it), and
+ * this process waits for it as perl's parent waits for its child. Called
+ * only when the warning is on: the child would find it on as this process
+ * does, and say nothing otherwise. Where no pseudo-process can be made,
+ * nothing is said. */
+static void wasi_exec_failed_in_child(const char *file, int err, int child_stdout,
+                                      int child_stderr) {
+    dTHX;
+    PERL_FLUSHALL_FOR_CHILD;
+    wasi_fork_point.exec_file = file;
+    wasi_fork_point.exec_errno = err;
+    wasi_fork_point.exec_stdout = child_stdout;
+    wasi_fork_point.exec_stderr = child_stderr;
+    const pid_t pid = wasi_fork_here(aTHX_ WASI_FORK_EXEC_FAILED);
+    if (pid > 0) {
+        int status;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
 }
 
 /* pp_fork (configure patch routes the whole op here). */
@@ -429,6 +483,11 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
             }
             SP = PL_stack_base + wasi_fork_point.return_sp;
             XPUSHs(&PL_sv_zero);
+        } else if (kind == WASI_FORK_EXEC_FAILED) {
+            /* the child of a command that could not be started: its
+             * standard handles are the command's */
+            if (wasi_fork_point.exec_stdout >= 0) dup2(wasi_fork_point.exec_stdout, 1);
+            if (wasi_fork_point.exec_stderr >= 0) dup2(wasi_fork_point.exec_stderr, 2);
         } else {
             mPUSHi(0);
         }
@@ -443,6 +502,15 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     JMPENV_PUSH(ret);
     switch (ret) {
     case 0:
+        if (kind == WASI_FORK_EXEC_FAILED) {
+            /* what perl's child does when its exec fails: it says so, and
+             * ends without anything of the program running (a handler
+             * that dies inside an eval the child inherited carries on
+             * from there, below, as perl's child does) */
+            Perl_warner(aTHX_ packWARN(WARN_EXEC), "Can't exec \"%s\": %s", wasi_fork_point.exec_file,
+                        Strerror(wasi_fork_point.exec_errno));
+            PerlProc__exit(1);
+        }
     redo_body:
         if (PL_op) CALLRUNOPS(aTHX);
         /* A process forked while a file was being compiled (in a BEGIN
@@ -541,7 +609,7 @@ extern "C" int execv(const char *path, char *const argv[]) {
 
 extern "C" int execvp(const char *file, char *const argv[]) {
     wasi_host_proc_exec_next(1);
-    const pid_t pid = wasi_spawn_file(file, argv, -1, -1);
+    const pid_t pid = wasi_spawn_file(file, argv, -1, -1, -1, WASI_EXEC_QUIET);
     if (pid < 0) {
         const int e = errno;
         wasi_host_proc_exec_next(0);
@@ -560,7 +628,7 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         /* exec STRING */
         bool blank = false;
         wasi_host_proc_exec_next(1);
-        pid = wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank);
+        pid = wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank, WASI_EXEC_IN_PLACE);
         if (blank) {
             wasi_host_proc_exec_next(0);
             return; /* nothing to run: exec fails, as perl's does */
@@ -584,7 +652,7 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
         wasi_host_proc_exec_next(1);
-        pid = wasi_spawn_argv(argv, -1, -1);
+        pid = wasi_spawn_argv(argv, -1, -1, -1, WASI_EXEC_IN_PLACE);
         free(argv);
     }
     if (pid < 0) {
@@ -631,14 +699,14 @@ extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {
     if (Perl_PerlProc_pipe_cloexec(aTHX_ p) < 0) return NULL;
     const bool reading = (*mode == 'r');
     bool blank = false;
-    pid_t pid = reading ? wasi_spawn_command(cmd, -1, p[1], &blank)
-                        : wasi_spawn_command(cmd, p[0], -1, &blank);
+    pid_t pid = reading ? wasi_spawn_command(cmd, -1, p[1], &blank, WASI_EXEC_IN_CHILD)
+                        : wasi_spawn_command(cmd, p[0], -1, &blank, WASI_EXEC_IN_CHILD);
     if (blank) {
         /* perl's forked child finds nothing to exec and exits with status
          * 1; the open itself succeeds. A shell that does just that stands
          * in for the child. */
-        pid = reading ? wasi_spawn_shell("exit 1", -1, p[1])
-                      : wasi_spawn_shell("exit 1", p[0], -1);
+        pid = reading ? wasi_spawn_shell("exit 1", -1, p[1], WASI_EXEC_IN_CHILD)
+                      : wasi_spawn_shell("exit 1", p[0], -1, WASI_EXEC_IN_CHILD);
     }
     if (pid < 0) {
         const int e = errno;
@@ -672,8 +740,8 @@ extern "C" PerlIO *wasi_spawn_popen_list(pTHX_ const char *mode, int n,
         return NULL;
     }
     const bool reading = (*mode == 'r');
-    pid_t pid = reading ? wasi_spawn_argv(argv, -1, p[1])
-                        : wasi_spawn_argv(argv, p[0], -1);
+    pid_t pid = reading ? wasi_spawn_argv(argv, -1, p[1], -1, WASI_EXEC_IN_CHILD)
+                        : wasi_spawn_argv(argv, p[0], -1, -1, WASI_EXEC_IN_CHILD);
     free(argv);
     if (pid < 0) {
         close(p[0]);
@@ -708,7 +776,7 @@ static int wasi_spawn_wait(pTHX_ pid_t pid) {
 extern "C" int do_spawn(char *cmd) {
     dTHX;
     bool blank = false;
-    pid_t pid = wasi_spawn_command(cmd, -1, -1, &blank);
+    pid_t pid = wasi_spawn_command(cmd, -1, -1, &blank, WASI_EXEC_IN_CHILD);
     /* perl's forked child finds nothing to exec and exits with status 255 */
     if (blank) return 255 << 8;
     if (pid < 0) return -1;
@@ -729,7 +797,7 @@ extern "C" int do_aspawn(void *vreally, void **mark, void **sp) {
     argv[out] = NULL;
     if (really && SvPOK(really) && SvCUR(really))
         argv[0] = SvPV_nolen(really);
-    pid_t pid = wasi_spawn_argv(argv, -1, -1);
+    pid_t pid = wasi_spawn_argv(argv, -1, -1, -1, WASI_EXEC_IN_CHILD);
     free(argv);
     if (pid < 0) return -1;
     return wasi_spawn_wait(aTHX_ pid);
