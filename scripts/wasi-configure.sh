@@ -352,10 +352,11 @@ d_ip_mreq='define'
 d_ip_mreq_source='define'
 d_ipv6_mreq='define'
 
-# vfork / raw syscall / wait4: no wasmify stub. Perl falls back (fork; no
-# syscall; waitpid instead of wait4).
+# vfork / wait4: no wasmify stub. Perl falls back (fork; waitpid instead
+# of wait4). syscall() is the host's raw system call (pp_syscall calls
+# goperl_syscall, perl_libc.cc, below).
 d_vfork='undef'
-d_syscall='undef'
+d_syscall='define'
 d_wait4='undef'
 # No System V IPC under wasi (sys/ipc.h, sys/msg.h, sys/sem.h, sys/shm.h).
 # perl.h gates these headers on HAS_SEM/HAS_MSG/HAS_SHM (d_sem/d_msg/d_shm), not
@@ -1257,6 +1258,43 @@ else:
         t = t.replace(old, new)
     open(path, "w").write(t)
     print(f"process addresses of 'p' and 'P' applied to {path}")
+PYPATCH
+# ---- pp_sys.c: syscall() is the host's ----------------------------------------
+# perl's syscall() hands the host's system call its arguments: numbers, or
+# for a string the address of its buffer, which is an address of this
+# memory and has to become the process's. pp_syscall tells goperl_syscall
+# (perl_libc.cc) which arguments are such addresses; the C library has no
+# syscall() to call. Idempotent.
+python3 - <<'PYPATCH'
+path = "pp_sys.c"
+t = open(path).read()
+if "goperl_syscall" in t:
+    print(f"the host's syscall already present in {path}")
+else:
+    for old, new in [
+        ("    unsigned long a[20];\n    I32 i = 0;\n    IV retval = -1;\n",
+         "    unsigned long a[20];\n    I32 i = 0;\n    IV retval = -1;\n"
+         "    unsigned long goperl_addresses = 0;\n"
+         "    extern long goperl_syscall(const unsigned long *a, int items, unsigned long addresses);\n"),
+        ("        else\n            a[i++] = (unsigned long)SvPV_force_nolen(*MARK);\n",
+         "        else {\n"
+         "            goperl_addresses |= 1UL << i;\n"
+         "            a[i++] = (unsigned long)SvPV_force_nolen(*MARK);\n"
+         "        }\n"),
+    ]:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    start = t.index("    switch (items) {\n    default:\n        DIE(aTHX_ \"Too many args to syscall\");\n")
+    end = t.index("    SP = ORIGMARK;\n    PUSHi(retval);\n", start)
+    t = (t[:start] +
+         "    if (items > 8)\n"
+         "        DIE(aTHX_ \"Too many args to syscall\");\n"
+         "    if (items == 0)\n"
+         "        DIE(aTHX_ \"Too few args to syscall\");\n"
+         "    retval = goperl_syscall(a, (int)items, goperl_addresses);\n" +
+         t[end:])
+    open(path, "w").write(t)
+    print(f"the host's syscall applied to {path}")
 PYPATCH
 # ---- op.c: the ops whose memory goes back are reported -------------------------
 # The XS bridge tells the host which of the ops it described were freed

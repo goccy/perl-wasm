@@ -83,6 +83,15 @@ int wasi_host_proc_setsid(int *sid_out);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_getattr")))
 int wasi_host_tty_getattr(int fd, struct termios *settings);
 
+/* The host's system call of the number with nargs (at most six) arguments
+ * at args, an argument whose bit is set in addresses being an address of
+ * this memory, which the host makes the process's; its result is written
+ * at result. 0 or a negative errno: -ENOSYS for a program that is not the
+ * host process. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sys_syscall")))
+int wasi_host_sys_syscall(long long number, const unsigned long long *args, int nargs,
+                          unsigned int addresses, long long *result);
+
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("tty_setattr")))
 int wasi_host_tty_setattr(int fd, int actions, const struct termios *settings);
 
@@ -821,6 +830,26 @@ char *ctermid(char *buf) {
     if (!buf) buf = name;
     strcpy(buf, "/dev/tty");
     return buf;
+}
+
+/* perl's syscall() (pp_sys.c, scripts/wasi-configure.sh): a[0] is the
+ * number and a[1..items-1] its arguments, those whose bit (by their index
+ * in a) is set in addresses the addresses of strings of this memory. More
+ * than six arguments no system call takes. -1 with errno set on failure,
+ * as syscall(2). */
+extern "C" long goperl_syscall(const unsigned long *a, int items, unsigned long addresses) {
+    unsigned long long args[6] = {0, 0, 0, 0, 0, 0};
+    const int nargs = items - 1;
+    if (nargs < 0 || nargs > 6) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (int i = 0; i < nargs; i++) args[i] = (unsigned long long)a[i + 1];
+    long long result = 0;
+    const int rc = wasi_host_sys_syscall((long long)a[0], args, nargs,
+                                         (unsigned int)(addresses >> 1), &result);
+    if (rc != 0) return fail(-rc);
+    return (long)result;
 }
 
 int tcgetattr(int fd, struct termios *settings) {
