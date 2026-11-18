@@ -3877,6 +3877,13 @@ enum {
                                      * with the op's own pp function first */
     GOPERL_INT_SAVE_AELEM = 44,     /* a: an array; b: flags<<32 | the index:
                                      * save_aelem_flags of the element */
+    GOPERL_INT_MROMETA = 46,        /* a: a stash, b: 1 to make one -> the
+                                     * address of its struct mro_meta, or 0 */
+    GOPERL_INT_MRO_RESOLVE = 47,    /* a: a stash, b: a struct mro_alg's
+                                     * address, c's high half: the level ->
+                                     * what the algorithm resolves (an AV) */
+    GOPERL_INT_MRO_BY_NAME = 48,    /* a: a name -> the registered struct
+                                     * mro_alg of that name's address, or 0 */
     GOPERL_INT_OP_MIRROR = 45,      /* a: the copy made before, or 0; s+b:
                                      * words [type | flags<<16 |
                                      * private<<24][targ][next op][1: the
@@ -5842,6 +5849,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         save_aelem_flags(av, idx, svp, (U32)(b >> 32));
         return 0;
     }
+    case GOPERL_INT_MROMETA: {
+        HV *const hv = (HV *)GOPERL_SVARG(lo);
+        if (!hv || SvTYPE((SV *)hv) != SVt_PVHV) Perl_croak(aTHX_ "goperl: HvMROMETA of something that is no hash");
+        if (b) return (uint64_t)(uintptr_t)HvMROMETA(hv);
+        return HvHasAUX(hv) ? (uint64_t)(uintptr_t)HvAUX(hv)->xhv_mro_meta : 0;
+    }
+    case GOPERL_INT_MRO_RESOLVE: {
+        HV *const hv = (HV *)GOPERL_SVARG(lo);
+        const struct mro_alg *const alg = (const struct mro_alg *)(uintptr_t)b;
+        if (!hv || SvTYPE((SV *)hv) != SVt_PVHV || !alg) Perl_croak(aTHX_ "goperl: a resolve of no stash or no algorithm");
+        /* an algorithm that is registered under its name */
+        SV *const name = newSVpvn_flags(alg->name, alg->length, SVs_TEMP | (alg->kflags & HVhek_UTF8 ? SVf_UTF8 : 0));
+        if (Perl_mro_get_from_name(aTHX_ name) != alg) Perl_croak(aTHX_ "goperl: a resolve with no registered algorithm");
+        return (uint64_t)(uintptr_t)alg->resolve(aTHX_ hv, (U32)c_hi);
+    }
+    case GOPERL_INT_MRO_BY_NAME:
+        return lo ? (uint64_t)(uintptr_t)Perl_mro_get_from_name(aTHX_ GOPERL_SVARG(lo)) : 0;
     case GOPERL_INT_OP_MIRROR: {
         /* An op of native code's own as PL_op (Scope::Upper's: the
          * interpreter goes on from its op_next): a copy of it in this
