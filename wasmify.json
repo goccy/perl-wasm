@@ -70,7 +70,13 @@
       "-Wl,--wrap=strerror",
       "-Wl,--wrap=write",
       "-Wl,--wrap=writev",
-      "-Wl,--wrap=send"
+      "-Wl,--wrap=send",
+      "-Wl,--wrap=localeconv",
+      "-Wl,--wrap=nl_langinfo",
+      "-Wl,--wrap=strftime",
+      "-Wl,--wrap=strxfrm",
+      "-Wl,--wrap=strcoll",
+      "-Wl,--wrap=vfprintf"
     ]
   },
   "user_selection": {

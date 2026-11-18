@@ -530,6 +530,11 @@ static int32_t g_go_cb = 0;
 /* Reserved callback method id for reading memory of the process that is not
  * this memory (unpack 'p' and 'P' of such an address, goperl_unpack_address). */
 #define GOPERL_PROCMEM_METHOD_ID (-10)
+/* The locales of the host (perl_libc.cc, go-perl's internal/locale.go):
+ * [open][category] name -> [1][handle]; [info][handle][n][item]*n -> [1]
+ * strings; [conv][handle] -> [1] the strings and chars of struct lconv;
+ * [xfrm][handle] string -> [1] its collation key. A failure is [0]. */
+#define GOPERL_LOCALE_METHOD_ID (-11)
 enum {
     GOPERL_HOST_NEWOP = 0, /* an op checker: [type][op] -> [op] */
     GOPERL_HOST_PEEP = 1,  /* a peephole hook: [which][op] */
@@ -666,6 +671,7 @@ static SV *goperl_die_hook(pTHX_ SV *msg) {
  * instance may be a snapshot copy the host has not seen yet. */
 extern "C" void wasi_signal_attach(pTHX);
 extern "C" void perl_wasm_locale_start_up(int on);
+extern "C" int perl_wasm_locale_host_ready(void);
 /* Ends the process by a signal, as the signal's default action does
  * (perl_signal.cc). Does not return. */
 extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
@@ -3197,6 +3203,23 @@ extern "C" void perl_wasm_croak_syscall_forked(void) {
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id) {
     if (h == 0) return;
     g_go_cb = callback_id;
+    /* the host's locales are there now: the locale the environment names,
+     * which the interpreter's start-up had no data for, is taken from the
+     * host, and the interpreter syncs with it */
+    if (g_my_perl && perl_wasm_locale_host_ready()) {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        sync_locale();
+    }
+}
+
+/* A request of the host's locales (perl_libc.cc): the reply, which the
+ * caller frees, or NULL when there is no host to ask. */
+extern "C" unsigned char *perl_wasm_host_locale(const void *req, size_t len, uint32_t *resp_len) {
+    if (!g_go_cb) return nullptr;
+    const int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_LOCALE_METHOD_ID, const_cast<void *>(req), len);
+    if (rc == GOPERL_CALLBACK_JUMPED) return nullptr;
+    return goperl_callback_response(rc, resp_len);
 }
 
 void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id) {

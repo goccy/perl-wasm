@@ -19,6 +19,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <locale.h>
+#include <langinfo.h>
+#include <cstdarg>
+#include <wchar.h>
 #include <string>
 #include <strings.h>
 #include <arpa/inet.h>
@@ -144,6 +147,12 @@ int __real_unsetenv(const char *name);
 int __real_putenv(char *string);
 int __real_clearenv(void);
 char *__real_setlocale(int category, const char *name);
+struct lconv *__real_localeconv(void);
+char *__real_nl_langinfo(nl_item item);
+size_t __real_strftime(char *s, size_t max, const char *fmt, const struct tm *tm);
+size_t __real_strxfrm(char *dest, const char *src, size_t n);
+int __real_strcoll(const char *a, const char *b);
+int __real_vfprintf(FILE *f, const char *fmt, va_list ap);
 
 extern char **environ;
 
@@ -470,12 +479,22 @@ int __wrap_clearenv(void) {
 
 /* ---- locales ----------------------------------------------------------------
  * The C library has the data of two locales: "C" (also named "POSIX") and
- * "C.UTF-8", which is "C" with UTF-8 as the character encoding. Its
- * setlocale nevertheless accepts every name, keeps it, and behaves as
- * "C.UTF-8": a program that asked for "de_DE" was told it had it, and then
- * found the decimal point and the currency of "C". Here a locale that is
- * asked for by name is one of the two, or the call fails, as it does on a
- * system where the locale is not installed.
+ * "C.UTF-8", which is "C" with UTF-8 as the character encoding. The others
+ * are the host's: the host's C library has the data of the locales the
+ * system has installed, and is asked for it (perl.cc's
+ * perl_wasm_host_locale, go-perl's host locales), for one category at a
+ * time. What the C library's functions read of a locale is kept here once
+ * it was asked for (host_locale): the items of nl_langinfo, the fields of
+ * localeconv, the names strftime writes. A program that switches back to a
+ * locale it had before asks the host nothing: perl switches LC_NUMERIC
+ * between "C" and the program's locale around every number it formats.
+ * Collation keys (strxfrm, strcoll) are asked of the host for each string.
+ *
+ * A locale the host does not have, or every locale when the host gives none
+ * (an interpreter in a sandbox), makes setlocale fail, as it does on a
+ * system where the locale is not installed. A locale whose character set is
+ * not UTF-8 (ISO-8859-1, EUC-JP) is not taken for LC_CTYPE: the C library
+ * converts characters as UTF-8 only.
  *
  * The empty name asks for the locale of the environment (LC_ALL, the
  * category's own variable, LANG, in that order; an environment that names
@@ -487,18 +506,22 @@ int __wrap_clearenv(void) {
  *
  * The interpreter asks the same question when it starts, and there a
  * failure would be a complaint on standard error at every start for a user
- * whose environment names, say, "ja_JP.UTF-8". What the user's environment
- * names is not a request the program made for the conventions of that
- * locale: at start-up the nearest locale there is data for is taken, which
- * is the one with the character encoding the environment names: "C.UTF-8"
- * for a name whose codeset is UTF-8, "C" for any other. */
+ * whose environment names, say, "ja_JP.UTF-8" on a system without it. What
+ * the user's environment names is not a request the program made for the
+ * conventions of that locale: at start-up the nearest locale there is data
+ * for is taken, which is the one with the character encoding the
+ * environment names: "C.UTF-8" for a name whose codeset is UTF-8, "C" for
+ * any other. The host is not there yet when the interpreter is
+ * constructed; once it is (perl_wasm_locale_host_ready), the locale of the
+ * environment is taken again from the host. */
 
-/* Set while the interpreter sets its locale up when it is constructed. The
- * C library cannot tell that call of setlocale(LC_ALL, "") from a
- * program's. */
+/* Set while the interpreter sets its locale up at start-up. The C library
+ * cannot tell that call of setlocale(LC_ALL, "") from a program's. */
 static bool locale_start_up;
 
 void perl_wasm_locale_start_up(int on) { locale_start_up = on != 0; }
+
+extern "C" unsigned char *perl_wasm_host_locale(const void *req, size_t len, uint32_t *resp_len);
 
 /* Whether the codeset of a locale name (language[_territory][.codeset]
  * [@modifier], the form of X/Open) is UTF-8, in either of its spellings. */
@@ -514,7 +537,7 @@ static bool locale_codeset_is_utf8(const char *name) {
 /* The name the C library knows a locale it has data for by, given one name
  * (of len characters) a program may use for it; NULL for every other
  * locale. */
-static const char *locale_with_data(const char *name, size_t len) {
+static const char *locale_builtin(const char *name, size_t len) {
     static const struct {
         const char *name;
         const char *known_as;
@@ -528,7 +551,8 @@ static const char *locale_with_data(const char *name, size_t len) {
 }
 
 /* The six categories setlocale(LC_ALL) stands for, with the environment
- * variable of each. */
+ * variable of each, in the order of their numbers (LC_CTYPE 0 to
+ * LC_MESSAGES 5). */
 static const struct {
     int category;
     const char *variable;
@@ -537,14 +561,137 @@ static const struct {
     {LC_COLLATE, "LC_COLLATE"},   {LC_MONETARY, "LC_MONETARY"}, {LC_MESSAGES, "LC_MESSAGES"},
 };
 
-/* The locale the environment names for one category, as the C library
- * knows it; NULL when there is no data for it. */
-static const char *locale_of_environment(const char *variable) {
+/* The items of nl_langinfo kept for a category: a run of item numbers. */
+static const struct {
+    nl_item first;
+    int count;
+} locale_items[6] = {
+    {CODESET, 1},              /* LC_CTYPE */
+    {RADIXCHAR, 2},            /* LC_NUMERIC: RADIXCHAR, THOUSEP */
+    {ABDAY_1, ERA_T_FMT - ABDAY_1 + 1}, /* LC_TIME: the names and formats */
+    {0, 0},                    /* LC_COLLATE */
+    {CRNCYSTR, 1},             /* LC_MONETARY */
+    {YESEXPR, 2},              /* LC_MESSAGES: YESEXPR, NOEXPR */
+};
+
+/* A locale of the host, for one category: its name, the host's handle of
+ * it, and what the C library's functions read of it. */
+struct host_locale {
+    int category;
+    std::string name;
+    uint64_t handle;
+    std::vector<std::string> items; /* locale_items' run of the category */
+    std::string conv[10];           /* LC_NUMERIC and LC_MONETARY: the strings of struct lconv */
+    char conv_chars[14];            /* and its char fields, as glibc orders them */
+};
+
+/* Every host locale asked for, for good: one asked for again is taken from
+ * here. */
+static std::vector<host_locale *> host_locales;
+
+/* The host locale each category is in; NULL for "C" and "C.UTF-8". */
+static host_locale *locale_current[6];
+
+/* A request of the host: words, then bytes. The answer (a status byte, then
+ * the reply), which the caller frees; NULL when the host has nothing to
+ * say. */
+static unsigned char *locale_ask(const std::vector<uint64_t> &words, const char *bytes, size_t nbytes,
+                                 uint32_t *len) {
+    std::string req;
+    for (const uint64_t w : words)
+        for (int i = 0; i < 8; i++) req += (char)(w >> (8 * i));
+    req.append(bytes, nbytes);
+    unsigned char *resp = perl_wasm_host_locale(req.data(), req.size(), len);
+    if (resp && (*len < 1 || resp[0] != 1)) {
+        free(resp);
+        return NULL;
+    }
+    return resp;
+}
+
+/* The strings of a reply from at: each a 32-bit length and the bytes. */
+static bool locale_strings(const unsigned char *resp, uint32_t len, uint32_t &at, std::string *out, int n) {
+    for (int i = 0; i < n; i++) {
+        if (at + 4 > len) return false;
+        const uint32_t sl = (uint32_t)resp[at] | (uint32_t)resp[at + 1] << 8 |
+                            (uint32_t)resp[at + 2] << 16 | (uint32_t)resp[at + 3] << 24;
+        at += 4;
+        if (at + sl > len) return false;
+        out[i].assign((const char *)resp + at, sl);
+        at += sl;
+    }
+    return true;
+}
+
+/* The host locale name for the category (an index of locale_categories):
+ * the one asked for before, or one the host opens now; NULL when the host
+ * does not have it, or it is not for this C library (LC_CTYPE of a
+ * character set other than UTF-8). */
+static host_locale *locale_of_host(int category, const char *name, size_t len) {
+    for (host_locale *l : host_locales)
+        if (l->category == category && l->name.size() == len && memcmp(l->name.data(), name, len) == 0)
+            return l;
+    uint32_t rlen;
+    unsigned char *resp = locale_ask({1, (uint64_t)category}, name, len, &rlen);
+    if (!resp) return NULL;
+    host_locale *l = NULL;
+    if (rlen >= 9) {
+        l = new host_locale();
+        l->category = category;
+        l->name.assign(name, len);
+        for (int i = 0; i < 8; i++) l->handle |= (uint64_t)resp[1 + i] << (8 * i);
+    }
+    free(resp);
+    if (!l) return NULL;
+    bool ok = true;
+    const int n = locale_items[category].count;
+    if (n > 0) {
+        std::vector<uint64_t> req = {2, l->handle, (uint64_t)n};
+        for (int i = 0; i < n; i++) req.push_back((uint64_t)(locale_items[category].first + i));
+        resp = locale_ask(req, NULL, 0, &rlen);
+        l->items.resize(n);
+        uint32_t at = 1;
+        ok = resp && locale_strings(resp, rlen, at, l->items.data(), n);
+        free(resp);
+    }
+    if (ok && (category == LC_NUMERIC || category == LC_MONETARY)) {
+        resp = locale_ask({3, l->handle}, NULL, 0, &rlen);
+        uint32_t at = 1;
+        ok = resp && locale_strings(resp, rlen, at, l->conv, 10) && at + 14 <= rlen;
+        if (ok) memcpy(l->conv_chars, resp + at, 14);
+        free(resp);
+    }
+    if (ok && category == LC_CTYPE) ok = locale_codeset_is_utf8(("." + l->items[0]).c_str());
+    if (!ok) {
+        /* kept, so that it is not asked for again, but never taken */
+        l->handle = 0;
+    }
+    host_locales.push_back(l);
+    return ok ? l : NULL;
+}
+
+/* A locale of one category, named by len characters of name: one the C
+ * library has, whose name is returned and *host made NULL, or one of the
+ * host's, whose name is returned and kept in *host; NULL for none. */
+static const char *locale_find(int category, const char *name, size_t len, host_locale **host) {
+    *host = NULL;
+    if (const char *known = locale_builtin(name, len)) return known;
+    if (len == 0) return NULL;
+    host_locale *l = locale_of_host(category, name, len);
+    if (!l || !l->handle) return NULL;
+    *host = l;
+    return l->name.c_str();
+}
+
+/* The locale the environment names for one category (an index of
+ * locale_categories), as locale_find finds it; NULL when there is no data
+ * for it (at start-up: the nearest the C library has). */
+static const char *locale_of_environment(int index, host_locale **host) {
     const char *name = getenv("LC_ALL");
-    if (!name || !*name) name = getenv(variable);
+    if (!name || !*name) name = getenv(locale_categories[index].variable);
     if (!name || !*name) name = getenv("LANG");
     if (!name || !*name) name = "C";
-    const char *known = locale_with_data(name, strlen(name));
+    const char *known = locale_find(index, name, strlen(name), host);
     if (!known && locale_start_up) known = locale_codeset_is_utf8(name) ? "C.UTF-8" : "C";
     return known;
 }
@@ -554,8 +701,8 @@ static const char *locale_of_environment(const char *variable) {
  * not the name it was given: its data of C.UTF-8 differs from C's in
  * LC_CTYPE alone, and it reports every other category set to C.UTF-8 as
  * "C" (glibc reports "C.UTF-8"; libintl-perl takes a category reported as
- * "C" for one without translations). The names are the ones
- * locale_with_data gives, which live as long as the program. */
+ * "C" for one without translations). The names are the ones locale_find
+ * gives, which live as long as the program. */
 static const char *locale_names[6] = {"C", "C", "C", "C", "C", "C"};
 
 /* The name setlocale reports for a category: that of the category, or for
@@ -578,59 +725,313 @@ static char *locale_name_of(int category) {
     return (char *)all.c_str();
 }
 
-/* Records the name a category (LC_ALL: every one) was set to. */
-static void locale_name_set(int category, const char *known) {
-    for (size_t i = 0; i < 6; i++)
-        if (category == LC_ALL || locale_categories[i].category == category) locale_names[i] = known;
+/* Puts category index i in a locale locale_find found. The C library's own
+ * data is C's for every category, and C.UTF-8's for LC_CTYPE when the
+ * locale's character set is UTF-8 (every host locale it is in). */
+static bool locale_take(size_t i, const char *known, host_locale *host) {
+    const char *data = host ? (i == LC_CTYPE ? "C.UTF-8" : "C") : known;
+    if (!__real_setlocale(locale_categories[i].category, data)) return false;
+    locale_names[i] = known;
+    locale_current[i] = host;
+    return true;
 }
 
 char *__wrap_setlocale(int category, const char *name) {
     if (!name) return locale_name_of(category);
+    size_t first = 0, last = 5;
+    if (category != LC_ALL) {
+        bool one_of_the_six = false;
+        for (size_t i = 0; i < 6; i++)
+            if (locale_categories[i].category == category) first = last = i, one_of_the_six = true;
+        if (!one_of_the_six) return __real_setlocale(category, name);
+    }
+    const char *known[6] = {};
+    host_locale *host[6] = {};
     if (!*name) {
         /* every category asked for has to be there before one is set */
-        for (const auto &c : locale_categories)
-            if ((category == LC_ALL || c.category == category) && !locale_of_environment(c.variable)) {
+        for (size_t i = first; i <= last; i++)
+            if (!(known[i] = locale_of_environment((int)i, &host[i]))) {
                 errno = ENOENT;
                 return NULL;
             }
-        bool one_of_the_six = false;
-        for (const auto &c : locale_categories) {
-            if (category != LC_ALL && c.category != category) continue;
-            one_of_the_six = true;
-            const char *known = locale_of_environment(c.variable);
-            if (!__real_setlocale(c.category, known)) return NULL;
-            locale_name_set(c.category, known);
+    } else {
+        /* A name, or for LC_ALL also one name per category separated by ";"
+         * (the form setlocale(LC_ALL, NULL) reports them in): every one has
+         * to be a locale there is data for. */
+        const char *parts[6];
+        size_t lens[6], count = 0;
+        for (const char *part = name;;) {
+            const size_t len = category == LC_ALL ? strcspn(part, ";") : strlen(part);
+            if (count == 6) {
+                errno = ENOENT;
+                return NULL;
+            }
+            parts[count] = part;
+            lens[count] = len;
+            count++;
+            if (!part[len]) break;
+            part += len + 1;
         }
-        if (!one_of_the_six) return __real_setlocale(category, name);
-        return locale_name_of(category);
-    }
-    /* A name, or for LC_ALL also one name per category separated by ";"
-     * (the form setlocale(LC_ALL, NULL) reports them in): every one has to
-     * be a locale there is data for. */
-    std::string known;
-    const char *parts[6];
-    size_t count = 0;
-    for (const char *part = name;;) {
-        const size_t len = category == LC_ALL ? strcspn(part, ";") : strlen(part);
-        const char *locale = locale_with_data(part, len);
-        if (!locale) {
+        if (count != 1 && count != 6) {
             errno = ENOENT;
             return NULL;
         }
-        if (!known.empty()) known += ';';
-        known += locale;
-        if (count < 6) parts[count] = locale;
-        count++;
-        if (!part[len]) break;
-        part += len + 1;
+        for (size_t i = first; i <= last; i++) {
+            const size_t p = count == 1 ? 0 : i;
+            if (!(known[i] = locale_find((int)i, parts[p], lens[p], &host[i]))) {
+                errno = ENOENT;
+                return NULL;
+            }
+        }
     }
-    if (!__real_setlocale(category, known.c_str())) return NULL;
-    if (count == 1) {
-        locale_name_set(category, parts[0]);
-    } else if (count == 6) {
-        for (size_t i = 0; i < 6; i++) locale_names[i] = parts[i];
-    }
+    for (size_t i = first; i <= last; i++)
+        if (!locale_take(i, known[i], host[i])) return NULL;
     return locale_name_of(category);
+}
+
+/* The host has come: the categories that start-up put in the nearest
+ * locale the C library has, for want of the one the environment names,
+ * are put in that one now when the host has it. Reports whether one
+ * changed. */
+extern "C" int perl_wasm_locale_host_ready(void) {
+    int changed = 0;
+    for (size_t i = 0; i < 6; i++) {
+        if (locale_current[i]) continue;
+        host_locale *host = NULL;
+        const char *known = locale_of_environment((int)i, &host);
+        if (host && known && strcmp(known, locale_names[i]) != 0 && locale_take(i, known, host)) changed = 1;
+    }
+    return changed;
+}
+
+/* localeconv: the C library's, with the fields of the host locales
+ * LC_NUMERIC and LC_MONETARY are in. */
+struct lconv *__wrap_localeconv(void) {
+    static struct lconv lc;
+    lc = *__real_localeconv();
+    if (const host_locale *n = locale_current[LC_NUMERIC]) {
+        lc.decimal_point = (char *)n->conv[0].c_str();
+        lc.thousands_sep = (char *)n->conv[1].c_str();
+        lc.grouping = (char *)n->conv[2].c_str();
+    }
+    if (const host_locale *m = locale_current[LC_MONETARY]) {
+        lc.int_curr_symbol = (char *)m->conv[3].c_str();
+        lc.currency_symbol = (char *)m->conv[4].c_str();
+        lc.mon_decimal_point = (char *)m->conv[5].c_str();
+        lc.mon_thousands_sep = (char *)m->conv[6].c_str();
+        lc.mon_grouping = (char *)m->conv[7].c_str();
+        lc.positive_sign = (char *)m->conv[8].c_str();
+        lc.negative_sign = (char *)m->conv[9].c_str();
+        const char *c = m->conv_chars;
+        lc.int_frac_digits = c[0];
+        lc.frac_digits = c[1];
+        lc.p_cs_precedes = c[2];
+        lc.p_sep_by_space = c[3];
+        lc.n_cs_precedes = c[4];
+        lc.n_sep_by_space = c[5];
+        lc.p_sign_posn = c[6];
+        lc.n_sign_posn = c[7];
+        lc.int_p_cs_precedes = c[8];
+        lc.int_p_sep_by_space = c[9];
+        lc.int_n_cs_precedes = c[10];
+        lc.int_n_sep_by_space = c[11];
+        lc.int_p_sign_posn = c[12];
+        lc.int_n_sign_posn = c[13];
+    }
+    return &lc;
+}
+
+/* An item of nl_langinfo the host locale of its category gives; NULL for
+ * one it does not keep. */
+static const char *locale_item(nl_item item) {
+    const int category = item == CODESET ? LC_CTYPE : (int)(item >> 16);
+    if (category < 0 || category >= 6) return NULL;
+    const host_locale *l = locale_current[category];
+    if (!l) return NULL;
+    const long at = (long)item - (long)locale_items[category].first;
+    if (at < 0 || at >= locale_items[category].count) return NULL;
+    return l->items[(size_t)at].c_str();
+}
+
+char *__wrap_nl_langinfo(nl_item item) {
+    if (const char *s = locale_item(item)) return (char *)s;
+    return __real_nl_langinfo(item);
+}
+
+/* strftime in a host locale LC_TIME is in is the host's: its C library
+ * writes the conversions as the host's perl gets them, ways of its own
+ * among them that nl_langinfo does not tell (macOS writes nothing for %p
+ * in fr_FR, whose AM_STR is empty, and %r there as "%H:%M:%S"). The time
+ * goes with its offset from UTC and its zone's name, which %z and %Z
+ * write. A result that does not fit in max bytes is 0, as the C library's
+ * strftime returns. */
+size_t __wrap_strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
+    if (!locale_current[LC_TIME] || !fmt || !tm) return __real_strftime(s, max, fmt, tm);
+    const char *const zone = tm->__tm_zone ? tm->__tm_zone : "";
+    const size_t zlen = strlen(zone);
+    std::string bytes(zone, zlen);
+    bytes += fmt;
+    uint32_t len;
+    unsigned char *resp = locale_ask(
+        {5, locale_current[LC_TIME]->handle, (uint64_t)(int64_t)tm->tm_sec,
+         (uint64_t)(int64_t)tm->tm_min, (uint64_t)(int64_t)tm->tm_hour,
+         (uint64_t)(int64_t)tm->tm_mday, (uint64_t)(int64_t)tm->tm_mon,
+         (uint64_t)(int64_t)tm->tm_year, (uint64_t)(int64_t)tm->tm_wday,
+         (uint64_t)(int64_t)tm->tm_yday, (uint64_t)(int64_t)tm->tm_isdst,
+         (uint64_t)(int64_t)tm->__tm_gmtoff, (uint64_t)zlen},
+        bytes.data(), bytes.size(), &len);
+    if (!resp) return __real_strftime(s, max, fmt, tm);
+    const size_t n = len - 1;
+    size_t r = 0;
+    if (n < max) {
+        memcpy(s, resp + 1, n);
+        s[n] = 0;
+        r = n;
+    }
+    free(resp);
+    return r;
+}
+
+/* The collation key of a string in the host locale LC_COLLATE is in. */
+static bool locale_xfrm(const char *s, std::string &key) {
+    uint32_t len;
+    unsigned char *resp = locale_ask({4, locale_current[LC_COLLATE]->handle}, s, strlen(s), &len);
+    if (!resp) return false;
+    key.assign((const char *)resp + 1, len - 1);
+    free(resp);
+    return true;
+}
+
+size_t __wrap_strxfrm(char *dest, const char *src, size_t n) {
+    std::string key;
+    if (!locale_current[LC_COLLATE] || !locale_xfrm(src, key)) return __real_strxfrm(dest, src, n);
+    if (key.size() < n) memcpy(dest, key.c_str(), key.size() + 1);
+    return key.size();
+}
+
+int __wrap_strcoll(const char *a, const char *b) {
+    std::string ka, kb;
+    if (!locale_current[LC_COLLATE] || !locale_xfrm(a, ka) || !locale_xfrm(b, kb))
+        return __real_strcoll(a, b);
+    const int c = ka.compare(kb);
+    return c < 0 ? -1 : c > 0;
+}
+
+/* vfprintf: the decimal point of a floating conversion (%a %e %f %g) is the
+ * one of the host locale LC_NUMERIC is in, as glibc's printf writes it
+ * (perl leaves the radix of the numbers it formats to the C library; this
+ * one writes "." whatever the locale). With a radix of ".", or a format
+ * with positional arguments (%1$d), the C library's is the whole of it;
+ * else each conversion is written by the C library on its own, and the
+ * "." of a floating one replaced. */
+static bool locale_printf_own;
+
+int __wrap_vfprintf(FILE *f, const char *fmt, va_list ap) {
+    const host_locale *n = locale_current[LC_NUMERIC];
+    if (locale_printf_own || !n || n->conv[0] == "." || n->conv[0].empty() || strchr(fmt, '$'))
+        return __real_vfprintf(f, fmt, ap);
+    locale_printf_own = true;
+    va_list args;
+    va_copy(args, ap);
+    int total = 0;
+    bool failed = false;
+    std::string spec;
+    for (const char *p = fmt; *p && !failed;) {
+        if (*p != '%') {
+            const char *lit = p;
+            while (*p && *p != '%') p++;
+            if (fwrite(lit, 1, (size_t)(p - lit), f) != (size_t)(p - lit)) failed = true;
+            total += (int)(p - lit);
+            continue;
+        }
+        if (p[1] == '%') {
+            if (fputc('%', f) == EOF) failed = true;
+            total++;
+            p += 2;
+            continue;
+        }
+        /* %[flags][width][.precision][length]conversion, with the stars
+         * written as the numbers they take */
+        spec = "%";
+        p++;
+        while (*p && strchr("-+ #0'", *p)) spec += *p++;
+        if (*p == '*') {
+            spec += std::to_string(va_arg(args, int));
+            p++;
+        } else {
+            while (*p >= '0' && *p <= '9') spec += *p++;
+        }
+        if (*p == '.') {
+            spec += *p++;
+            if (*p == '*') {
+                spec += std::to_string(va_arg(args, int));
+                p++;
+            } else {
+                while (*p >= '0' && *p <= '9') spec += *p++;
+            }
+        }
+        std::string length;
+        while (*p && strchr("hlLqjzt", *p)) length += *p++;
+        const char conv = *p;
+        if (!conv) break;
+        p++;
+        spec += length;
+        spec += conv;
+        int wrote = 0;
+        if (strchr("aAeEfFgG", conv)) {
+            char buf[512];
+            const bool wide = length == "L";
+            const long double ld = wide ? va_arg(args, long double) : 0;
+            const double d = wide ? 0 : va_arg(args, double);
+            const int need = wide ? snprintf(buf, sizeof buf, spec.c_str(), ld) : snprintf(buf, sizeof buf, spec.c_str(), d);
+            std::string out;
+            if (need >= (int)sizeof buf) {
+                out.resize((size_t)need + 1);
+                if (wide) snprintf(&out[0], out.size(), spec.c_str(), ld);
+                else snprintf(&out[0], out.size(), spec.c_str(), d);
+                out.resize((size_t)need);
+            } else if (need >= 0) {
+                out.assign(buf, (size_t)need);
+            }
+            const size_t dot = out.find('.');
+            if (dot != std::string::npos) out.replace(dot, 1, n->conv[0]);
+            if (fwrite(out.data(), 1, out.size(), f) != out.size()) failed = true;
+            wrote = (int)out.size();
+        } else if (conv == 'n') {
+            void *at = va_arg(args, void *);
+            if (length == "hh") *(signed char *)at = (signed char)total;
+            else if (length == "h") *(short *)at = (short)total;
+            else if (length == "l") *(long *)at = total;
+            else if (length == "ll" || length == "q") *(long long *)at = total;
+            else if (length == "j") *(intmax_t *)at = total;
+            else if (length == "z") *(size_t *)at = (size_t)total;
+            else if (length == "t") *(ptrdiff_t *)at = total;
+            else *(int *)at = total;
+        } else if (strchr("diouxXc", conv)) {
+            if (length == "l") wrote = fprintf(f, spec.c_str(), va_arg(args, long));
+            else if (length == "ll" || length == "q") wrote = fprintf(f, spec.c_str(), va_arg(args, long long));
+            else if (length == "j") wrote = fprintf(f, spec.c_str(), va_arg(args, intmax_t));
+            else if (length == "z") wrote = fprintf(f, spec.c_str(), va_arg(args, size_t));
+            else if (length == "t") wrote = fprintf(f, spec.c_str(), va_arg(args, ptrdiff_t));
+            else wrote = fprintf(f, spec.c_str(), va_arg(args, int));
+        } else if (conv == 's') {
+            wrote = length == "l" ? fprintf(f, spec.c_str(), va_arg(args, wchar_t *))
+                                  : fprintf(f, spec.c_str(), va_arg(args, char *));
+        } else if (conv == 'C' || conv == 'S') {
+            wrote = conv == 'C' ? fprintf(f, spec.c_str(), va_arg(args, wint_t))
+                                : fprintf(f, spec.c_str(), va_arg(args, wchar_t *));
+        } else if (conv == 'p') {
+            wrote = fprintf(f, spec.c_str(), va_arg(args, void *));
+        } else {
+            /* not a conversion: written as it stands, as the C library does */
+            wrote = fprintf(f, "%s", spec.c_str());
+        }
+        if (wrote < 0) failed = true;
+        total += wrote;
+    }
+    va_end(args);
+    locale_printf_own = false;
+    return failed ? -1 : total;
 }
 
 /* ---- sockets ----------------------------------------------------------------

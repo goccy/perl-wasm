@@ -549,6 +549,12 @@ perl_lc_all_separator='";"'
 d_perl_lc_all_category_positions_init='define'
 perl_lc_all_category_positions_init='{ 0, 1, 2, 3, 4, 5 }'
 d_setlocale_accepts_any_locale_name='undef'
+# struct lconv has the fields of C99 for international monetary formats
+# (int_p_cs_precedes, int_n_sign_posn, ...), which the C library fills
+# from the host's locale (perl_libc.cc), and POSIX::localeconv reports
+# them when this says they are there, as perl on the host does. The base
+# says they are not: it predates them.
+d_lc_monetary_2008='define'
 # The C library is not glibc, and the compiler is not gcc 2.95. perl.h
 # defines _GNU_SOURCE for glibc; for a musl, perl's own hints (hints/linux.sh)
 # put -D_GNU_SOURCE into ccflags instead, and so does ccflags above: perl
