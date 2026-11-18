@@ -129,6 +129,7 @@ jobs:
             wasmify parse-headers --header pl.h
             wasmify gen-proto
             wasmify wasm-build --optimize --non-interactive
+            make wasm-imports
             rm -rf build
             buf generate --timeout 30m
             make bundle-gomod

@@ -131,6 +131,7 @@ jobs:
             wasmify parse-headers --header pl.h
             wasmify gen-proto
             wasmify wasm-build --optimize --non-interactive
+            make wasm-imports
             # Clean tree before buf generate: protoc-gen-wasmify-go overwrites
             # but never deletes, and the bundle file SET depends on the wasm size
             # (single- vs multi-package layout).

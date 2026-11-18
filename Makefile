@@ -39,7 +39,8 @@ BUILD_ENV = WASMIFY_NON_INTERACTIVE=1
 # `wasmify build` then replays the captured `make` under the compiler-wrapper;
 # generate-build emits build.json, parse-headers/gen-proto emit the api spec +
 # proto + bridge, wasm-build links perl.wasm (the bridge in perl.cc is injected
-# automatically), and buf generate + bundle-gomod produce the wasm2go bundle as
+# automatically), wasm-imports refuses a perl.wasm with imports it is not
+# meant to have, and buf generate + bundle-gomod produce the wasm2go bundle as
 # a self-contained Go module.
 WASMIFY_PIPELINE = \
 	make tools && \
@@ -49,6 +50,7 @@ WASMIFY_PIPELINE = \
 	wasmify parse-headers --header pl.h --clang $(WASI_CLANG) && \
 	wasmify gen-proto && \
 	$(BUILD_ENV) wasmify wasm-build --optimize --non-interactive && \
+	make wasm-imports && \
 	rm -rf build && \
 	buf generate --timeout 0 && \
 	make bundle-gomod
@@ -68,7 +70,7 @@ WASI_CLANG = $${WASI_SDK_PATH:-$$HOME/.config/wasmify/bin/wasi-sdk}/bin/clang
 # wasm yields a single-package layout; a larger one yields the base/ + pN
 # multi-package layout). Mixing two leftover sets in one package won't compile.
 
-.PHONY: all wasm wasm-host wasm-clean tools bundle-gomod stdlib-zip image-pull help
+.PHONY: all wasm wasm-host wasm-clean tools bundle-gomod stdlib-zip wasm-imports image-pull help
 
 all: wasm
 
@@ -111,6 +113,13 @@ wasm-host:
 stdlib-zip:
 	python3 scripts/make-stdlib-zip.py perl5/lib perl_stdlib.zip
 
+# Fail when the linked perl.wasm imports anything scripts/wasm-imports.txt does
+# not list: the linker turns a symbol nothing defines into an import of "env",
+# which the transpiled program binds to a function that does nothing and
+# returns zero.
+wasm-imports:
+	python3 scripts/wasm-imports.py .wasmify/wasm-build/output/perl.wasm scripts/wasm-imports.txt
+
 # Write go.mod into the wasm2go bundle so the released tarball is a
 # self-contained Go module. Parses bridge.Wasm2GoImportPath out of wasmify.json
 # with grep+sed (no jq in the image; no Go toolchain needed — a literal manifest).
@@ -145,6 +154,7 @@ help:
 	@echo "Targets:"
 	@echo "  wasm         build perl.wasm + wasm2go bundle in the wasmify container"
 	@echo "  stdlib-zip   zip the assembled perl5/lib into perl_stdlib.zip"
+	@echo "  wasm-imports fail on imports of perl.wasm scripts/wasm-imports.txt does not list"
 	@echo "  bundle-gomod stamp go.mod into the wasm2go bundle"
 	@echo "  tools        install wasi-sdk + declared tools"
 	@echo "  wasm-clean   remove every wasmify-generated artefact"
