@@ -4608,7 +4608,8 @@ enum {
     GOPERL_OPF_PMREPLROOT = 402,
     GOPERL_OPF_PMSTASHSTART = 403,
     GOPERL_OPF_PMCODELIST = 404,
-    GOPERL_OPF_PADIX = 405
+    GOPERL_OPF_PADIX = 405,
+    GOPERL_OPF_SV = 406 /* the SV of an SVOP */
 };
 enum {
     GOPERL_LEX_READ_SPACE = 0,
@@ -7589,6 +7590,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         case GOPERL_OPF_PMCODELIST: cPMOPx(o)->op_code_list = GOPERL_MEMARG(OP, val); return 0;
         case GOPERL_OPF_PADIX: cPADOPx(o)->op_padix = (PADOFFSET)val; return 0;
+        case GOPERL_OPF_SV:
+            /* the member, stored as it is: the SV the op had is the
+             * caller's to let go of, as on perl */
+            if (op_class(o) != OPclass_SVOP)
+                Perl_croak(aTHX_ "goperl: the SV of an op that is no SVOP");
+            cSVOPx(o)->op_sv = val ? GOPERL_STORED(val) : NULL;
+            return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown op field %d", sel);
     }
