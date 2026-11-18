@@ -4108,9 +4108,15 @@ enum {
                                  * function (a word: uf_val or uf_set of a
                                  * struct ufuncs of the interpreter's) -> what
                                  * it returned */
-    GOPERL_CALL_UVAR_OWN = 35   /* a = the SV, s = [uf_val][uf_set][uf_index],
+    GOPERL_CALL_UVAR_OWN = 35,  /* a = the SV, s = [uf_val][uf_set][uf_index],
                                  * functions of the interpreter's: uvar magic
                                  * with them, as sv_magic attaches it */
+    GOPERL_CALL_SS_ROOM = 36,   /* b = how many entries: room for them above
+                                 * PL_savestack_ix (SSCHECK) -> the address of
+                                 * the save stack, which may have moved */
+    GOPERL_CALL_TMPS_ROOM = 37  /* b = how many: room for them above
+                                 * PL_tmps_ix (EXTEND_MORTAL) -> the address of
+                                 * the temporaries stack */
 };
 /* The words of CALL_PARSER. */
 enum {
@@ -4767,6 +4773,11 @@ enum {
                                         * native code reads and takes the
                                         * address of (Data::HashMap::Shared) */
 #define GOPERL_PL_PSIG_PEND_ADDR 118   /* the address of PL_psig_pend's array */
+#define GOPERL_PL_SAVESTACK_ADDR 119   /* the address of the save stack (ANY[]) */
+#define GOPERL_PL_TMPS_STACK_ADDR 120  /* the address of the temporaries (SV *[]) */
+#define GOPERL_PL_SAVESTACK_MAX 121
+#define GOPERL_PL_TMPS_MAX 122
+#define GOPERL_PL_CATCH 123            /* CATCH_GET */
 #define GOPERL_PL_SV_ARENAROOT 116 /* the first SV arena (read only): native
                                     * code walks the arenas from it */
 
@@ -6501,6 +6512,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SV_ARENAROOT: return (uint64_t)(uintptr_t)PL_sv_arenaroot;
         case GOPERL_PL_SIG_PENDING_ADDR: return GOPERL_ADDR(&PL_sig_pending);
         case GOPERL_PL_PSIG_PEND_ADDR: return GOPERL_ADDR(PL_psig_pend);
+        case GOPERL_PL_SAVESTACK_ADDR: return GOPERL_ADDR(PL_savestack);
+        case GOPERL_PL_TMPS_STACK_ADDR: return GOPERL_ADDR(PL_tmps_stack);
+        case GOPERL_PL_SAVESTACK_MAX: return (uint64_t)(int64_t)PL_savestack_max;
+        case GOPERL_PL_TMPS_MAX: return (uint64_t)(int64_t)PL_tmps_max;
+        case GOPERL_PL_CATCH: return CATCH_GET ? 1 : 0;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -6644,6 +6660,19 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_LASTSTYPE: PL_laststype = (U16)b; return 0;
         case GOPERL_PL_STATNAME: PL_statname = GOPERL_SVARG(b); return 0;
         case GOPERL_PL_TMPS_FLOOR: PL_tmps_floor = (SSize_t)(int64_t)b; return 0;
+        /* the indices of the two stacks, which native code moves when it
+         * takes entries off itself or has added them in place */
+        case GOPERL_PL_SAVESTACK_IX:
+            if ((int64_t)b < 0 || (int64_t)b > (int64_t)PL_savestack_max + SS_MAXPUSH)
+                Perl_croak(aTHX_ "goperl: PL_savestack_ix set beyond the save stack");
+            PL_savestack_ix = (I32)(int64_t)b;
+            if (PL_savestack_ix > PL_savestack_max) savestack_grow();
+            return 0;
+        case GOPERL_PL_TMPS_IX:
+            if ((int64_t)b < -1 || (int64_t)b > (int64_t)PL_tmps_max)
+                Perl_croak(aTHX_ "goperl: PL_tmps_ix set beyond the temporaries stack");
+            PL_tmps_ix = (SSize_t)(int64_t)b;
+            return 0;
         case GOPERL_PL_CURPM: PL_curpm = GOPERL_MEMARG(PMOP, b); return 0;
         case GOPERL_PL_DEFSTASH: PL_defstash = GOPERL_HVARG(b); return 0;
         case GOPERL_PL_PARSER:
@@ -8728,6 +8757,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_ATOF:
         case GOPERL_CALL_COP_SET:
         case GOPERL_CALL_UNPACKSTRING:
+        case GOPERL_CALL_SS_ROOM:
+        case GOPERL_CALL_TMPS_ROOM:
             break;
         default: (void)GOPERL_SVARG(a);
         }
@@ -8854,6 +8885,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             r.len = (goperl_gword_t)len;
             return (uint64_t)(uintptr_t)&r;
         }
+        case GOPERL_CALL_SS_ROOM:
+            SSCHECK((int)(int64_t)b);
+            return GOPERL_ADDR(PL_savestack);
+        case GOPERL_CALL_TMPS_ROOM:
+            EXTEND_MORTAL((SSize_t)(int64_t)b);
+            return GOPERL_ADDR(PL_tmps_stack);
         case GOPERL_CALL_MG_UNLINK: {
             if (SvTYPE(sv) < SVt_PVMG) return 0;
             for (MAGIC *prev = NULL, *mg = SvMAGIC(sv); mg; prev = mg, mg = mg->mg_moremagic) {
