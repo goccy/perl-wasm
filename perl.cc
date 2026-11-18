@@ -8644,8 +8644,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             if (SvTYPE(sv) != SVt_PVIO) return 0;
             IO *io = (IO *)sv;
             /* a name the host gave as text is the interpreter's copy, which
-             * it frees with the IO, as perl frees the savepv it was given */
-            char *name = s ? savepv(s) : (char *)(uintptr_t)b;
+             * it frees with the IO, as perl frees the savepv it was given;
+             * one given as an address is that address, whatever it points
+             * at (Filter::Util::Exec keeps a pointer into its buffer in
+             * IoFMT_NAME). The text is slen bytes with its NUL: the box
+             * hands every operation a string, an empty one without text. */
+            char *name = slen ? savepv(s) : (char *)(uintptr_t)b;
             switch ((int)(c >> 32)) {
             case GOPERL_IOWORD_LINES: IoLINES(io) = (IV)(int64_t)b; return 0;
             case GOPERL_IOWORD_PAGE: IoPAGE(io) = (IV)(int64_t)b; return 0;
