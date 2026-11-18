@@ -3879,6 +3879,8 @@ enum {
                                      * handler ran */
     GOPERL_INT_DOCATCH = 43,        /* a: the running op: pp_ctl.c's docatch,
                                      * with the op's own pp function first */
+    GOPERL_INT_SAVE_AELEM = 44,     /* a: an array; b: flags<<32 | the index:
+                                     * save_aelem_flags of the element */
     GOPERL_INT_PADNAMELIST_NEW = 60, /* b: max -> newPADNAMELIST's list */
     GOPERL_INT_PADNAMELIST_FREE = 61, /* a: the list: PadnamelistREFCNT_dec */
     GOPERL_INT_PADNAME_OUTER = 62,  /* a: a pad name -> newPADNAMEouter's */
@@ -4780,6 +4782,7 @@ enum {
 #define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
 #define GOPERL_PL_YES 128              /* the address of PL_Yes, the buffer of true */
 #define GOPERL_PL_NO 129               /* the address of PL_No, the buffer of false */
+#define GOPERL_PL_DBGV 131             /* PL_DBgv, the glob *DB::DB */
 #define GOPERL_PL_DTOR_THUNK 130       /* the function a destructor of the host's
                                         * is to the save stack (goperl_dtor_thunk) */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
@@ -5874,6 +5877,16 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SAVE_FREEOP:
         if (lo) save_freeop(GOPERL_MEMARG(OP, lo));
         return 0;
+    case GOPERL_INT_SAVE_AELEM: {
+        AV *const av = GOPERL_AVARG(lo);
+        const SSize_t idx = (SSize_t)(int32_t)(uint32_t)b;
+        if (!av || SvTYPE((SV *)av) != SVt_PVAV)
+            Perl_croak(aTHX_ "goperl: save_aelem of something that is not an array");
+        SV **const svp = av_fetch(av, idx, TRUE);
+        if (!svp || *svp == &PL_sv_undef) Perl_croak(aTHX_ PL_no_aelem, (int)idx);
+        save_aelem_flags(av, idx, svp, (U32)(b >> 32));
+        return 0;
+    }
     case GOPERL_INT_DOCATCH: {
         OP *const o = GOPERL_MEMARG(OP, lo);
         if (!o || o != PL_op) Perl_croak(aTHX_ "goperl: docatch of an op that is not running");
@@ -6526,6 +6539,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return goperl_two((uint64_t)(uintptr_t)PL_op, goperl_op_fields(PL_op));
         case GOPERL_PL_PERLDB: return (uint64_t)(int64_t)PL_perldb;
         case GOPERL_PL_DBSUB: return (uint64_t)(uintptr_t)PL_DBsub;
+        case GOPERL_PL_DBGV: return (uint64_t)(uintptr_t)PL_DBgv;
         case GOPERL_PL_DBSINGLE: return (uint64_t)(uintptr_t)PL_DBsingle;
         case GOPERL_PL_ENDAV: return (uint64_t)(uintptr_t)(SV *)PL_endav;
         case GOPERL_PL_CHECKAV: return (uint64_t)(uintptr_t)(SV *)PL_checkav;
@@ -9400,7 +9414,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * sub and format [cv][retop][olddepth][savearray]
                  * [prevcomppad]; eval [retop][old_namesv][cur_text][cv]
                  * [old_eval_root], and at 15 [cur_top_env]; loop [my_op],
-                 * and at 15 [itervar_u][itersave][the two words of state_u] */
+                 * and at 15 [itervar_u][itersave][the two words of state_u];
+                 * given and when [leave_op][defsv_save] */
             static goperl_gword_t w[20];
             const I32 ix = (I32)(int64_t)b;
             /* the context above the top is the one perl popped last, which
@@ -9452,6 +9467,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 w[13] = GOPERL_ADDR(cx->blk_eval.cv);
                 w[14] = GOPERL_ADDR(cx->blk_eval.old_eval_root);
                 w[15] = GOPERL_ADDR(cx->blk_eval.cur_top_env);
+                break;
+            case CXt_GIVEN:
+            case CXt_WHEN:
+                w[10] = GOPERL_ADDR(cx->blk_givwhen.leave_op);
+                w[11] = GOPERL_ADDR(cx->blk_givwhen.defsv_save);
                 break;
             default:
                 if (CxTYPE_is_LOOP(cx)) {
@@ -9574,6 +9594,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 case 13: cx->blk_eval.cv = GOPERL_CVARG(v); return 1;
                 case 14: cx->blk_eval.old_eval_root = GOPERL_MEMARG(OP, v); return 1;
                 case 15: cx->blk_eval.cur_top_env = (JMPENV *)(uintptr_t)v; return 1;
+                }
+                break;
+            case CXt_GIVEN:
+            case CXt_WHEN:
+                switch (w[1]) {
+                case 10: cx->blk_givwhen.leave_op = (OP *)(uintptr_t)v; return 1;
+                case 11: cx->blk_givwhen.defsv_save = (SV *)(uintptr_t)v; return 1;
                 }
                 break;
             default:
