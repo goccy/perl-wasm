@@ -3181,6 +3181,15 @@ std::string perl_release(uint64_t h, const char *ids, uint32_t ids_len) {
     return out;
 }
 
+/* syscall() in a forked process (perl_libc.cc's goperl_syscall): the
+ * host makes none, and the program is told why. */
+extern "C" void perl_wasm_croak_syscall_forked(void) {
+    dTHX;
+    Perl_croak(aTHX_ "syscall() cannot be used in a forked process: a system call acts on the "
+                     "operating system's process, which a process forked by gperl shares with "
+                     "the process it was forked from");
+}
+
 void perl_set_go_dispatcher(uint64_t h, int32_t callback_id) {
     if (h == 0) return;
     g_go_cb = callback_id;

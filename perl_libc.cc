@@ -839,6 +839,7 @@ char *ctermid(char *buf) {
  * in a) is set in addresses the addresses of strings of this memory. More
  * than six arguments no system call takes. -1 with errno set on failure,
  * as syscall(2). */
+extern "C" void perl_wasm_croak_syscall_forked(void) __attribute__((noreturn));
 extern "C" long goperl_syscall(const unsigned long *a, int items, unsigned long addresses) {
     unsigned long long args[6] = {0, 0, 0, 0, 0, 0};
     const int nargs = items - 1;
@@ -850,6 +851,10 @@ extern "C" long goperl_syscall(const unsigned long *a, int items, unsigned long 
     long long result = 0;
     const int rc = wasi_host_sys_syscall((long long)a[0], args, nargs,
                                          (unsigned int)(addresses >> 1), &result);
+    /* the host makes no call for a forked process (1): a system call acts
+     * on the process of the operating system, which a forked process of
+     * gperl shares with the process it was forked from */
+    if (rc == 1) perl_wasm_croak_syscall_forked();
     if (rc != 0) return fail(-rc);
     return (long)result;
 }
