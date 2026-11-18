@@ -3889,6 +3889,8 @@ enum {
     GOPERL_INT_SIGSET_STORE = 64,   /* a: the address of a sigset_t of this
                                      * memory, b: a mask: the set becomes
                                      * that mask */
+    GOPERL_INT_RAISE = 65,          /* b: a signal: it arrives for the
+                                     * program, as raise sends it */
     GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
                                      * functions; a: the flags, and in its
                                      * high half the operation
@@ -5721,6 +5723,16 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         /* sigprocmask and pthread_sigmask of native code: the program's
          * mask, as POSIX::sigprocmask changes it (perl_signal.cc) */
         return perl_signal_native_mask((int)lo, b);
+    case GOPERL_INT_RAISE: {
+        /* a signal native code's call raised for the process (SIGPIPE of a
+         * write into a pipe nobody reads), which the kernel delivers as
+         * the call returns: it arrives for the program now, and its
+         * handler runs at the next op, as perl's does */
+        const int saved = errno;
+        const int r = raise((int)(int64_t)b);
+        errno = saved;
+        return (uint64_t)(int64_t)r;
+    }
     case GOPERL_INT_SIGSET_STORE: {
         /* the set before, into a POSIX::SigSet native code handed over */
         sigset_t *set = (sigset_t *)goperl_mem_arg(aTHX_ a, 1, GOPERL_OP_INTERNAL, "a sigset_t");
