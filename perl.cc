@@ -4438,6 +4438,10 @@ enum {
 #define GOPERL_PL_SIGHANDLERP 115  /* the host's id of the signal handler of
                                     * native code that is PL_sighandlerp, 0
                                     * for the interpreter's own */
+#define GOPERL_PL_SIG_PENDING_ADDR 117 /* the address of PL_sig_pending, which
+                                        * native code reads and takes the
+                                        * address of (Data::HashMap::Shared) */
+#define GOPERL_PL_PSIG_PEND_ADDR 118   /* the address of PL_psig_pend's array */
 #define GOPERL_PL_SV_ARENAROOT 116 /* the first SV arena (read only): native
                                     * code walks the arenas from it */
 
@@ -6053,6 +6057,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SIGHANDLERP:
             return PL_sighandlerp == goperl_sighandler_native ? g_sighandler_native : 0;
         case GOPERL_PL_SV_ARENAROOT: return (uint64_t)(uintptr_t)PL_sv_arenaroot;
+        case GOPERL_PL_SIG_PENDING_ADDR: return GOPERL_ADDR(&PL_sig_pending);
+        case GOPERL_PL_PSIG_PEND_ADDR: return GOPERL_ADDR(PL_psig_pend);
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
