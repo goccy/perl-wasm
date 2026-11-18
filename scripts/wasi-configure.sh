@@ -1029,6 +1029,54 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"op numbers outside the memory taken in {path}")
 PYPATCH
+# ---- B: the links of an op of native code ------------------------------------
+# An op of native code that B is given (perl.cc goperl_native_op) keeps the
+# addresses its links have in the host process: B follows one when it is
+# asked for it, as perl reads a link only then. Every op B makes an object
+# of, and every op its walks step to, is taken through goperl_number_op,
+# which gives an address outside this memory the op that stands for it.
+# Idempotent.
+python3 - <<'PYPATCH'
+path = "ext/B/B.xs"
+t = open(path).read()
+if "GOPERL_LINK" in t:
+    print(f"links of native ops already followed when asked in {path}")
+else:
+    pairs = [
+        ('static SV *\nmake_op_object(pTHX_ const OP *o)\n{\n    SV *opsv = sv_newmortal();\n',
+         '/* the op a link holds, as B follows it (goperl_number_op) */\n'
+         '#define GOPERL_LINK(o) ((OP *)goperl_number_op(aTHX_ PTR2IV(o)))\n\n'
+         'static SV *\nmake_op_object(pTHX_ const OP *o)\n{\n    SV *opsv = sv_newmortal();\n'
+         '    o = GOPERL_LINK(o);\n'),
+        ('    const char *const classname = opclassnames[op_class(o)];\n    dMY_CXT;\n',
+         '    const char *classname;\n    dMY_CXT;\n'
+         '    o = GOPERL_LINK(o);\n    classname = opclassnames[op_class(o)];\n'),
+        ('\tfor (kid = ((UNOP*)o)->op_first; kid; kid = OpSIBLING(kid)) {\n\t    ref = walkoptree(aTHX_ kid, method, ref);\n',
+         '\tfor (kid = GOPERL_LINK(((UNOP*)o)->op_first); kid; kid = GOPERL_LINK(OpSIBLING(kid))) {\n\t    ref = walkoptree(aTHX_ kid, method, ref);\n'),
+        ('    for(; o; o = o->op_next) {\n\tif (o->op_opt == 0)\n',
+         '    for(o = GOPERL_LINK(o); o; o = GOPERL_LINK(o->op_next)) {\n\tif (o->op_opt == 0)\n'),
+        ('\t\t    for (kid = ((LISTOP*)o)->op_first; kid; kid = OpSIBLING(kid))\n\t\t\ti++;\n',
+         '\t\t    for (kid = GOPERL_LINK(((LISTOP*)o)->op_first); kid; kid = GOPERL_LINK(OpSIBLING(kid)))\n\t\t\ti++;\n'),
+        ('\t\tOP *kid = OpSIBLING(cLISTOPo->op_first);   /* pass pushmark */\n'
+         '\t\tkid = kUNOP->op_first;                      /* pass rv2gv */\n'
+         '\t\tkid = kUNOP->op_first;                      /* pass leave */\n',
+         '\t\tOP *kid = GOPERL_LINK(OpSIBLING(GOPERL_LINK(cLISTOPo->op_first)));   /* pass pushmark */\n'
+         '\t\tkid = GOPERL_LINK(kUNOP->op_first);                      /* pass rv2gv */\n'
+         '\t\tkid = GOPERL_LINK(kUNOP->op_first);                      /* pass leave */\n'),
+        ('\t\tret = make_op_object(aTHX_ op_parent(o));\n',
+         '\t\t{\n'
+         '\t\t    /* op_parent, each sibling taken as B follows it */\n'
+         '\t\t    const OP *p = o;\n'
+         '\t\t    while (p && OpHAS_SIBLING(p)) p = GOPERL_LINK(p->op_sibparent);\n'
+         '\t\t    ret = make_op_object(aTHX_ p ? p->op_sibparent : NULL);\n'
+         '\t\t}\n'),
+    ]
+    for old, new in pairs:
+        assert t.count(old) == 1, (path, old[:50], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"links of native ops followed when asked in {path}")
+PYPATCH
 # ---- B: the numbers of pad structures ----------------------------------------
 # The number of a B::PADLIST, B::PADNAMELIST or B::PADNAME object is the
 # structure's address with bit 61 set and the kind of structure in bits 59

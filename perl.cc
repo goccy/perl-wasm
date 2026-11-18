@@ -2544,29 +2544,19 @@ static const char *goperl_procmem_string(pTHX_ uint64_t addr) {
  * op (B::CallChecker asks for the next op, B::OPCheck for the first): B is
  * handed the op's address in the host process. The host says what is
  * there: the interpreter's op that the shadow there stands for, or the
- * fields of the module's own op, whose ops are the interpreter's or others
- * of the module's. B gets an op of this memory with those fields: one for
- * each address, filled again each time B is asked (the module changes its
- * op between calls), and once in one asking (an op that leads back to
- * itself). */
-static OP *goperl_native_op_at(pTHX_ uint64_t addr, uint64_t asking);
-static OP *goperl_native_op_word(pTHX_ goperl_gword_t w, uint64_t asking) {
-    const goperl_gword_t tag = (goperl_gword_t)1 << 62;
-    if (!w) return NULL;
-    if (w & tag) return (OP *)(uintptr_t)(w & ~tag);
-    return goperl_native_op_at(aTHX_ w, asking);
-}
-static OP *goperl_native_op_at(pTHX_ uint64_t addr, uint64_t asking) {
-    struct ghost {
-        OP *op;
-        uint64_t asking;
-    };
-    static std::unordered_map<uint64_t, ghost> ghosts;
-    ghost &g = ghosts[addr];
-    if (g.op && g.asking == asking) return g.op;
+ * fields of the module's own op. B gets an op of this memory with those
+ * fields, one for each address, filled again each time B is asked (the
+ * module changes its op between calls). Its links are the addresses the
+ * module's op holds, in the host process: B follows one when it is asked
+ * for it (B.xs's make_op_object and its walks of ops), as perl reads a
+ * link only then, so a link the module left holding stack bytes is never
+ * read unless the program asks for it. */
+extern "C" OP *goperl_native_op(pTHX_ UV addr) {
+    static std::unordered_map<uint64_t, OP *> ghosts;
+    const uint64_t addr64 = (uint64_t)addr;
     if (g_go_cb == 0)
-        Perl_croak(aTHX_ "go-perl: no native code to ask for its op at 0x%" UVxf, (UV)addr);
-    const goperl_gword_t words[1] = {addr};
+        Perl_croak(aTHX_ "go-perl: no native code to ask for its op at 0x%" UVxf, addr);
+    const goperl_gword_t words[1] = {addr64};
     uint32_t rlen = 0;
     unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_NATIVE_OP, words, 1, &rlen);
     goperl_gword_t w[7];
@@ -2577,25 +2567,26 @@ static OP *goperl_native_op_at(pTHX_ uint64_t addr, uint64_t asking) {
         Perl_croak(aTHX_ "go-perl: native code did not say what its op at 0x%" UVxf " is", (UV)addr);
     /* room for the largest kind of op */
     const size_t size = sizeof(LOOP) > sizeof(PMOP) ? sizeof(LOOP) : sizeof(PMOP);
-    if (!g.op) g.op = static_cast<OP *>(PerlMemShared_calloc(1, size > sizeof(COP) ? size : sizeof(COP)));
-    g.asking = asking;
-    OP *const o = g.op;
+    OP *&ghost = ghosts[addr64];
+    if (!ghost) ghost = static_cast<OP *>(PerlMemShared_calloc(1, size > sizeof(COP) ? size : sizeof(COP)));
+    OP *const o = ghost;
     o->op_type = (OPCODE)(w[1] & 0xFFFF);
     if (o->op_type >= OP_max) o->op_type = OP_NULL;
     o->op_flags = (U8)(w[1] >> 16);
     o->op_private = (U8)(w[1] >> 24);
     o->op_moresib = (w[1] >> 32) & 1;
+    o->op_opt = (w[1] >> 33) & 1;
+    o->op_slabbed = (w[1] >> 34) & 1;
+    o->op_savefree = (w[1] >> 35) & 1;
+    o->op_static = (w[1] >> 36) & 1;
+    o->op_folded = (w[1] >> 37) & 1;
     o->op_ppaddr = PL_ppaddr[o->op_type];
     o->op_targ = (PADOFFSET)w[2];
-    o->op_next = goperl_native_op_word(aTHX_ w[3], asking);
-    o->op_sibparent = goperl_native_op_word(aTHX_ w[4], asking);
-    cUNOPx(o)->op_first = goperl_native_op_word(aTHX_ w[5], asking);
-    cBINOPx(o)->op_last = goperl_native_op_word(aTHX_ w[6], asking);
+    o->op_next = (OP *)(uintptr_t)w[3];
+    o->op_sibparent = (OP *)(uintptr_t)w[4];
+    cUNOPx(o)->op_first = (OP *)(uintptr_t)w[5];
+    cBINOPx(o)->op_last = (OP *)(uintptr_t)w[6];
     return o;
-}
-extern "C" OP *goperl_native_op(pTHX_ UV addr) {
-    static uint64_t asking;
-    return goperl_native_op_at(aTHX_ (uint64_t)addr, ++asking);
 }
 
 /* The encode_t table of an Encode::XS object of native code: a module made
