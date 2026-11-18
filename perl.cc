@@ -3866,6 +3866,8 @@ enum {
                                      * address of a sigset_t of this memory
                                      * -> the mask before; second: 1 when a
                                      * handler ran */
+    GOPERL_INT_DOCATCH = 43,        /* a: the running op: pp_ctl.c's docatch,
+                                     * with the op's own pp function first */
     GOPERL_INT_PADNAMELIST_NEW = 60, /* b: max -> newPADNAMELIST's list */
     GOPERL_INT_PADNAMELIST_FREE = 61, /* a: the list: PadnamelistREFCNT_dec */
     GOPERL_INT_PADNAME_OUTER = 62,  /* a: a pad name -> newPADNAMEouter's */
@@ -4232,7 +4234,8 @@ enum {
                               * of the top context, which is index */
     GOPERL_CX_POPEVAL = 6,   /* b = index of the top context: cx_popeval */
     GOPERL_CX_POPBLOCK = 7,  /* b = index of the top context: cx_popblock */
-    GOPERL_CX_POP = 8        /* b = index of the top context: CX_POP */
+    GOPERL_CX_POP = 8,       /* b = index of the top context: CX_POP */
+    GOPERL_CX_PUSHTRY = 9    /* s = [index][retop]: cx_pushtry on the top context */
 };
 
 /* PERLIO selectors: the handle functions of perlio.h. */
@@ -4754,6 +4757,8 @@ enum {
 #define GOPERL_PL_CATCH 123            /* CATCH_GET */
 #define GOPERL_PL_TOP_ENV 125          /* the address of PL_top_env's JMPENV */
 #define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
+#define GOPERL_PL_DTOR_THUNK 130       /* the function a destructor of the host's
+                                        * is to the save stack (goperl_dtor_thunk) */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
                                         * variables of the two stacks are
                                         * (goperl_pp_vars) */
@@ -5196,6 +5201,41 @@ static void goperl_save_plvar(pTHX_ int id, int kind) {
     }
 #undef GOPERL_SAVE_PTRVAR
     Perl_croak(aTHX_ "goperl: interpreter variable %d cannot be saved", id);
+}
+
+/* pp_ctl.c's docatch, whose first pp function is the op's own (a pp
+ * function of native code that asks for docatch under CATCH_GET): the ops
+ * run in a loop of their own under a JMPENV of their own, where CATCH_GET
+ * is false, and a die an eval entered under that JMPENV catches goes on
+ * from the eval's op in that loop. NULL: the loop ran the ops to their end. */
+static OP *goperl_docatch(pTHX_ OP *o) {
+    int ret;
+    OP *const oldop = PL_op;
+    dJMPENV;
+    JMPENV_PUSH(ret);
+    switch (ret) {
+    case 0:
+        PL_op = o->op_ppaddr(aTHX);
+    redo_body:
+        if (PL_op) CALLRUNOPS(aTHX);
+        break;
+    case 3:
+        if (PL_restartop && PL_restartjmpenv == PL_top_env) {
+            PL_restartjmpenv = NULL;
+            PL_op = PL_restartop;
+            PL_restartop = 0;
+            goto redo_body;
+        }
+        /* FALLTHROUGH */
+    default:
+        JMPENV_POP;
+        PL_op = oldop;
+        JMPENV_JUMP(ret);
+        NOT_REACHED; /* NOTREACHED */
+    }
+    JMPENV_POP;
+    PL_op = oldop;
+    return NULL;
 }
 
 /* A save of a location in this memory: a pointer by the kind, an integer
@@ -5787,6 +5827,11 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SAVE_FREEOP:
         if (lo) save_freeop(GOPERL_MEMARG(OP, lo));
         return 0;
+    case GOPERL_INT_DOCATCH: {
+        OP *const o = GOPERL_MEMARG(OP, lo);
+        if (!o || o != PL_op) Perl_croak(aTHX_ "goperl: docatch of an op that is not running");
+        return (uint64_t)(uintptr_t)goperl_docatch(aTHX_ o);
+    }
     case GOPERL_INT_RUNOPS: {
         OP *start = GOPERL_MEMARG(OP, lo);
         if (b >> 63) { /* the stack is the interpreter's already */
@@ -6499,6 +6544,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
         case GOPERL_PL_TOP_ENV: return GOPERL_ADDR(PL_top_env);
         case GOPERL_PL_RESTARTJMPENV: return GOPERL_ADDR(PL_restartjmpenv);
+        case GOPERL_PL_DTOR_THUNK: return (uint64_t)(uintptr_t)&goperl_dtor_thunk;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -9366,7 +9412,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             memcpy(w, s, sizeof w);
             if (si != PL_curstackinfo)
                 Perl_croak(aTHX_ "goperl: a context is pushed on the current stackinfo only");
-            cx_pushblock((U8)w[0], (U8)w[1], PL_stack_sp, (I32)(int64_t)w[2]);
+            PERL_CONTEXT *const cx =
+                cx_pushblock((U8)w[0], (U8)w[1], PL_stack_sp, (I32)(int64_t)w[2]);
+            /* the fields of its kind are what the push of that kind sets
+             * (cx_pusheval, cx_pushtry, cx_pushloop_*), which native code
+             * makes next; until then they are empty, not what an earlier
+             * context there left or cxinc's poison, which the context
+             * shadow would read as ops and scalars meanwhile */
+            memset(&cx->cx_u.cx_blk.blk_u, 0, sizeof cx->cx_u.cx_blk.blk_u);
             return (uint64_t)(int64_t)cxstack_ix;
         }
         case GOPERL_CX_PUSHEVAL: {
@@ -9377,6 +9430,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 Perl_croak(aTHX_ "goperl: cx_pusheval is given a context that is not the top one");
             cx_pusheval(&cxstack[cxstack_ix], w[1] ? GOPERL_MEMARG(OP, w[1]) : NULL,
                         w[2] ? GOPERL_SVARG(w[2]) : NULL);
+            return 0;
+        }
+        case GOPERL_CX_PUSHTRY: { /* s = [index][retop]: try/catch's eval
+                 * context, as Future::AsyncAwait resumes one */
+            goperl_gword_t w[2] = {0, 0};
+            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short try context push");
+            memcpy(w, s, sizeof w);
+            if (si != PL_curstackinfo || (I32)(int64_t)w[0] != cxstack_ix || cxstack_ix < 0)
+                Perl_croak(aTHX_ "goperl: cx_pushtry is given a context that is not the top one");
+            cx_pushtry(&cxstack[cxstack_ix], w[1] ? GOPERL_MEMARG(OP, w[1]) : NULL);
             return 0;
         }
         case GOPERL_CX_POPEVAL:
