@@ -491,9 +491,9 @@ static int32_t g_go_cb = 0;
 
 /* Reserved callback method id for pp hooks: a native module that patched a
  * PL_ppaddr slot (host-side proxy table) gets called for every execution of
- * that op type. Request [op][op_type] and the perl stack (see
- * goperl_pp_stack_words); response [1][next_op] and what the hook made of
- * the stack on success, [0]+croak-message on failure. The hook runs the
+ * that op type. Request [op][op_type] and where the perl stack is (see
+ * goperl_pp_stack_words); response [1][next_op][depth][top mark] on success,
+ * [0]+croak-message on failure. The hook runs the
  * ORIGINAL pp itself (perl_xs_helper op RUN_ORIGINAL) and decides the next
  * op, exactly like a real PL_ppaddr replacement. */
 #define GOPERL_PP_HOOK_METHOD_ID (-3)
@@ -1075,71 +1075,49 @@ static constexpr std::array<goperl_bhk_entries, sizeof...(I)> goperl_bhk_tramps_
 static const std::array<goperl_bhk_entries, GOPERL_BHK_MAX> goperl_bhk_tramps =
     goperl_bhk_tramps_make(std::make_index_sequence<GOPERL_BHK_MAX>{});
 
-/* The perl stack as a pp function on the host sees it.
+/* The stack of a module's pp function (the function of a custom op, or one
+ * it put in place of an op's) is the interpreter's own: native code reads
+ * and writes its slots and the marks where they are, in this memory. The
+ * request says where the two stacks are and how far they reach, and gives
+ * the address of a record of where the six variables that describe them
+ * are (goperl_pp_vars), through which native code puts its stack pointer
+ * and its top mark into them before every operation and reads them back
+ * after it (the stacks move when they grow).
  *
- * A pp function reads and writes the argument stack and the mark stack
- * directly, and a module's own (the function of a custom op, or one it put
- * in place of an op's) runs on the host, where it has a copy of both. The
- * copy is made when the function is called; what the function left in it
- * comes back with the next op, and around every operation of the function
- * that runs interpreter code on the stack (the pp function it stands in
- * for) the two are brought in line again.
- *
- * The state, as words: the depth of the stack, the index of the top mark,
- * how many marks follow (the top GOPERL_PP_MARKS_MAX at most), those marks
- * from the lowest, then the values of the stack from index 1. */
-#define GOPERL_PP_MARKS_MAX 32
+ * The words: the address of PL_stack_base, the depth (PL_stack_sp -
+ * PL_stack_base), the room (PL_stack_max - PL_stack_base), the address of
+ * PL_markstack, the top (PL_markstack_ptr - PL_markstack), the mark room
+ * (PL_markstack_max - PL_markstack), the record's address. */
+static goperl_gword_t g_pp_vars[6];
+static uint64_t goperl_pp_vars(pTHX) {
+    g_pp_vars[0] = GOPERL_ADDR(&PL_stack_sp);
+    g_pp_vars[1] = GOPERL_ADDR(&PL_stack_base);
+    g_pp_vars[2] = GOPERL_ADDR(&PL_stack_max);
+    g_pp_vars[3] = GOPERL_ADDR(&PL_markstack_ptr);
+    g_pp_vars[4] = GOPERL_ADDR(&PL_markstack);
+    g_pp_vars[5] = GOPERL_ADDR(&PL_markstack_max);
+    return GOPERL_ADDR(g_pp_vars);
+}
 static void goperl_pp_stack_words(pTHX_ std::vector<goperl_gword_t> &out) {
-    SSize_t depth = PL_stack_sp - PL_stack_base;
-    if (depth < 0) depth = 0;
-    const SSize_t top = PL_markstack_ptr - PL_markstack;
-    const SSize_t nmarks = top > GOPERL_PP_MARKS_MAX ? GOPERL_PP_MARKS_MAX : (top > 0 ? top : 0);
-    out.push_back((goperl_gword_t)depth);
-    out.push_back((goperl_gword_t)(int64_t)top);
-    out.push_back((goperl_gword_t)nmarks);
-    for (SSize_t i = top - nmarks + 1; i <= top; i++)
-        out.push_back((goperl_gword_t)(int64_t)PL_markstack[i]);
-    for (SSize_t i = 1; i <= depth; i++)
-        out.push_back(GOPERL_ADDR(PL_stack_base[i]));
+    out.push_back(GOPERL_ADDR(PL_stack_base));
+    out.push_back((goperl_gword_t)(PL_stack_sp - PL_stack_base));
+    out.push_back((goperl_gword_t)(PL_stack_max - PL_stack_base));
+    out.push_back(GOPERL_ADDR(PL_markstack));
+    out.push_back((goperl_gword_t)(PL_markstack_ptr - PL_markstack));
+    out.push_back((goperl_gword_t)(PL_markstack_max - PL_markstack));
+    out.push_back(goperl_pp_vars(aTHX));
 }
 
-/* What the host's copy became: [depth][lo] and the values of the indices
- * above lo up to depth, then [top mark][mlo] and the marks above mlo up to
- * the top, as words. Returns false when the words are not that. */
+/* What the function left: [depth][top mark], within the stacks as they are
+ * now. Returns false when the words are not that. */
 static bool goperl_pp_stack_apply(pTHX_ const unsigned char *p, size_t len) {
-    const size_t nw = len / 8;
-    if (nw < 2) return false;
-    goperl_gword_t w;
-    memcpy(&w, p, 8);
-    const int64_t depth = (int64_t)w;
-    memcpy(&w, p + 8, 8);
-    const int64_t lo = (int64_t)w;
-    if (depth < 0 || lo < 0 || lo > depth) return false;
-    const size_t nvals = (size_t)(depth - lo);
-    if (nw < 2 + nvals + 2) return false;
-    const SSize_t have = PL_stack_max - PL_stack_base;
-    if (depth >= have) {
-        SV **sp = PL_stack_sp;
-        (void)stack_grow(sp, sp, depth - (PL_stack_sp - PL_stack_base) + 1);
-    }
-    for (size_t i = 0; i < nvals; i++) {
-        memcpy(&w, p + 8 * (2 + i), 8);
-        PL_stack_base[lo + 1 + (SSize_t)i] = (SV *)(uintptr_t)w;
-    }
+    if (len < 16) return false;
+    goperl_gword_t w[2];
+    memcpy(w, p, sizeof w);
+    const int64_t depth = (int64_t)w[0], top = (int64_t)w[1];
+    if (depth < 0 || depth > (int64_t)(PL_stack_max - PL_stack_base)) return false;
+    if (top < 0 || top >= (int64_t)(PL_markstack_max - PL_markstack)) return false;
     PL_stack_sp = PL_stack_base + depth;
-    const unsigned char *q = p + 8 * (2 + nvals);
-    memcpy(&w, q, 8);
-    const int64_t top = (int64_t)w;
-    memcpy(&w, q + 8, 8);
-    const int64_t mlo = (int64_t)w;
-    if (top < 0 || mlo < 0 || mlo > top) return false;
-    const size_t nmarks = (size_t)(top - mlo);
-    if (nw < 2 + nvals + 2 + nmarks) return false;
-    while (PL_markstack + top >= PL_markstack_max) (void)markstack_grow();
-    for (size_t i = 0; i < nmarks; i++) {
-        memcpy(&w, q + 8 * (2 + i), 8);
-        PL_markstack[mlo + 1 + (SSize_t)i] = (Stack_off_t)(int64_t)w;
-    }
     PL_markstack_ptr = PL_markstack + top;
     return true;
 }
@@ -1176,9 +1154,9 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
         free(resp);
         Perl_croak(aTHX_ "%s", msg);
     }
-    /* [1][next op][stack state, when the function changed its copy] */
+    /* [1][next op][depth][top mark] */
     OP *const next = (OP *)(uintptr_t)goperl_resp_word(resp, resp_len, 0);
-    const bool applied = resp_len <= 1 + 8 ||
+    const bool applied = resp_len >= 1 + 8 + 16 &&
                          goperl_pp_stack_apply(aTHX_ resp + 1 + 8, resp_len - (1 + 8));
     free(resp);
     if (!applied) Perl_croak(aTHX_ "pp hook: malformed stack state");
@@ -3784,8 +3762,6 @@ enum goperl_xs_op {
     GOPERL_OP_REGEXP = 197,
     /* Hooks into compilation and teardown that run native code. */
     GOPERL_OP_HOOK = 198,
-    /* The perl stack as a pp function on the host sees it. */
-    GOPERL_OP_PP_STACK = 199,
     /* The context stack. */
     GOPERL_OP_CX = 200,
     /* The fields of an op and of the ops around it, in one answer. */
@@ -4114,9 +4090,14 @@ enum {
     GOPERL_CALL_SS_ROOM = 36,   /* b = how many entries: room for them above
                                  * PL_savestack_ix (SSCHECK) -> the address of
                                  * the save stack, which may have moved */
-    GOPERL_CALL_TMPS_ROOM = 37  /* b = how many: room for them above
+    GOPERL_CALL_TMPS_ROOM = 37, /* b = how many: room for them above
                                  * PL_tmps_ix (EXTEND_MORTAL) -> the address of
                                  * the temporaries stack */
+    GOPERL_CALL_STACK_ROOM = 38, /* a = an address in the stack (native code's
+                                 * sp), b = how many: room for them above it,
+                                 * as EXTEND makes it -> where that slot is now */
+    GOPERL_CALL_MARK_ROOM = 39  /* room for another mark above
+                                 * PL_markstack_ptr */
 };
 /* The words of CALL_PARSER. */
 enum {
@@ -4236,13 +4217,6 @@ enum {
     GOPERL_HOOK_PEEP_ORIG = 3,  /* b = op, c = which */
     GOPERL_HOOK_ATEXIT = 4,     /* b = host id */
     GOPERL_HOOK_UNWIND = 5      /* leave what the running native call opened */
-};
-
-/* PP_STACK selectors (a = selector). */
-enum {
-    GOPERL_PPSTACK_PULL = 0, /* -> the address of the state's words; second:
-                              * their number */
-    GOPERL_PPSTACK_PUSH = 1  /* s = the state, b = its length in bytes */
 };
 
 /* CX selectors (c = selector, a = stackinfo token or 0). */
@@ -4778,6 +4752,9 @@ enum {
 #define GOPERL_PL_SAVESTACK_MAX 121
 #define GOPERL_PL_TMPS_MAX 122
 #define GOPERL_PL_CATCH 123            /* CATCH_GET */
+#define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
+                                        * variables of the two stacks are
+                                        * (goperl_pp_vars) */
 #define GOPERL_PL_SV_ARENAROOT 116 /* the first SV arena (read only): native
                                     * code walks the arenas from it */
 
@@ -5386,7 +5363,7 @@ static const char *goperl_op_name(int32_t op) {
     N(KEYWORD_ENABLE) N(CHARCLASS) N(SAVE_MISC) N(SV_CLASSIFY) N(SV_FLAGS)
     N(SV_SLOT_SET) N(SV_CALL) N(GV_CALL) N(SV_STR) N(SV_SLOT_GET) N(CALLER_CX)
     N(PERLIO) N(MEM_FREE) N(MEM_REALLOC) N(DO_OPENN) N(FIELD) N(REGEXP)
-    N(HOOK) N(PP_STACK) N(CX) N(OP_DUMP) N(CALL) N(TREE) N(INTERNAL)
+    N(HOOK) N(CX) N(OP_DUMP) N(CALL) N(TREE) N(INTERNAL)
 #undef N
     }
     return "?";
@@ -6517,6 +6494,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SAVESTACK_MAX: return (uint64_t)(int64_t)PL_savestack_max;
         case GOPERL_PL_TMPS_MAX: return (uint64_t)(int64_t)PL_tmps_max;
         case GOPERL_PL_CATCH: return CATCH_GET ? 1 : 0;
+        case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
         case GOPERL_PL_TAINTING: return TAINTING_get ? 1 : 0;
@@ -8706,21 +8684,6 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         Perl_croak(aTHX_ "goperl: unknown hook call %d", (int)a);
     }
-    case GOPERL_OP_PP_STACK: { /* a = a GOPERL_PPSTACK_ selector */
-        switch ((int)a) {
-        case GOPERL_PPSTACK_PULL: { /* -> the words; second: their number */
-            static std::vector<goperl_gword_t> state;
-            state.clear();
-            goperl_pp_stack_words(aTHX_ state);
-            return goperl_two(GOPERL_ADDR(state.data()), (uint64_t)state.size());
-        }
-        case GOPERL_PPSTACK_PUSH:
-            if (!s || !goperl_pp_stack_apply(aTHX_ (const unsigned char *)s, (size_t)b))
-                Perl_croak(aTHX_ "goperl: malformed stack state");
-            return 0;
-        }
-        Perl_croak(aTHX_ "goperl: unknown stack call %d", (int)a);
-    }
     case GOPERL_OP_OP_DUMP: { /* a = op token; b = cap<<8 | mode -> the
                  * address of the records; second: their number */
         static std::vector<goperl_gword_t> records;
@@ -8759,6 +8722,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_UNPACKSTRING:
         case GOPERL_CALL_SS_ROOM:
         case GOPERL_CALL_TMPS_ROOM:
+        case GOPERL_CALL_STACK_ROOM:
+        case GOPERL_CALL_MARK_ROOM:
             break;
         default: (void)GOPERL_SVARG(a);
         }
@@ -8888,6 +8853,19 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_SS_ROOM:
             SSCHECK((int)(int64_t)b);
             return GOPERL_ADDR(PL_savestack);
+        case GOPERL_CALL_STACK_ROOM: {
+            SV **sp = (SV **)(uintptr_t)a;
+            if (sp < PL_stack_base || sp > PL_stack_max)
+                Perl_croak(aTHX_ "goperl: EXTEND of a stack pointer outside the stack");
+            if (PL_stack_max - sp < (SSize_t)(int64_t)b) sp = stack_grow(sp, sp, (SSize_t)(int64_t)b);
+            return GOPERL_ADDR(sp);
+        }
+        case GOPERL_CALL_MARK_ROOM: {
+            const SSize_t top = PL_markstack_ptr - PL_markstack;
+            if (PL_markstack_ptr + 1 >= PL_markstack_max) (void)markstack_grow();
+            PL_markstack_ptr = PL_markstack + top;
+            return 0;
+        }
         case GOPERL_CALL_TMPS_ROOM:
             EXTEND_MORTAL((SSize_t)(int64_t)b);
             return GOPERL_ADDR(PL_tmps_stack);
