@@ -4783,6 +4783,8 @@ enum {
 #define GOPERL_PL_YES 128              /* the address of PL_Yes, the buffer of true */
 #define GOPERL_PL_NO 129               /* the address of PL_No, the buffer of false */
 #define GOPERL_PL_DBGV 131             /* PL_DBgv, the glob *DB::DB */
+#define GOPERL_PL_INTERRUPT_ADDR 132   /* the address of the interrupt flag the
+                                        * host sets (a 32-bit word) */
 #define GOPERL_PL_DTOR_THUNK 130       /* the function a destructor of the host's
                                         * is to the save stack (goperl_dtor_thunk) */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
@@ -6540,6 +6542,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_PERLDB: return (uint64_t)(int64_t)PL_perldb;
         case GOPERL_PL_DBSUB: return (uint64_t)(uintptr_t)PL_DBsub;
         case GOPERL_PL_DBGV: return (uint64_t)(uintptr_t)PL_DBgv;
+        case GOPERL_PL_INTERRUPT_ADDR: return GOPERL_ADDR(&g_interrupt);
         case GOPERL_PL_DBSINGLE: return (uint64_t)(uintptr_t)PL_DBsingle;
         case GOPERL_PL_ENDAV: return (uint64_t)(uintptr_t)(SV *)PL_endav;
         case GOPERL_PL_CHECKAV: return (uint64_t)(uintptr_t)(SV *)PL_checkav;
