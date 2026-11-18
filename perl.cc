@@ -517,10 +517,10 @@ static int32_t g_go_cb = 0;
 #define GOPERL_MG_LOCAL_METHOD_ID (-8)
 
 /* Reserved callback method id for PerlIO layer hooks: a host-registered
- * layer (op PERLIO_DEF_LAYER) gets its CUSTOM slots (Pushed/Fill/Popped)
- * run on the host; the stock buffered behavior stays guest-native. The
- * request starts [hook][funcs_id][f][layer]; responses are hook-specific,
- * [0]+message croaks in the guest. */
+ * layer of native code's (op PERLIO_DEFINE, goperlio_define) gets the slots
+ * the module wrote itself run on the host. The request is [the slot][funcs
+ * id][f][layer][errno], the slot's arguments as words and its string; the
+ * response [1][the slot's result], or [0] and the message to die with. */
 #define GOPERL_PERLIO_METHOD_ID (-6)
 
 /* Reserved callback method id for calls of native code that go through one
@@ -3421,154 +3421,6 @@ static void goperl_uvar_drop(pTHX_ SV *sv) {
     }
 }
 
-/* ---- host-backed PerlIO layers (v7) --------------------------------------
- * A native module defines a layer with custom Pushed/Fill (the
- * PerlIO::utf8_strict shape); the guest registers a PerlIOBuf-derived
- * proxy whose stock slots are the real :perlio behaviors and whose custom
- * slots round-trip to the host over GOPERL_PERLIO_METHOD_ID. The buffer
- * lives in the GUEST (fast_gets stays native); one host call per refill. */
-
-#define GOPERLIO_HOOK_PUSHED 1
-#define GOPERLIO_HOOK_FILL 2
-#define GOPERLIO_HOOK_POPPED 3
-
-#define GOPERLIO_MASK_PUSHED 0x1
-#define GOPERLIO_MASK_FILL 0x2
-
-typedef struct {
-    PerlIOBuf buf;
-    U32 funcs_id;
-    U32 mask;
-} GoperlIOL;
-
-#define GOPERLIO_MAX_LAYERS 8
-typedef struct {
-    PerlIO_funcs funcs;
-    char name[32];
-    U32 funcs_id;
-    U32 mask;
-} goperlio_class_t;
-static goperlio_class_t goperlio_classes[GOPERLIO_MAX_LAYERS];
-static int goperlio_nclasses = 0;
-
-static goperlio_class_t *goperlio_class_of(PerlIO_funcs *tab) {
-    for (int i = 0; i < goperlio_nclasses; i++)
-        if (&goperlio_classes[i].funcs == tab) return &goperlio_classes[i];
-    return NULL;
-}
-
-/* Send one hook to the host. head is the fixed prefix; extra/extralen is
- * appended. Returns the malloc'd response (caller frees) or croaks. */
-static unsigned char *goperlio_call(pTHX_ U32 hook, GoperlIOL *l, PerlIO *f,
-                                    const void *extra, size_t extralen,
-                                    uint32_t *resplen) {
-    if (g_go_cb == 0)
-        Perl_croak(aTHX_ "PerlIO layer hook: no Go dispatcher");
-    goperl_gword_t head[4];
-    head[0] = hook;
-    head[1] = l->funcs_id;
-    head[2] = GOPERL_ADDR(f);
-    head[3] = GOPERL_ADDR(l);
-    size_t n = sizeof head + extralen;
-    unsigned char *buf = (unsigned char *)malloc(n);
-    if (!buf) Perl_croak(aTHX_ "PerlIO layer hook: out of memory");
-    memcpy(buf, head, sizeof head);
-    if (extralen) memcpy(buf + sizeof head, extra, extralen);
-    int64_t rc =
-        wasmify_callback_invoke(g_go_cb, GOPERL_PERLIO_METHOD_ID, buf, n);
-    free(buf);
-    if (rc == GOPERL_CALLBACK_JUMPED) {
-        *resplen = 0;
-        return NULL;
-    }
-    uint32_t rlen;
-    unsigned char *resp = goperl_callback_response(rc, &rlen);
-    if (resp == nullptr || rlen < 1)
-        Perl_croak(aTHX_ "PerlIO layer hook: empty response");
-    if (resp[0] == 0) {
-        char msg[512];
-        size_t ml = rlen - 1;
-        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-        memcpy(msg, resp + 1, ml);
-        msg[ml] = '\0';
-        free(resp);
-        Perl_croak(aTHX_ "%s", msg);
-    }
-    *resplen = rlen;
-    return resp;
-}
-
-static IV goperlio_pushed(pTHX_ PerlIO *f, const char *mode, SV *arg,
-                          PerlIO_funcs *tab) {
-    goperlio_class_t *cls = goperlio_class_of(tab);
-    IV code = PerlIOBuf_pushed(aTHX_ f, mode, arg, tab);
-    if (!cls) return code;
-    GoperlIOL *l = PerlIOSelf(f, GoperlIOL);
-    l->funcs_id = cls->funcs_id;
-    l->mask = cls->mask;
-    if (code != 0 || !(cls->mask & GOPERLIO_MASK_PUSHED)) return code;
-    /* extra: [the arg][the bytes of the mode, NUL] */
-    char extra[64];
-    const goperl_gword_t argtok = GOPERL_ADDR(arg);
-    memcpy(extra, &argtok, 8);
-    size_t ml = mode ? strlen(mode) : 0;
-    if (ml > 55) ml = 55;
-    memcpy(extra + 8, mode ? mode : "", ml);
-    extra[8 + ml] = '\0';
-    uint32_t rlen = 0;
-    unsigned char *resp =
-        goperlio_call(aTHX_ GOPERLIO_HOOK_PUSHED, l, f, extra, 9 + ml, &rlen);
-    /* response: [1][flags to set][flags to clear] */
-    if (rlen >= 1 + 16) {
-        const U32 setf = (U32)goperl_resp_word(resp, rlen, 0);
-        const U32 clrf = (U32)goperl_resp_word(resp, rlen, 1);
-        PerlIOBase(f)->flags = (PerlIOBase(f)->flags & ~clrf) | setf;
-    }
-    free(resp);
-    return 0;
-}
-
-static IV goperlio_fill(pTHX_ PerlIO *f) {
-    GoperlIOL *l = PerlIOSelf(f, GoperlIOL);
-    PerlIOBuf *b = &l->buf;
-    if (PerlIO_flush(f) != 0) return -1;
-    if (!b->buf) PerlIO_get_base(f);
-    b->ptr = b->end = b->buf;
-    /* extra: [buf][bufsiz][flags] */
-    goperl_gword_t extra[3];
-    extra[0] = GOPERL_ADDR(b->buf);
-    extra[1] = (goperl_gword_t)b->bufsiz;
-    extra[2] = PerlIOBase(f)->flags;
-    uint32_t rlen = 0;
-    unsigned char *resp = goperlio_call(aTHX_ GOPERLIO_HOOK_FILL, l, f, extra,
-                                        sizeof extra, &rlen);
-    /* response: [1][status][ptrOff][endOff][setflags] */
-    IV ret = -1;
-    if (rlen >= 1 + 32) {
-        const goperl_gword_t status = goperl_resp_word(resp, rlen, 0);
-        const goperl_gword_t ptrOff = goperl_resp_word(resp, rlen, 1);
-        const goperl_gword_t endOff = goperl_resp_word(resp, rlen, 2);
-        const U32 setf = (U32)goperl_resp_word(resp, rlen, 3);
-        b->ptr = b->buf + ptrOff;
-        b->end = b->buf + endOff;
-        PerlIOBase(f)->flags |= setf;
-        ret = status == 0 ? 0 : -1;
-    }
-    free(resp);
-    return ret;
-}
-
-static IV goperlio_popped(pTHX_ PerlIO *f) {
-    GoperlIOL *l = PerlIOSelf(f, GoperlIOL);
-    if (l->funcs_id) {
-        uint32_t rlen = 0;
-        unsigned char *resp =
-            goperlio_call(aTHX_ GOPERLIO_HOOK_POPPED, l, f, "", 0, &rlen);
-        free(resp);
-    }
-    return PerlIOBuf_popped(aTHX_ f);
-}
-
 /* ---- perl_xs_helper protocol constants ----------------------------------
  * KEEP IN SYNC with go-perl's xsnative/sdk/include/perl.h, which mirrors
  * every value here (the GOPERL_OP_* enum, the GOPERL_PL_* ids, and the
@@ -3746,14 +3598,8 @@ enum goperl_xs_op {
     GOPERL_OP_SV_CUR = 162,
     GOPERL_OP_SV_MAGIC_STD = 163,
     /* v7: PerlIO layer bridging */
-    GOPERL_OP_PERLIO_DEF_LAYER = 164,
-    GOPERL_OP_PERLIO_NEXT_READ = 165,
-    GOPERL_OP_PERLIO_NEXT_FASTGETS = 166,
-    GOPERL_OP_PERLIO_NEXT_GETCNT = 167,
-    GOPERL_OP_PERLIO_NEXT_GETPTR = 168,
-    GOPERL_OP_PERLIO_NEXT_SETPTRCNT = 169,
-    GOPERL_OP_PERLIO_NEXT_FILL = 170,
-    GOPERL_OP_PERLIO_STATE = 171,
+    /* 164-171 were the first layer proxy's (PerlIO::utf8_strict's Pushed
+     * and Fill, the layer below as a tail): retired, not to be used again */
     /* v8: keyword plugins, lexer/parser bridging, optree construction */
     GOPERL_OP_OPTREE_NEW = 172,
     GOPERL_OP_OPTREE_MISC = 173,
@@ -3798,7 +3644,11 @@ enum goperl_xs_op {
      * (pads, the body of a sub, the hints of a COP), and saves the
      * interpreter undoes: c = a GOPERL_INT_ selector, a = a token or an
      * address of this memory. */
-    GOPERL_OP_INTERNAL = 204
+    GOPERL_OP_INTERNAL = 204,
+    /* PerlIO layers of native code: a class (goperlio_define), a call of
+     * a layer function (goperlio_call) */
+    GOPERL_OP_PERLIO_DEFINE = 300,
+    GOPERL_OP_PERLIO_CALL = 301
 };
 
 /* the C library's waitpid, which the link otherwise gives to the program's
@@ -4340,9 +4190,12 @@ enum {
     GOPERL_PIO_LAYERS = 32, /* -> the address of [n] and, for each layer
                             * from the top, [the address of its next
                             * field][the address of its name][its kind][its
-                            * flags]; with b = 1 five more words a layer:
+                            * flags]; with b = 1 seven more words a layer:
                             * [buf][end][ptr][bufsiz][posn] of a buffered one
-                            * (PerlIOBuf), zeros for another */
+                            * (PerlIOBuf), zeros for another and for a layer
+                            * of native code's (whose struct the host has),
+                            * then [the module's table of a layer of native
+                            * code's, 0 for another][the layer's table] */
     /* The stdio stream of the handle, made as perl makes it: FIND_FILE is
      * PerlIO_findFILE (the stream of the handle's :stdio layer, or a new
      * one), EXPORT_FILE is PerlIO_exportFILE (s = the mode, or empty): the
@@ -4360,7 +4213,25 @@ enum {
     GOPERL_PIO_OPENN = 36,  /* a = the old handle or 0; b = the length of s:
                              * four words (fd, imode, perm, narg), narg
                              * words of SVs, the layers NUL the mode NUL */
-    GOPERL_PIO_ISUTF8 = 37
+    GOPERL_PIO_ISUTF8 = 37,
+    /* the stack of layers of a handle, and the tables of layers (perliol.h):
+     * PUSH (s = [tab kind][tab][arg][has a mode] then the mode, see
+     * goperlio_tab_arg) -> the handle or 0; POP; FIND_LAYER (s = the name,
+     * b = load) -> the table; LAYER_FETCH (a = a list of layers, b = the
+     * index, s = [def kind][def]) -> the table; ARG_FETCH (a = the list,
+     * b = the index) -> the argument (PerlIOArg); STD_FUNCS (b = the number
+     * in goperlio_std_funcs) -> the table; FUNCS_INFO (a = a table) -> the
+     * address of [name][size][kind][the module's table, 0 for a table of
+     * perl's][the slots that are not NULL, a bit each]; MODESTR -> the mode
+     * of the handle as PerlIO_modestr writes it */
+    GOPERL_PIO_PUSH = 300,
+    GOPERL_PIO_POP = 301,
+    GOPERL_PIO_FIND_LAYER = 302,
+    GOPERL_PIO_LAYER_FETCH = 303,
+    GOPERL_PIO_ARG_FETCH = 304,
+    GOPERL_PIO_STD_FUNCS = 305,
+    GOPERL_PIO_FUNCS_INFO = 306,
+    GOPERL_PIO_MODESTR = 307
 };
 
 /* SAVE_MISC selectors. */
@@ -5494,14 +5365,13 @@ static const char *goperl_op_name(int32_t op) {
     N(SV_IS_BOOL) N(SV_POK_ONLY) N(EVAL_SV) N(AV_SHIFT) N(SV_2IO)
     N(SV_FORCE_NORMAL) N(PERLIO_OPEN) N(PERLIO_CLOSE) N(PERLIO_PUTS)
     N(PERLIO_FLUSH) N(PERLIO_WRITE) N(IO_OFP) N(SV_CUR) N(SV_MAGIC_STD)
-    N(PERLIO_DEF_LAYER) N(PERLIO_NEXT_READ) N(PERLIO_NEXT_FASTGETS)
-    N(PERLIO_NEXT_GETCNT) N(PERLIO_NEXT_GETPTR) N(PERLIO_NEXT_SETPTRCNT)
-    N(PERLIO_NEXT_FILL) N(PERLIO_STATE) N(OPTREE_NEW) N(OPTREE_MISC) N(OP_SET)
+    N(OPTREE_NEW) N(OPTREE_MISC) N(OP_SET)
     N(LEX) N(PARSE) N(PARSER_GET) N(PARSER_SET) N(BLOCK) N(PAD)
     N(KEYWORD_ENABLE) N(CHARCLASS) N(SAVE_MISC) N(SV_CLASSIFY) N(SV_FLAGS)
     N(SV_SLOT_SET) N(SV_CALL) N(GV_CALL) N(SV_STR) N(SV_SLOT_GET) N(CALLER_CX)
     N(PERLIO) N(MEM_FREE) N(MEM_REALLOC) N(DO_OPENN) N(FIELD) N(REGEXP)
     N(HOOK) N(CX) N(OP_DUMP) N(CALL) N(TREE) N(INTERNAL)
+    N(PERLIO_DEFINE) N(PERLIO_CALL)
 #undef N
     }
     return "?";
@@ -5584,6 +5454,559 @@ static inline SV *goperl_stored(pTHX_ uint64_t v) {
     SV *const imm = v < 0x40 ? goperl_static_immortal(aTHX_ v) : NULL;
     return imm ? imm : (SV *)(uintptr_t)v;
 }
+
+/* ---- PerlIO layers of native code ----------------------------------------
+ * A native module defines a layer (PerlIO_define_layer of its PerlIO_funcs,
+ * op PERLIO_DEFINE): the interpreter registers a class under the module's
+ * name, with the module's size (0 for a pseudo-layer, which has no struct of
+ * its own: :locale, :if), kind and slots. A slot the module left NULL is
+ * NULL; a slot that names one of perl's own layer functions (the stock
+ * functions below, by number) is that function, which runs here on the
+ * layer; any other slot is the module's and runs on the host: the slot's
+ * forwarder sends the hook (GOPERL_PERLIO_METHOD_ID) with the slot's
+ * arguments. The module's struct is the host's (the SDK keeps the PerlIOl
+ * and, for a buffered layer, the PerlIOBuf part of it in step with the
+ * layer here). Popped always goes to the host, which lets go of its struct.
+ *
+ * The other way, native code calls a stock function, or a slot of one of
+ * the interpreter's tables, on a handle (op PERLIO_CALL). */
+
+/* The slots of PerlIO_funcs, in their order. */
+enum {
+    GOPERLIO_SLOT_PUSHED = 0,
+    GOPERLIO_SLOT_POPPED,
+    GOPERLIO_SLOT_OPEN,
+    GOPERLIO_SLOT_BINMODE,
+    GOPERLIO_SLOT_GETARG,
+    GOPERLIO_SLOT_FILENO,
+    GOPERLIO_SLOT_DUP,
+    GOPERLIO_SLOT_READ,
+    GOPERLIO_SLOT_UNREAD,
+    GOPERLIO_SLOT_WRITE,
+    GOPERLIO_SLOT_SEEK,
+    GOPERLIO_SLOT_TELL,
+    GOPERLIO_SLOT_CLOSE,
+    GOPERLIO_SLOT_FLUSH,
+    GOPERLIO_SLOT_FILL,
+    GOPERLIO_SLOT_EOF,
+    GOPERLIO_SLOT_ERROR,
+    GOPERLIO_SLOT_CLEARERR,
+    GOPERLIO_SLOT_SETLINEBUF,
+    GOPERLIO_SLOT_GET_BASE,
+    GOPERLIO_SLOT_GET_BUFSIZ,
+    GOPERLIO_SLOT_GET_PTR,
+    GOPERLIO_SLOT_GET_CNT,
+    GOPERLIO_SLOT_SET_PTRCNT,
+    GOPERLIO_SLOTS,
+    /* the hook after a stock Popped (or none): the host lets go of its
+     * struct of the layer */
+    GOPERLIO_HOOK_DROP = GOPERLIO_SLOTS
+};
+/* The shapes of the slots' functions. */
+enum {
+    GOPERLIO_SIG_PUSHED,    /* IV (f, mode, arg, tab) */
+    GOPERLIO_SIG_IV_F,      /* IV (f) */
+    GOPERLIO_SIG_OPEN,      /* PerlIO *(tab, layers, n, mode, fd, imode, perm, old, narg, args) */
+    GOPERLIO_SIG_GETARG,    /* SV *(f, param, flags) */
+    GOPERLIO_SIG_DUP,       /* PerlIO *(f, o, param, flags) */
+    GOPERLIO_SIG_READ,      /* SSize_t (f, vbuf, count) */
+    GOPERLIO_SIG_WRITE,     /* SSize_t (f, const vbuf, count) */
+    GOPERLIO_SIG_SEEK,      /* IV (f, offset, whence) */
+    GOPERLIO_SIG_TELL,      /* Off_t (f) */
+    GOPERLIO_SIG_VOID_F,    /* void (f) */
+    GOPERLIO_SIG_PTR_F,     /* STDCHAR *(f) */
+    GOPERLIO_SIG_SIZE_F,    /* Size_t (f) */
+    GOPERLIO_SIG_SSIZE_F,   /* SSize_t (f) */
+    GOPERLIO_SIG_SETPTRCNT  /* void (f, ptr, cnt) */
+};
+static const unsigned char goperlio_slot_sig[GOPERLIO_SLOTS] = {
+    GOPERLIO_SIG_PUSHED, GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_OPEN,   GOPERLIO_SIG_IV_F,
+    GOPERLIO_SIG_GETARG, GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_DUP,    GOPERLIO_SIG_READ,
+    GOPERLIO_SIG_WRITE,  GOPERLIO_SIG_WRITE,  GOPERLIO_SIG_SEEK,   GOPERLIO_SIG_TELL,
+    GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_IV_F,
+    GOPERLIO_SIG_IV_F,   GOPERLIO_SIG_VOID_F, GOPERLIO_SIG_VOID_F, GOPERLIO_SIG_PTR_F,
+    GOPERLIO_SIG_SIZE_F, GOPERLIO_SIG_PTR_F,  GOPERLIO_SIG_SSIZE_F, GOPERLIO_SIG_SETPTRCNT,
+};
+
+/* perl's own layer functions (perliol.h), by the numbers the SDK has for
+ * them (its perliol.h lists them in the same order: KEEP IN SYNC). */
+#define GOPERLIO_STOCK(X)                                                     \
+    X(1, PerlIOBase_pushed, PUSHED) X(2, PerlIOBuf_pushed, PUSHED)            \
+    X(3, PerlIOCrlf_pushed, PUSHED) X(4, PerlIOPending_pushed, PUSHED)        \
+    X(5, PerlIOPop_pushed, PUSHED) X(6, PerlIORaw_pushed, PUSHED)             \
+    X(7, PerlIOStdio_pushed, PUSHED) X(8, PerlIOUnix_pushed, PUSHED)          \
+    X(9, PerlIOUtf8_pushed, PUSHED) X(10, PerlIOBase_popped, IV_F)            \
+    X(11, PerlIOBuf_popped, IV_F) X(12, PerlIOBase_noop_ok, IV_F)             \
+    X(13, PerlIOBase_noop_fail, IV_F) X(14, PerlIOBase_binmode, IV_F)         \
+    X(15, PerlIOCrlf_binmode, IV_F) X(16, PerlIOBase_fileno, IV_F)            \
+    X(17, PerlIOStdio_fileno, IV_F) X(18, PerlIOUnix_fileno, IV_F)            \
+    X(19, PerlIOBase_close, IV_F) X(20, PerlIOBuf_close, IV_F)                \
+    X(21, PerlIOPending_close, IV_F) X(22, PerlIOStdio_close, IV_F)           \
+    X(23, PerlIOUnix_close, IV_F) X(24, PerlIOBuf_flush, IV_F)                \
+    X(25, PerlIOCrlf_flush, IV_F) X(26, PerlIOPending_flush, IV_F)            \
+    X(27, PerlIOStdio_flush, IV_F) X(28, PerlIOBuf_fill, IV_F)                \
+    X(29, PerlIOPending_fill, IV_F) X(30, PerlIOStdio_fill, IV_F)             \
+    X(31, PerlIOBase_eof, IV_F) X(32, PerlIOStdio_eof, IV_F)                  \
+    X(33, PerlIOBase_error, IV_F) X(34, PerlIOStdio_error, IV_F)              \
+    X(35, PerlIOBase_open, OPEN) X(36, PerlIOBuf_open, OPEN)                  \
+    X(37, PerlIOStdio_open, OPEN) X(38, PerlIOUnix_open, OPEN)                \
+    X(39, PerlIOBase_dup, DUP) X(40, PerlIOBuf_dup, DUP)                      \
+    X(41, PerlIOStdio_dup, DUP) X(42, PerlIOUnix_dup, DUP)                    \
+    X(43, PerlIOBase_read, READ) X(44, PerlIOBuf_read, READ)                  \
+    X(45, PerlIOPending_read, READ) X(46, PerlIOStdio_read, READ)             \
+    X(47, PerlIOUnix_read, READ) X(48, PerlIOBase_unread, WRITE)              \
+    X(49, PerlIOBuf_unread, WRITE) X(50, PerlIOCrlf_unread, WRITE)            \
+    X(51, PerlIOStdio_unread, WRITE) X(52, PerlIOBuf_write, WRITE)            \
+    X(53, PerlIOCrlf_write, WRITE) X(54, PerlIOStdio_write, WRITE)            \
+    X(55, PerlIOUnix_write, WRITE) X(56, PerlIOBuf_seek, SEEK)                \
+    X(57, PerlIOPending_seek, SEEK) X(58, PerlIOStdio_seek, SEEK)             \
+    X(59, PerlIOUnix_seek, SEEK) X(60, PerlIOBuf_tell, TELL)                  \
+    X(61, PerlIOStdio_tell, TELL) X(62, PerlIOUnix_tell, TELL)                \
+    X(63, PerlIOBase_clearerr, VOID_F) X(64, PerlIOStdio_clearerr, VOID_F)    \
+    X(65, PerlIOBase_setlinebuf, VOID_F) X(66, PerlIOStdio_setlinebuf, VOID_F) \
+    X(67, PerlIOBuf_get_base, PTR_F) X(68, PerlIOBuf_get_ptr, PTR_F)          \
+    X(69, PerlIOBuf_bufsiz, SIZE_F) X(70, PerlIOBuf_get_cnt, SSIZE_F)         \
+    X(71, PerlIOCrlf_get_cnt, SSIZE_F) X(72, PerlIOBuf_set_ptrcnt, SETPTRCNT) \
+    X(73, PerlIOCrlf_set_ptrcnt, SETPTRCNT) X(74, PerlIOPending_set_ptrcnt, SETPTRCNT)
+#define GOPERLIO_STOCK_MAX 74
+typedef void (*goperlio_fn_t)(void);
+struct goperlio_stock_t {
+    unsigned char sig;
+    goperlio_fn_t fn;
+};
+static const goperlio_stock_t goperlio_stock[GOPERLIO_STOCK_MAX + 1] = {
+    {0, nullptr},
+#define X(id, name, sig) {GOPERLIO_SIG_##sig, reinterpret_cast<goperlio_fn_t>(&name)},
+    GOPERLIO_STOCK(X)
+#undef X
+};
+
+/* The function in slot s of a table, and the place to put one there. */
+static goperlio_fn_t *goperlio_slot_ref(PerlIO_funcs *tab, int s) {
+    switch (s) {
+#define S(k, m) case GOPERLIO_SLOT_##k: return reinterpret_cast<goperlio_fn_t *>(&tab->m);
+    S(PUSHED, Pushed) S(POPPED, Popped) S(OPEN, Open) S(BINMODE, Binmode) S(GETARG, Getarg)
+    S(FILENO, Fileno) S(DUP, Dup) S(READ, Read) S(UNREAD, Unread) S(WRITE, Write)
+    S(SEEK, Seek) S(TELL, Tell) S(CLOSE, Close) S(FLUSH, Flush) S(FILL, Fill) S(EOF, Eof)
+    S(ERROR, Error) S(CLEARERR, Clearerr) S(SETLINEBUF, Setlinebuf) S(GET_BASE, Get_base)
+    S(GET_BUFSIZ, Get_bufsiz) S(GET_PTR, Get_ptr) S(GET_CNT, Get_cnt) S(SET_PTRCNT, Set_ptrcnt)
+#undef S
+    }
+    return nullptr;
+}
+
+/* A class of native code's: the table perl knows (first, so that a layer's
+ * tab is its class), the module's number for its table (funcs_id, for the
+ * hook) and the address of that table in the module (host_tab, by which
+ * native code names its class), the slots that run on the host, and the
+ * stock Popped (Popped itself always goes to the host). */
+typedef struct goperlio_class {
+    PerlIO_funcs funcs;
+    struct goperlio_class *next;
+    U32 funcs_id;
+    U32 custom;
+    goperl_gword_t host_tab;
+    IV (*stock_popped)(pTHX_ PerlIO *);
+} goperlio_class_t;
+static goperlio_class_t *goperlio_classes = nullptr;
+
+static goperlio_class_t *goperlio_class_of(const PerlIO_funcs *tab) {
+    for (goperlio_class_t *c = goperlio_classes; c; c = c->next)
+        if (&c->funcs == tab) return c;
+    return nullptr;
+}
+static goperlio_class_t *goperlio_class_by_host(goperl_gword_t host_tab) {
+    for (goperlio_class_t *c = goperlio_classes; c; c = c->next)
+        if (c->host_tab == host_tab) return c;
+    return nullptr;
+}
+/* A table native code names: [kind][value], 0 none, 1 a table of the
+ * interpreter's by its address, 2 a class of native code's by the address
+ * of the module's table. */
+static PerlIO_funcs *goperlio_tab_arg(pTHX_ goperl_gword_t kind, goperl_gword_t v) {
+    switch (kind) {
+    case 0: return nullptr;
+    case 1: return (PerlIO_funcs *)(uintptr_t)v;
+    case 2: {
+        goperlio_class_t *c = goperlio_class_by_host(v);
+        if (!c) Perl_croak(aTHX_ "goperl: a PerlIO layer native code did not define");
+        return &c->funcs;
+    }
+    }
+    Perl_croak(aTHX_ "goperl: unknown PerlIO table %d", (int)kind);
+}
+
+/* One hook to the host: [slot][funcs id][f][layer][errno], the slot's
+ * words and a string (the mode). The slot starts with this errno, and the
+ * errno it leaves is $! after it (the loader sets it), as an XSUB's. The answer is [1][the slot's result], [0][the
+ * message] to die with, or GOPERL_RESP_THROW (the value the slot threw).
+ * The slot is a native call as an XSUB is (goperl_native_enter). jumped: the host ended the call by a non-local exit
+ * of this interpreter (GOPERL_CALLBACK_JUMPED): the caller returns at once. */
+static goperl_gword_t goperlio_hook(pTHX_ goperlio_class_t *cls, int slot, PerlIO *f,
+                                    const goperl_gword_t *w, size_t nw, const char *str,
+                                    bool *jumped) {
+    *jumped = false;
+    if (g_go_cb == 0) Perl_croak(aTHX_ "PerlIO layer hook: no Go dispatcher");
+    const size_t sl = str ? strlen(str) + 1 : 0;
+    const size_t n = 8 * (5 + nw) + sl;
+    unsigned char *buf = (unsigned char *)malloc(n);
+    if (!buf) Perl_croak(aTHX_ "PerlIO layer hook: out of memory");
+    goperl_gword_t head[5];
+    head[0] = (goperl_gword_t)slot;
+    head[1] = cls->funcs_id;
+    head[2] = GOPERL_ADDR(f);
+    head[3] = (f && cls->funcs.size) ? GOPERL_ADDR(*f) : 0;
+    head[4] = (goperl_gword_t)(int64_t)errno;
+    memcpy(buf, head, sizeof head);
+    if (nw) memcpy(buf + sizeof head, w, 8 * nw);
+    if (sl) memcpy(buf + 8 * (5 + nw), str, sl);
+    const size_t native_below = goperl_native_enter(aTHX);
+    const int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_PERLIO_METHOD_ID, buf, n);
+    goperl_native_leave(native_below);
+    free(buf);
+    if (rc == GOPERL_CALLBACK_JUMPED) {
+        *jumped = true;
+        return 0;
+    }
+    uint32_t rlen;
+    unsigned char *resp = goperl_callback_response(rc, &rlen);
+    if (resp == nullptr || rlen < 1) Perl_croak(aTHX_ "PerlIO layer hook: empty response");
+    goperl_die_if_thrown(aTHX_ resp);
+    if (resp[0] == GOPERL_RESP_FAIL) {
+        char msg[512];
+        size_t ml = rlen - 1;
+        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
+        memcpy(msg, resp + 1, ml);
+        msg[ml] = '\0';
+        free(resp);
+        Perl_croak(aTHX_ "%s", msg);
+    }
+    const goperl_gword_t r = goperl_resp_word(resp, rlen, 0);
+    free(resp);
+    return r;
+}
+static goperlio_class_t *goperlio_class_of_handle(pTHX_ PerlIO *f) {
+    goperlio_class_t *c = PerlIOValid(f) ? goperlio_class_of(PerlIOBase(f)->tab) : nullptr;
+    if (!c) Perl_croak(aTHX_ "goperl: a layer of native code without its class");
+    return c;
+}
+#define GOPERLIO_HOOK_F(slot, f, w, nw, str)                                         \
+    ({ bool jumped_;                                                                \
+       const goperl_gword_t r_ = goperlio_hook(aTHX_ goperlio_class_of_handle(aTHX_ f), \
+                                               (slot), (f), (w), (nw), (str), &jumped_); \
+       r_; })
+
+/* The forwarders of the slots native code runs on the host. */
+static IV goperlio_fwd_pushed(pTHX_ PerlIO *f, const char *mode, SV *arg, PerlIO_funcs *tab) {
+    goperlio_class_t *cls = goperlio_class_of(tab);
+    if (!cls) Perl_croak(aTHX_ "goperl: a layer of native code without its class");
+    const goperl_gword_t w[2] = {GOPERL_ADDR(arg), mode ? 1u : 0u};
+    bool jumped;
+    return (IV)(int64_t)goperlio_hook(aTHX_ cls, GOPERLIO_SLOT_PUSHED, f, w, 2, mode, &jumped);
+}
+static IV goperlio_fwd_popped(pTHX_ PerlIO *f) {
+    goperlio_class_t *cls = goperlio_class_of_handle(aTHX_ f);
+    bool jumped;
+    if (cls->custom & (1u << GOPERLIO_SLOT_POPPED))
+        return (IV)(int64_t)goperlio_hook(aTHX_ cls, GOPERLIO_SLOT_POPPED, f, nullptr, 0, nullptr,
+                                          &jumped);
+    const IV code = cls->stock_popped ? cls->stock_popped(aTHX_ f) : 0;
+    goperlio_hook(aTHX_ cls, GOPERLIO_HOOK_DROP, f, nullptr, 0, nullptr, &jumped);
+    return code;
+}
+static PerlIO *goperlio_fwd_open(pTHX_ PerlIO_funcs *tab, PerlIO_list_t *layers, IV n,
+                                 const char *mode, int fd, int imode, int perm, PerlIO *old,
+                                 int narg, SV **args) {
+    goperlio_class_t *cls = goperlio_class_of(tab);
+    if (!cls) Perl_croak(aTHX_ "goperl: a layer of native code without its class");
+    const goperl_gword_t w[9] = {GOPERL_ADDR(layers),       (goperl_gword_t)n,
+                                 (goperl_gword_t)(int64_t)fd, (goperl_gword_t)(int64_t)imode,
+                                 (goperl_gword_t)(int64_t)perm, GOPERL_ADDR(old),
+                                 (goperl_gword_t)(int64_t)narg, GOPERL_ADDR(args),
+                                 mode ? 1u : 0u};
+    bool jumped;
+    return (PerlIO *)(uintptr_t)goperlio_hook(aTHX_ cls, GOPERLIO_SLOT_OPEN, nullptr, w, 9, mode,
+                                              &jumped);
+}
+#define GOPERLIO_FWD_IV(name, slot)                                       \
+    static IV name(pTHX_ PerlIO *f) {                                     \
+        return (IV)(int64_t)GOPERLIO_HOOK_F(slot, f, nullptr, 0, nullptr); \
+    }
+GOPERLIO_FWD_IV(goperlio_fwd_binmode, GOPERLIO_SLOT_BINMODE)
+GOPERLIO_FWD_IV(goperlio_fwd_fileno, GOPERLIO_SLOT_FILENO)
+GOPERLIO_FWD_IV(goperlio_fwd_close, GOPERLIO_SLOT_CLOSE)
+GOPERLIO_FWD_IV(goperlio_fwd_flush, GOPERLIO_SLOT_FLUSH)
+GOPERLIO_FWD_IV(goperlio_fwd_fill, GOPERLIO_SLOT_FILL)
+GOPERLIO_FWD_IV(goperlio_fwd_eof, GOPERLIO_SLOT_EOF)
+GOPERLIO_FWD_IV(goperlio_fwd_error, GOPERLIO_SLOT_ERROR)
+static SV *goperlio_fwd_getarg(pTHX_ PerlIO *f, CLONE_PARAMS *param, int flags) {
+    (void)param;
+    const goperl_gword_t w[1] = {(goperl_gword_t)(int64_t)flags};
+    return (SV *)(uintptr_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_GETARG, f, w, 1, nullptr);
+}
+static PerlIO *goperlio_fwd_dup(pTHX_ PerlIO *f, PerlIO *o, CLONE_PARAMS *param, int flags) {
+    (void)param;
+    const goperl_gword_t w[2] = {GOPERL_ADDR(o), (goperl_gword_t)(int64_t)flags};
+    return (PerlIO *)(uintptr_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_DUP, f, w, 2, nullptr);
+}
+static SSize_t goperlio_fwd_read(pTHX_ PerlIO *f, void *vbuf, Size_t count) {
+    const goperl_gword_t w[2] = {GOPERL_ADDR(vbuf), (goperl_gword_t)count};
+    return (SSize_t)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_READ, f, w, 2, nullptr);
+}
+static SSize_t goperlio_fwd_unread(pTHX_ PerlIO *f, const void *vbuf, Size_t count) {
+    const goperl_gword_t w[2] = {GOPERL_ADDR(vbuf), (goperl_gword_t)count};
+    return (SSize_t)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_UNREAD, f, w, 2, nullptr);
+}
+static SSize_t goperlio_fwd_write(pTHX_ PerlIO *f, const void *vbuf, Size_t count) {
+    const goperl_gword_t w[2] = {GOPERL_ADDR(vbuf), (goperl_gword_t)count};
+    return (SSize_t)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_WRITE, f, w, 2, nullptr);
+}
+static IV goperlio_fwd_seek(pTHX_ PerlIO *f, Off_t offset, int whence) {
+    const goperl_gword_t w[2] = {(goperl_gword_t)(int64_t)offset, (goperl_gword_t)(int64_t)whence};
+    return (IV)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_SEEK, f, w, 2, nullptr);
+}
+static Off_t goperlio_fwd_tell(pTHX_ PerlIO *f) {
+    return (Off_t)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_TELL, f, nullptr, 0, nullptr);
+}
+static void goperlio_fwd_clearerr(pTHX_ PerlIO *f) {
+    (void)GOPERLIO_HOOK_F(GOPERLIO_SLOT_CLEARERR, f, nullptr, 0, nullptr);
+}
+static void goperlio_fwd_setlinebuf(pTHX_ PerlIO *f) {
+    (void)GOPERLIO_HOOK_F(GOPERLIO_SLOT_SETLINEBUF, f, nullptr, 0, nullptr);
+}
+static STDCHAR *goperlio_fwd_get_base(pTHX_ PerlIO *f) {
+    return (STDCHAR *)(uintptr_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_GET_BASE, f, nullptr, 0, nullptr);
+}
+static Size_t goperlio_fwd_get_bufsiz(pTHX_ PerlIO *f) {
+    return (Size_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_GET_BUFSIZ, f, nullptr, 0, nullptr);
+}
+static STDCHAR *goperlio_fwd_get_ptr(pTHX_ PerlIO *f) {
+    return (STDCHAR *)(uintptr_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_GET_PTR, f, nullptr, 0, nullptr);
+}
+static SSize_t goperlio_fwd_get_cnt(pTHX_ PerlIO *f) {
+    return (SSize_t)(int64_t)GOPERLIO_HOOK_F(GOPERLIO_SLOT_GET_CNT, f, nullptr, 0, nullptr);
+}
+static void goperlio_fwd_set_ptrcnt(pTHX_ PerlIO *f, STDCHAR *ptr, SSize_t cnt) {
+    const goperl_gword_t w[2] = {GOPERL_ADDR(ptr), (goperl_gword_t)(int64_t)cnt};
+    (void)GOPERLIO_HOOK_F(GOPERLIO_SLOT_SET_PTRCNT, f, w, 2, nullptr);
+}
+static const goperlio_fn_t goperlio_forwarders[GOPERLIO_SLOTS] = {
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_pushed),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_popped),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_open),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_binmode),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_getarg),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_fileno),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_dup),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_read),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_unread),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_write),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_seek),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_tell),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_close),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_flush),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_fill),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_eof),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_error),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_clearerr),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_setlinebuf),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_get_base),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_get_bufsiz),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_get_ptr),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_get_cnt),
+    reinterpret_cast<goperlio_fn_t>(&goperlio_fwd_set_ptrcnt),
+};
+
+/* PERLIO_DEFINE: s = [funcs id][the module's table][size][kind], a pair
+ * [0 NULL | 1 a stock function | 2 the module's][the stock number] for each
+ * slot, then the name -> the class's table. */
+static uint64_t goperlio_define(pTHX_ const char *s, uint64_t slen) {
+    const size_t nw = 4 + 2 * GOPERLIO_SLOTS;
+    if (!s || slen < 8 * nw + 1) Perl_croak(aTHX_ "goperl: PerlIO_define_layer: short request");
+    goperl_gword_t w[4 + 2 * GOPERLIO_SLOTS];
+    memcpy(w, s, sizeof w);
+    const char *name = s + sizeof w;
+    goperlio_class_t *cls = (goperlio_class_t *)calloc(1, sizeof(goperlio_class_t));
+    if (!cls) Perl_croak(aTHX_ "goperl: PerlIO_define_layer: out of memory");
+    cls->funcs.fsize = sizeof(PerlIO_funcs);
+    cls->funcs.name = savepv(name);
+    cls->funcs.size = (Size_t)w[2];
+    cls->funcs.kind = (IV)w[3];
+    cls->funcs_id = (U32)w[0];
+    cls->host_tab = w[1];
+    for (int i = 0; i < GOPERLIO_SLOTS; i++) {
+        const goperl_gword_t kind = w[4 + 2 * i], id = w[5 + 2 * i];
+        goperlio_fn_t fn = nullptr;
+        if (kind == 1) {
+            if (id == 0 || id > GOPERLIO_STOCK_MAX || goperlio_stock[id].sig != goperlio_slot_sig[i])
+                Perl_croak(aTHX_ "goperl: PerlIO layer '%s': slot %d names no stock function of "
+                                 "its shape",
+                           name, i);
+            fn = goperlio_stock[id].fn;
+        } else if (kind == 2) {
+            fn = goperlio_forwarders[i];
+            cls->custom |= 1u << i;
+        }
+        *goperlio_slot_ref(&cls->funcs, i) = fn;
+    }
+    if (cls->funcs.size) {
+        /* Popped goes to the host, which lets go of its struct */
+        if (!(cls->custom & (1u << GOPERLIO_SLOT_POPPED)))
+            cls->stock_popped = reinterpret_cast<IV (*)(pTHX_ PerlIO *)>(cls->funcs.Popped);
+        cls->funcs.Popped = goperlio_fwd_popped;
+    }
+    cls->next = goperlio_classes;
+    goperlio_classes = cls;
+    PerlIO_define_layer(aTHX_ &cls->funcs);
+    return GOPERL_ADDR(&cls->funcs);
+}
+
+/* PERLIO_CALL: s = [n words][which: 1 a stock function, 2 a slot of the
+ * table of the handle's top layer, 3 a slot of a table][the stock number or
+ * the slot][the table], the arguments of the function's shape as words,
+ * then its string or bytes:
+ *   PUSHED [f][arg][tab kind][tab][has a mode]; the mode
+ *   IV_F, TELL, VOID_F, PTR_F, SIZE_F, SSIZE_F [f]
+ *   OPEN [tab kind][tab][layers][n][fd][imode][perm][old][narg][args: 1 an
+ *        array of the interpreter's, 2 the SVs as words after these][args]
+ *        [has a mode]; the mode
+ * A mode perl passes as NULL (binmode, PerlIO_apply_layers) is none, which
+ * is not the empty one. s is b bytes.
+ *   GETARG [f][flags]; DUP [f][o][flags]; READ [f][buffer][count]
+ *   WRITE [f][buffer, 0 for the bytes after the words][count]
+ *   SEEK [f][offset][whence]; SETPTRCNT [f][ptr][cnt]
+ * -> the function's result (an address for a pointer). */
+static uint64_t goperlio_call(pTHX_ const char *s, uint64_t slen) {
+    const int32_t op = GOPERL_OP_PERLIO_CALL; /* for the argument checks */
+    goperl_gword_t nw = 0;
+    if (!s || slen < 8) Perl_croak(aTHX_ "goperl: PerlIO call: short request");
+    memcpy(&nw, s, 8);
+    if (nw < 4 || slen < 8 * nw) Perl_croak(aTHX_ "goperl: PerlIO call: short request");
+    std::vector<goperl_gword_t> w(nw);
+    memcpy(w.data(), s, 8 * nw);
+    const char *tail = s + 8 * nw;
+    const goperl_gword_t which = w[1], id = w[2];
+    goperlio_fn_t fn = nullptr;
+    int sig;
+    if (which == 1) {
+        if (id == 0 || id > GOPERLIO_STOCK_MAX) Perl_croak(aTHX_ "goperl: unknown PerlIO function %d", (int)id);
+        fn = goperlio_stock[id].fn;
+        sig = goperlio_stock[id].sig;
+    } else {
+        if (id >= GOPERLIO_SLOTS) Perl_croak(aTHX_ "goperl: unknown PerlIO slot %d", (int)id);
+        sig = goperlio_slot_sig[id];
+        PerlIO_funcs *tab;
+        if (which == 2) {
+            PerlIO *f = GOPERL_MEMARG(PerlIO, w[4]);
+            tab = PerlIOValid(f) ? (PerlIO_funcs *)PerlIOBase(f)->tab : nullptr;
+        } else {
+            tab = (PerlIO_funcs *)(uintptr_t)w[3];
+        }
+        if (tab) fn = *goperlio_slot_ref(tab, (int)id);
+    }
+    const goperl_gword_t *a = w.data() + 4;
+    const size_t na = nw - 4;
+#define GOPERLIO_ARGS(k) \
+    if (na < (k)) Perl_croak(aTHX_ "goperl: PerlIO call: short request")
+    if (sig != GOPERLIO_SIG_OPEN) {
+        GOPERLIO_ARGS(1);
+        PerlIO *f = GOPERL_MEMARG(PerlIO, a[0]);
+        /* what perl's generic functions do with a closed handle or an
+         * absent slot */
+        if (!fn || (sig != GOPERLIO_SIG_PUSHED && !PerlIOValid(f))) {
+            SETERRNO(fn ? EBADF : EINVAL, fn ? SS_IVCHAN : LIB_INVARG);
+            switch (sig) {
+            case GOPERLIO_SIG_GETARG: case GOPERLIO_SIG_DUP: case GOPERLIO_SIG_PTR_F:
+            case GOPERLIO_SIG_VOID_F: case GOPERLIO_SIG_SETPTRCNT: case GOPERLIO_SIG_SIZE_F:
+                return 0;
+            }
+            return (uint64_t)(int64_t)-1;
+        }
+        switch (sig) {
+        case GOPERLIO_SIG_PUSHED: {
+            GOPERLIO_ARGS(5);
+            return (uint64_t)(int64_t)reinterpret_cast<IV (*)(pTHX_ PerlIO *, const char *, SV *,
+                                                              PerlIO_funcs *)>(fn)(
+                aTHX_ f, a[4] ? tail : nullptr, GOPERL_SVARG(a[1]),
+                goperlio_tab_arg(aTHX_ a[2], a[3]));
+        }
+        case GOPERLIO_SIG_IV_F:
+            return (uint64_t)(int64_t)reinterpret_cast<IV (*)(pTHX_ PerlIO *)>(fn)(aTHX_ f);
+        case GOPERLIO_SIG_TELL:
+            return (uint64_t)(int64_t)reinterpret_cast<Off_t (*)(pTHX_ PerlIO *)>(fn)(aTHX_ f);
+        case GOPERLIO_SIG_VOID_F:
+            reinterpret_cast<void (*)(pTHX_ PerlIO *)>(fn)(aTHX_ f);
+            return 0;
+        case GOPERLIO_SIG_PTR_F:
+            return GOPERL_ADDR(reinterpret_cast<STDCHAR *(*)(pTHX_ PerlIO *)>(fn)(aTHX_ f));
+        case GOPERLIO_SIG_SIZE_F:
+            return (uint64_t)reinterpret_cast<Size_t (*)(pTHX_ PerlIO *)>(fn)(aTHX_ f);
+        case GOPERLIO_SIG_SSIZE_F:
+            return (uint64_t)(int64_t)reinterpret_cast<SSize_t (*)(pTHX_ PerlIO *)>(fn)(aTHX_ f);
+        case GOPERLIO_SIG_GETARG:
+            GOPERLIO_ARGS(2);
+            return GOPERL_ADDR(reinterpret_cast<SV *(*)(pTHX_ PerlIO *, CLONE_PARAMS *, int)>(fn)(
+                aTHX_ f, nullptr, (int)(int64_t)a[1]));
+        case GOPERLIO_SIG_DUP:
+            GOPERLIO_ARGS(3);
+            return GOPERL_ADDR(reinterpret_cast<PerlIO *(*)(pTHX_ PerlIO *, PerlIO *, CLONE_PARAMS *,
+                                                            int)>(fn)(
+                aTHX_ f, GOPERL_MEMARG(PerlIO, a[1]), nullptr, (int)(int64_t)a[2]));
+        case GOPERLIO_SIG_READ:
+            GOPERLIO_ARGS(3);
+            return (uint64_t)(int64_t)reinterpret_cast<SSize_t (*)(pTHX_ PerlIO *, void *, Size_t)>(
+                fn)(aTHX_ f, (void *)(uintptr_t)a[1], (Size_t)a[2]);
+        case GOPERLIO_SIG_WRITE:
+            GOPERLIO_ARGS(3);
+            if (!a[1] && (uint64_t)(tail - s) + a[2] > slen)
+                Perl_croak(aTHX_ "goperl: PerlIO call: short request");
+            return (uint64_t)(int64_t)reinterpret_cast<SSize_t (*)(pTHX_ PerlIO *, const void *,
+                                                                   Size_t)>(fn)(
+                aTHX_ f, a[1] ? (const void *)(uintptr_t)a[1] : (const void *)tail, (Size_t)a[2]);
+        case GOPERLIO_SIG_SEEK:
+            GOPERLIO_ARGS(3);
+            return (uint64_t)(int64_t)reinterpret_cast<IV (*)(pTHX_ PerlIO *, Off_t, int)>(fn)(
+                aTHX_ f, (Off_t)(int64_t)a[1], (int)(int64_t)a[2]);
+        case GOPERLIO_SIG_SETPTRCNT:
+            GOPERLIO_ARGS(3);
+            reinterpret_cast<void (*)(pTHX_ PerlIO *, STDCHAR *, SSize_t)>(fn)(
+                aTHX_ f, (STDCHAR *)(uintptr_t)a[1], (SSize_t)(int64_t)a[2]);
+            return 0;
+        }
+        Perl_croak(aTHX_ "goperl: PerlIO call of unknown shape %d", sig);
+    }
+    GOPERLIO_ARGS(12);
+    if (!fn) {
+        SETERRNO(EINVAL, LIB_INVARG);
+        return 0;
+    }
+    const int narg = (int)(int64_t)a[8];
+    SV **args = nullptr;
+    if (narg > 0) {
+        if (a[9] == 1) {
+            args = (SV **)(uintptr_t)a[10];
+        } else {
+            GOPERLIO_ARGS(12 + (size_t)narg);
+            Newx(args, narg, SV *);
+            SAVEFREEPV(args);
+            for (int i = 0; i < narg; i++) args[i] = GOPERL_SVARG(a[12 + i]);
+        }
+    }
+    return GOPERL_ADDR(reinterpret_cast<PerlIO *(*)(pTHX_ PerlIO_funcs *, PerlIO_list_t *, IV,
+                                                    const char *, int, int, int, PerlIO *, int,
+                                                    SV **)>(fn)(
+        aTHX_ goperlio_tab_arg(aTHX_ a[0], a[1]), (PerlIO_list_t *)(uintptr_t)a[2], (IV)(int64_t)a[3],
+        a[11] ? tail : nullptr, (int)(int64_t)a[4], (int)(int64_t)a[5], (int)(int64_t)a[6],
+        GOPERL_MEMARG(PerlIO, a[7]), narg, args));
+#undef GOPERLIO_ARGS
+}
+
+/* The tables of perl's own layers native code names (PerlIO_perlio, ...),
+ * by the numbers of GOPERL_PIO_STD_FUNCS. */
+static const PerlIO_funcs *const goperlio_std_funcs[] = {
+    &PerlIO_unix, &PerlIO_perlio, &PerlIO_stdio, &PerlIO_crlf,
+    &PerlIO_utf8, &PerlIO_byte,   &PerlIO_raw,   &PerlIO_pending,
+};
 
 /* A value stored in a container that lies outside the interpreter's memory
  * (a structure the module allocated: Text::KnuthPlass keeps its list of
@@ -7402,75 +7825,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (SvTYPE(GOPERL_SVARG(a)) < SVt_PV)
                    ? 0
                    : (uint64_t)SvCUR(GOPERL_SVARG(a));
-    case GOPERL_OP_PERLIO_DEF_LAYER: { /* s = name, a = funcs_id, b = mask.
-                 * Clone the :perlio buffer layer, swap in the forwarding
-                 * hooks the mask asks for, and register it. */
-        if (goperlio_nclasses >= GOPERLIO_MAX_LAYERS) return 0;
-        goperlio_class_t *cls = &goperlio_classes[goperlio_nclasses++];
-        memcpy(&cls->funcs, &PerlIO_perlio, sizeof(PerlIO_funcs));
-        strncpy(cls->name, s ? s : "goperlio", sizeof(cls->name) - 1);
-        cls->funcs.name = cls->name;
-        cls->funcs.size = sizeof(GoperlIOL);
-        cls->funcs.kind |= PERLIO_K_UTF8; /* allow :utf8-ish layers */
-        cls->funcs_id = (uint32_t)a;
-        cls->mask = (uint32_t)b;
-        cls->funcs.Pushed = goperlio_pushed;
-        cls->funcs.Popped = goperlio_popped;
-        if (b & GOPERLIO_MASK_FILL) cls->funcs.Fill = goperlio_fill;
-        PerlIO_define_layer(aTHX_ &cls->funcs);
-        return 1;
-    }
-    case GOPERL_OP_PERLIO_NEXT_READ: { /* a = ff, b = dst, c = len */
-        PerlIO *f = GOPERL_MEMARG(PerlIO, a);
-        PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
-        if (!PerlIOValid(n)) return (uint64_t)(int64_t)-1;
-        SSize_t got = PerlIO_read(n, (void *)(uintptr_t)b, (Size_t)c);
-        return (uint64_t)(int64_t)got;
-    }
-    case GOPERL_OP_PERLIO_NEXT_FASTGETS: {
-        PerlIO *f = GOPERL_MEMARG(PerlIO, a);
-        PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
-        return (PerlIOValid(n) && PerlIO_fast_gets(n)) ? 1 : 0;
-    }
-    case GOPERL_OP_PERLIO_NEXT_GETCNT: {
-        PerlIO *n = PerlIONext(GOPERL_MEMARG(PerlIO, a));
-        return (uint64_t)(int64_t)PerlIO_get_cnt(n);
-    }
-    case GOPERL_OP_PERLIO_NEXT_GETPTR: {
-        PerlIO *n = PerlIONext(GOPERL_MEMARG(PerlIO, a));
-        return GOPERL_ADDR(PerlIO_get_ptr(n));
-    }
-    case GOPERL_OP_PERLIO_NEXT_SETPTRCNT: { /* b = ptr, c = cnt */
-        PerlIO *n = PerlIONext(GOPERL_MEMARG(PerlIO, a));
-        PerlIO_set_ptrcnt(n, (STDCHAR *)(uintptr_t)b, (SSize_t)(int64_t)c);
-        return 0;
-    }
-    case GOPERL_OP_PERLIO_NEXT_FILL: {
-        PerlIO *n = PerlIONext(GOPERL_MEMARG(PerlIO, a));
-        return (uint64_t)(int64_t)PerlIO_fill(n);
-    }
-    case GOPERL_OP_PERLIO_STATE: { /* b: 0 = eof|error<<1 of NEXT,
-                 * 1 = flush NEXT, 2 = flush SELF, 3 = the flags of NEXT */
-        PerlIO *f = GOPERL_MEMARG(PerlIO, a);
-        switch ((int)b) {
-        case 0: {
-            PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
-            if (!PerlIOValid(n)) return 1; /* treat as EOF */
-            return (PerlIO_eof(n) ? 1 : 0) | (PerlIO_error(n) ? 2 : 0);
-        }
-        case 1: {
-            PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
-            return PerlIOValid(n) ? (uint64_t)(int64_t)PerlIO_flush(n) : 0;
-        }
-        case 2:
-            return (uint64_t)(int64_t)PerlIO_flush(f);
-        case 3: {
-            PerlIO *n = PerlIOValid(f) ? PerlIONext(f) : NULL;
-            return PerlIOValid(n) ? (uint64_t)PerlIOBase(n)->flags : 0;
-        }
-        }
-        return 0;
-    }
+    /* b: the length of s (a request longer than the operation box comes
+     * through perl_xs_helper, which has none) */
+    case GOPERL_OP_PERLIO_DEFINE: return goperlio_define(aTHX_ s, b);
+    case GOPERL_OP_PERLIO_CALL: return goperlio_call(aTHX_ s, b);
     case GOPERL_OP_OPTREE_NEW: { /* a = class<<32|type, b = flags,
                  * s = kid tokens (u64 each; count fixed by class) */
         int cls = (int)(a >> 32);
@@ -8127,6 +8485,46 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return (uint64_t)(uintptr_t)IoOFP(io);
         }
         case GOPERL_PIO_VALID: return PerlIOValid(f) ? 1 : 0;
+        case GOPERL_PIO_PUSH: {
+            goperl_gword_t w4[4];
+            if (!f || !s || slen < sizeof w4) Perl_croak(aTHX_ "goperl: PerlIO_push: short request");
+            memcpy(w4, s, sizeof w4);
+            return GOPERL_ADDR(PerlIO_push(aTHX_ f, goperlio_tab_arg(aTHX_ w4[0], w4[1]),
+                                           w4[3] ? s + sizeof w4 : nullptr, GOPERL_SVARG(w4[2])));
+        }
+        case GOPERL_PIO_FIND_LAYER:
+            return GOPERL_ADDR(PerlIO_find_layer(aTHX_ s ? s : "", s ? slen : 0, (int)b));
+        case GOPERL_PIO_LAYER_FETCH: {
+            goperl_gword_t w2[2] = {0, 0};
+            if (s && slen >= sizeof w2) memcpy(w2, s, sizeof w2);
+            PerlIO_list_t *const list = GOPERL_MEMARG(PerlIO_list_t, a);
+            if (!list) Perl_croak(aTHX_ "goperl: PerlIO_layer_fetch of no list");
+            return GOPERL_ADDR(PerlIO_layer_fetch(aTHX_ list, (IV)(int64_t)b,
+                                                  goperlio_tab_arg(aTHX_ w2[0], w2[1])));
+        }
+        case GOPERL_PIO_ARG_FETCH: {
+            PerlIO_list_t *const list = GOPERL_MEMARG(PerlIO_list_t, a);
+            /* an index of the list's (perl reads past it otherwise) */
+            if (!list || (IV)(int64_t)b < 0 || (IV)(int64_t)b >= list->cur) return 0;
+            return GOPERL_ADDR(PerlIO_arg_fetch(list, (IV)(int64_t)b));
+        }
+        case GOPERL_PIO_STD_FUNCS:
+            if (b >= sizeof goperlio_std_funcs / sizeof goperlio_std_funcs[0]) return 0;
+            return GOPERL_ADDR(goperlio_std_funcs[b]);
+        case GOPERL_PIO_FUNCS_INFO: {
+            static goperl_gword_t w5[5];
+            PerlIO_funcs *const tab = (PerlIO_funcs *)GOPERL_MEMARG(PerlIO_funcs, a);
+            if (!tab) return 0;
+            goperlio_class_t *const cls = goperlio_class_of(tab);
+            w5[0] = GOPERL_ADDR(tab->name);
+            w5[1] = (goperl_gword_t)tab->size;
+            w5[2] = (goperl_gword_t)tab->kind;
+            w5[3] = cls ? cls->host_tab : 0;
+            w5[4] = 0;
+            for (int i = 0; i < GOPERLIO_SLOTS; i++)
+                if (*goperlio_slot_ref(tab, i)) w5[4] |= (goperl_gword_t)1 << i;
+            return GOPERL_ADDR(w5);
+        }
         case GOPERL_PIO_LAYERS: {
             static std::vector<goperl_gword_t> w;
             w.assign(1, 0);
@@ -8135,8 +8533,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 w.push_back(GOPERL_ADDR((*l)->tab->name));
                 w.push_back((goperl_gword_t)(*l)->tab->kind);
                 w.push_back((goperl_gword_t)(*l)->flags);
+                goperlio_class_t *const cls = b == 1 ? goperlio_class_of((*l)->tab) : nullptr;
                 if (b == 1) {
-                    if (!((*l)->tab->kind & PERLIO_K_BUFFERED)) {
+                    if (!((*l)->tab->kind & PERLIO_K_BUFFERED) || cls) {
                         w.insert(w.end(), 5, 0);
                     } else if ((*l)->tab->Get_base == PerlIOBuf_get_base) {
                         /* a PerlIOBuf (:perlio, :crlf): its fields */
@@ -8163,6 +8562,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                         w.push_back((goperl_gword_t)PerlIO_get_bufsiz(l));
                         w.push_back(0);
                     }
+                    w.push_back(cls ? cls->host_tab : 0);
+                    w.push_back(GOPERL_ADDR((*l)->tab));
                 }
                 w[0]++;
             }
@@ -8232,6 +8633,11 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         switch (fn) {
         case GOPERL_PIO_FILENO: return (uint64_t)(int64_t)PerlIO_fileno(f);
         case GOPERL_PIO_ISUTF8: return PerlIO_isutf8(f) ? 1 : 0;
+        case GOPERL_PIO_POP: PerlIO_pop(aTHX_ f); return 0;
+        case GOPERL_PIO_MODESTR: {
+            static char mode[8];
+            return GOPERL_ADDR(PerlIO_modestr(f, mode));
+        }
         case GOPERL_PIO_READ: { /* b = count -> the buffer; second: the count
                  * read (negative on error). The bytes stay valid until the
                  * next read operation. */
