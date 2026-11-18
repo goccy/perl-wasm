@@ -223,6 +223,9 @@ CONFIG_HEAVY_LIBDIR = """\
     my $archname = Internals::archname();
     $set->('archname', $archname);
     $set->('myarchname', $archname);
+    # The system is the one the interpreter runs on, which it was told when
+    # it started ($^O).
+    $set->('osname', $^O);
     unless (%site) {
         for my $kind (['sitearch', 'sitelib'], ['sitearchexp', 'sitelibexp'],
                       ['installsitearch', 'installsitelib']) {
@@ -371,6 +374,9 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
             raise SystemExit("make-stdlib-zip: Config.pm: sitearchexp is not sitelibexp/archname")
         text = replace_once(text, r"^    archname => '[^'\n]*',$", "    archname => $archname,",
                             "Config.pm: archname")
+        # the system is the one the interpreter runs on, which it was told
+        # when it started ($^O, perl_new's osname)
+        text = replace_once(text, r"^    osname => '[^'\n]*',$", "    osname => $^O,", "Config.pm: osname")
         text = replace_once(text, r"^    sitelibexp => '[^'\n]*',$",
                             f"    sitelibexp => $site{{sitelibexp}} // '{sitelib.group(1)}',",
                             "Config.pm: sitelibexp")

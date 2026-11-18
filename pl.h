@@ -97,13 +97,17 @@
  * subdirectories perl adds to @INC with a directory (PERL5LIB, -I) and of
  * the site's architecture directory, and what `perl -v` says perl was
  * built for; empty stands for the name the build was configured with.
+ * `osname` is the name of the system the interpreter runs on, as perl's
+ * Configure names it there: $^O and $Config{osname}; empty stands for the
+ * name the build was configured with (wasi).
  * %Config reports the directories
  * under every key that names one of them, and sitearch and sitelib are in
  * @INC where perl has them: after the PERL5LIB directories and before the
  * standard library. None of them is created. Without a site_dir %Config
  * keeps the values of the build's configuration and @INC has no site
  * directory. */
-uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname);
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname,
+                  const char *osname);
 
 /* Evaluate `src` (a string eval in scalar context, REPL-like state
  * persistence). ok payload:

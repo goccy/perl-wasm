@@ -2176,7 +2176,8 @@ static void inc_use_stdlib(pTHX_ const char *lib_dir) {
 }
 
 /* ---- public API (pl.h) --------------------------------------------------- */
-uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname) {
+uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archname,
+                  const char *osname) {
     if (g_my_perl) return 0; /* one interpreter per instance */
     g_archname = archname && *archname ? archname : ARCHNAME;
     site_configure(site_dir);
@@ -2200,6 +2201,14 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archnam
     perl_construct(g_my_perl);
     perl_wasm_locale_start_up(0);
     PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
+    /* $^O is the system the interpreter runs on, which the host names, as
+     * perl's is the system it was built for and runs on; %Config's osname
+     * is $^O (scripts/make-stdlib-zip.py) */
+    if (osname && *osname) {
+        dTHX;
+        Safefree(PL_osname);
+        PL_osname = savepv(osname);
+    }
 
     /* Bootstrap args: perl -e 0 — parse an empty program so the interpreter
      * is ready to eval. lib_dir is not a -I directory: those come first in
