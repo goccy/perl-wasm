@@ -9454,8 +9454,24 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             /* the running native call is the innermost */
             if (g_native_marks.empty()) return 0;
             const goperl_native_mark m = g_native_marks.back();
-            while (PL_scopestack_ix > m.scope_ix) pop_scope();
-            if (PL_savestack_ix > m.save_ix) leave_scope(m.save_ix);
+            /* No further than what the innermost context opened, which
+             * perl's die_unwind leaves first too (dounwind's, or the
+             * eval's, CX_LEAVE_SCOPE): the contexts below it may be ones a
+             * run loop of native code pushed for the Perl code it runs (an
+             * eval, a sub, a loop), whose scopes perl leaves as it pops
+             * them, after it has found the eval that catches the death. An
+             * XSUB has no context of its own: its mark is above its
+             * caller's. A substitution's context keeps the savestack's
+             * index where the others do, and no scopestack index. */
+            I32 save_ix = m.save_ix, scope_ix = m.scope_ix;
+            if (cxstack_ix >= 0) {
+                const PERL_CONTEXT *const cx = CX_CUR();
+                if (cx->blk_oldsaveix > save_ix) save_ix = cx->blk_oldsaveix;
+                if (CxTYPE(cx) != CXt_SUBST && cx->blk_oldscopesp > scope_ix)
+                    scope_ix = cx->blk_oldscopesp;
+            }
+            while (PL_scopestack_ix > scope_ix) pop_scope();
+            if (PL_savestack_ix > save_ix) leave_scope(save_ix);
             return 0;
         }
         }
