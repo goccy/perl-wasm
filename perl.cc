@@ -3123,9 +3123,13 @@ static I32 goperl_uvar_call(pTHX_ goperl_gword_t is_set, IV arg, SV *sv) {
         result = goperl_resp_word(resp, rlen, 1);
     }
     free(resp);
-    /* the MAGIC may be another one by now */
+    /* the MAGIC may be another one by now. The key goes into it when
+     * native code changed it: a function of this interpreter's that native
+     * code called meanwhile (Hash::Util::FieldHash's, which Variable::Magic
+     * calls first) put its own key in the MAGIC, which stays then, as on
+     * perl, where the two share one MAGIC */
     mg = mg_find(sv, PERL_MAGIC_uvar);
-    if (mg) mg->mg_obj = (SV *)(uintptr_t)key;
+    if (mg && key != words[3]) mg->mg_obj = (SV *)(uintptr_t)key;
     LEAVE;
     return (I32)(int64_t)result;
 }
@@ -3794,8 +3798,20 @@ enum {
                                  * b = a code point -> the address of [the first
                                  * code point of the result][its length in
                                  * bytes], two words, and its UTF-8 bytes */
-    GOPERL_CALL_ASYNC = 16   /* what is pending is delivered, as between ops
+    GOPERL_CALL_ASYNC = 16,  /* what is pending is delivered, as between ops
                               * -> 1 when a handler died (the error is $@) */
+    GOPERL_CALL_MG_UNLINK = 33, /* a = the SV, b = the address of the data
+                                 * (mg_ptr) or 0, hi = the type -> the address
+                                 * of the MAGIC of the interpreter's own with
+                                 * them, taken off the chain and not freed
+                                 * (native code frees it, as on perl), or 0 */
+    GOPERL_CALL_UF_CALL = 34,   /* a = the SV, b = the argument, s = the
+                                 * function (a word: uf_val or uf_set of a
+                                 * struct ufuncs of the interpreter's) -> what
+                                 * it returned */
+    GOPERL_CALL_UVAR_OWN = 35   /* a = the SV, s = [uf_val][uf_set][uf_index],
+                                 * functions of the interpreter's: uvar magic
+                                 * with them, as sv_magic attaches it */
 };
 /* The words of CALL_PARSER. */
 enum {
@@ -8347,6 +8363,39 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             r.first = (goperl_gword_t)first;
             r.len = (goperl_gword_t)len;
             return (uint64_t)(uintptr_t)&r;
+        }
+        case GOPERL_CALL_MG_UNLINK: {
+            if (SvTYPE(sv) < SVt_PVMG) return 0;
+            for (MAGIC *prev = NULL, *mg = SvMAGIC(sv); mg; prev = mg, mg = mg->mg_moremagic) {
+                if (mg->mg_type != (char)(int)hi || goperl_is_anchor(mg)) continue;
+                if (GOPERL_ADDR(mg->mg_ptr) != b) continue;
+                if (prev)
+                    prev->mg_moremagic = mg->mg_moremagic;
+                else
+                    SvMAGIC_set(sv, mg->mg_moremagic);
+                mg->mg_moremagic = NULL;
+                mg_magical(sv);
+                return GOPERL_ADDR(mg);
+            }
+            return 0;
+        }
+        case GOPERL_CALL_UF_CALL: {
+            goperl_gword_t fn = 0;
+            if (!s || slen != sizeof fn) Perl_croak(aTHX_ "goperl: short uvar function call");
+            memcpy(&fn, s, sizeof fn);
+            I32 (*const f)(pTHX_ IV, SV *) = (I32(*)(pTHX_ IV, SV *))(uintptr_t)fn;
+            return f ? (uint64_t)(int64_t)f(aTHX_ (IV)(int64_t)b, sv) : 0;
+        }
+        case GOPERL_CALL_UVAR_OWN: {
+            goperl_gword_t w[3];
+            if (!s || slen != sizeof w) Perl_croak(aTHX_ "goperl: short uvar functions");
+            memcpy(w, s, sizeof w);
+            struct ufuncs uf;
+            uf.uf_val = (I32(*)(pTHX_ IV, SV *))(uintptr_t)w[0];
+            uf.uf_set = (I32(*)(pTHX_ IV, SV *))(uintptr_t)w[1];
+            uf.uf_index = (IV)(int64_t)w[2];
+            sv_magic(sv, NULL, PERL_MAGIC_uvar, (const char *)&uf, sizeof uf);
+            return 0;
         }
         case GOPERL_CALL_UVAR: { /* b bit 0: the module has uf_val, bit 1:
                  * uf_set */
