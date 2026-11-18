@@ -652,14 +652,11 @@ static SV *goperl_die_hook(pTHX_ SV *msg) {
     return ex;
 }
 
-/* Native-XSUB request: GOPERL_NATIVE_HDR_WORDS header words (fn_id, the
- * CV, the item count, the stack index of the first item (ax), the address
- * of the stack, and errno, which native code finds in its errno as the
- * XSUB starts: perl's errno and $! are one variable) followed by the
- * frame's SVs, a word each. The native function's stack is this one by
- * index: it reads what lies below its items here (an index it has from
- * PL_markstack or a context). */
-#define GOPERL_NATIVE_HDR_WORDS 6
+/* Native-XSUB request: fn_id, the CV, errno (which native code finds in
+ * its errno as the XSUB starts: perl's errno and $! are one variable), and
+ * where the stacks are (goperl_pp_stack_fill). */
+/* RUN_PP's answer when the pp function returned the op it ran for */
+#define GOPERL_RUN_PP_SELF 1
 
 /* Connects this module instance to the host's signal delivery
  * (perl_signal.cc). Every entry point that runs Perl code calls it: the
@@ -1105,14 +1102,20 @@ static uint64_t goperl_pp_vars(pTHX) {
     g_pp_vars[5] = GOPERL_ADDR(&PL_markstack_max);
     return GOPERL_ADDR(g_pp_vars);
 }
+#define GOPERL_PP_STACK_WORDS 7
+static void goperl_pp_stack_fill(pTHX_ goperl_gword_t *w) {
+    w[0] = GOPERL_ADDR(PL_stack_base);
+    w[1] = (goperl_gword_t)(PL_stack_sp - PL_stack_base);
+    w[2] = (goperl_gword_t)(PL_stack_max - PL_stack_base);
+    w[3] = GOPERL_ADDR(PL_markstack);
+    w[4] = (goperl_gword_t)(PL_markstack_ptr - PL_markstack);
+    w[5] = (goperl_gword_t)(PL_markstack_max - PL_markstack);
+    w[6] = goperl_pp_vars(aTHX);
+}
 static void goperl_pp_stack_words(pTHX_ std::vector<goperl_gword_t> &out) {
-    out.push_back(GOPERL_ADDR(PL_stack_base));
-    out.push_back((goperl_gword_t)(PL_stack_sp - PL_stack_base));
-    out.push_back((goperl_gword_t)(PL_stack_max - PL_stack_base));
-    out.push_back(GOPERL_ADDR(PL_markstack));
-    out.push_back((goperl_gword_t)(PL_markstack_ptr - PL_markstack));
-    out.push_back((goperl_gword_t)(PL_markstack_max - PL_markstack));
-    out.push_back(goperl_pp_vars(aTHX));
+    goperl_gword_t w[GOPERL_PP_STACK_WORDS];
+    goperl_pp_stack_fill(aTHX_ w);
+    out.insert(out.end(), w, w + GOPERL_PP_STACK_WORDS);
 }
 
 /* What the function left: [depth][top mark], within the stacks as they are
@@ -1123,7 +1126,11 @@ static bool goperl_pp_stack_apply(pTHX_ const unsigned char *p, size_t len) {
     memcpy(w, p, sizeof w);
     const int64_t depth = (int64_t)w[0], top = (int64_t)w[1];
     if (depth < 0 || depth > (int64_t)(PL_stack_max - PL_stack_base)) return false;
-    if (top < 0 || top >= (int64_t)(PL_markstack_max - PL_markstack)) return false;
+    /* top -1: below the first mark, where perl's POPMARK takes the pointer
+     * when the marks are taken past it (Tk's Lang_catch runs an XSUB through
+     * call_sv without a mark of its own), as perl lets it be until the next
+     * PUSHMARK */
+    if (top < -1 || top >= (int64_t)(PL_markstack_max - PL_markstack)) return false;
     PL_stack_sp = PL_stack_base + depth;
     PL_markstack_ptr = PL_markstack + top;
     return true;
@@ -1730,35 +1737,28 @@ XS(XS_goperl_go_thunk) {
 }
 
 /* Generic thunk backing every host-native XSUB (see pl.h "Native XS
- * support"). Marshals the call frame's SV tokens to the host over the
- * wasmify callback import and pushes the returned (mortal) SVs. */
+ * support"). The native function is the XSUB: it runs on this stack and
+ * mark stack, where it finds its arguments and the mark pp_entersub pushed
+ * above them, which its dXSARGS takes, as a real XSUB's does, and what it
+ * leaves there is what it returns. */
 static inline SV *goperl_static_immortal(pTHX_ uint64_t v);
+static bool goperl_pp_stack_apply(pTHX_ const unsigned char *p, size_t len);
 XS(XS_goperl_native_thunk);
 XS(XS_goperl_native_thunk) {
-    dXSARGS;
     int32_t fn_id = XSANY.any_i32;
     const int entry_errno = errno;
     if (g_go_cb == 0)
         Perl_croak(aTHX_ "no Go dispatcher registered for this instance");
-
-    size_t payload_len =
-        sizeof(goperl_gword_t) * (GOPERL_NATIVE_HDR_WORDS + (size_t)items);
-    goperl_gword_t *payload = (goperl_gword_t *)malloc(payload_len);
-    if (!payload) Perl_croak(aTHX_ "native XS dispatch: out of memory");
-    payload[0] = (goperl_gword_t)(int64_t)fn_id;
-    payload[1] = GOPERL_ADDR(cv); /* real XSUBs receive their CV */
-    payload[2] = (goperl_gword_t)items;
-    payload[3] = (goperl_gword_t)ax;
-    payload[4] = GOPERL_ADDR(PL_stack_base);
-    payload[5] = (goperl_gword_t)(int64_t)entry_errno;
-    for (I32 i = 0; i < items; i++)
-        payload[GOPERL_NATIVE_HDR_WORDS + i] = GOPERL_ADDR(ST(i));
-
+    /* where the values it returns start: above the mark it takes */
+    const SSize_t markix = PL_markstack_ptr > PL_markstack ? *PL_markstack_ptr : 0;
+    goperl_gword_t req[3 + GOPERL_PP_STACK_WORDS];
+    req[0] = (goperl_gword_t)(int64_t)fn_id;
+    req[1] = GOPERL_ADDR(cv); /* real XSUBs receive their CV */
+    req[2] = (goperl_gword_t)(int64_t)entry_errno;
+    goperl_pp_stack_fill(aTHX_ req + 3);
     const size_t native_below = goperl_native_enter(aTHX);
-    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_NATIVE_METHOD_ID,
-                                         payload, payload_len);
+    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_NATIVE_METHOD_ID, req, sizeof req);
     goperl_native_leave(native_below);
-    free(payload);
     if (rc == GOPERL_CALLBACK_JUMPED) return;
 
     uint32_t resp_len;
@@ -1776,22 +1776,18 @@ XS(XS_goperl_native_thunk) {
         free(resp);
         Perl_croak(aTHX_ "%s", msg);
     }
-    /* [1][nret][the returned SVs] */
-    if (resp_len < 1 + 8) { free(resp); Perl_croak(aTHX_ "native XS dispatch: short response"); }
-    const goperl_gword_t nret = goperl_resp_word(resp, resp_len, 0);
-    if (nret > ((size_t)resp_len - (1 + 8)) / 8) {
-        free(resp);
-        Perl_croak(aTHX_ "native XS dispatch: truncated response");
-    }
-    XSprePUSH;
-    EXTEND(SP, (SSize_t)nret);
-    for (goperl_gword_t k = 0; k < nret; k++) {
-        const uint64_t w = goperl_resp_word(resp, resp_len, (uint32_t)(1 + k));
-        SV *const imm = w < 0x40 ? goperl_static_immortal(aTHX_ w) : NULL;
-        ST(k) = imm ? imm : (SV *)(uintptr_t)w;
-    }
+    /* [1][depth][top mark] */
+    const bool applied = resp_len >= 1 + 16 && goperl_pp_stack_apply(aTHX_ resp + 1, resp_len - 1);
     free(resp);
-    XSRETURN((IV)nret);
+    if (!applied) Perl_croak(aTHX_ "native XS dispatch: malformed stack state");
+    /* &PL_sv_undef, &PL_sv_yes and &PL_sv_no as code that ran before the
+     * module was booted has them (goperl_static_immortal), among the
+     * values returned */
+    for (SV **p = PL_stack_base + markix + 1; p <= PL_stack_sp; p++)
+        if ((uint64_t)(uintptr_t)*p < 0x40) {
+            SV *const imm = goperl_static_immortal(aTHX_ (uint64_t)(uintptr_t)*p);
+            if (imm) *p = imm;
+        }
 }
 
 /* ---- value-operation XSUBs -----------------------------------------------
@@ -3881,6 +3877,11 @@ enum {
                                      * with the op's own pp function first */
     GOPERL_INT_SAVE_AELEM = 44,     /* a: an array; b: flags<<32 | the index:
                                      * save_aelem_flags of the element */
+    GOPERL_INT_OP_MIRROR = 45,      /* a: the copy made before, or 0; s+b:
+                                     * words [type | flags<<16 |
+                                     * private<<24][targ][next op][1: the
+                                     * type's pp function] -> the copy of
+                                     * an op of native code's own */
     GOPERL_INT_PADNAMELIST_NEW = 60, /* b: max -> newPADNAMELIST's list */
     GOPERL_INT_PADNAMELIST_FREE = 61, /* a: the list: PadnamelistREFCNT_dec */
     GOPERL_INT_PADNAME_OUTER = 62,  /* a: a pad name -> newPADNAMEouter's */
@@ -4785,6 +4786,8 @@ enum {
 #define GOPERL_PL_DBGV 131             /* PL_DBgv, the glob *DB::DB */
 #define GOPERL_PL_INTERRUPT_ADDR 132   /* the address of the interrupt flag the
                                         * host sets (a 32-bit word) */
+#define GOPERL_PL_OP_ADDR 133          /* the address of PL_op, which native code
+                                        * assigns there */
 #define GOPERL_PL_DTOR_THUNK 130       /* the function a destructor of the host's
                                         * is to the save stack (goperl_dtor_thunk) */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
@@ -5281,56 +5284,6 @@ static void goperl_save_mem(pTHX_ void *loc, int width, int kind) {
     case 8: save_iv((IV *)loc); return;
     }
     Perl_croak(aTHX_ "goperl: a save of %d bytes", width);
-}
-
-/* The perl stack native code had, laid out on the interpreter's, and back
- * (INTERNAL RUNOPS): s = [number of marks][number of values], the marks
- * (offsets from the bottom of that stack), the values. The answer is the
- * address of [count][number of marks][array of the values], the marks:
- * what the ops left above where the native stack began. */
-static uint64_t goperl_runops_with_stack(pTHX_ OP *start, const char *s, size_t len) {
-    static std::vector<goperl_gword_t> answer;
-    goperl_gword_t nmarks = 0, n = 0;
-    if (s && len >= 16) {
-        memcpy(&nmarks, s, 8);
-        memcpy(&n, s + 8, 8);
-    }
-    if (nmarks > len / 8 || n > len / 8 || len < 16 + 8 * (size_t)(nmarks + n))
-        Perl_croak(aTHX_ "goperl: short stack for a run of ops");
-    const SSize_t base = PL_stack_sp - PL_stack_base;
-    const I32 markbase = (I32)(PL_markstack_ptr - PL_markstack);
-    dSP;
-    EXTEND(SP, (SSize_t)n);
-    for (goperl_gword_t i = 0; i < nmarks; i++) {
-        goperl_gword_t m;
-        memcpy(&m, s + 16 + 8 * i, 8);
-        PL_stack_sp = PL_stack_base + base + (SSize_t)m;
-        PUSHMARK(PL_stack_sp);
-    }
-    SP = PL_stack_base + base;
-    for (goperl_gword_t i = 0; i < n; i++) {
-        goperl_gword_t tok;
-        memcpy(&tok, s + 16 + 8 * (size_t)(nmarks + i), 8);
-        *++SP = (SV *)(uintptr_t)tok;
-    }
-    PUTBACK;
-    PL_op = start;
-    CALLRUNOPS(aTHX);
-    const SSize_t top = PL_stack_sp - PL_stack_base;
-    AV *values = newAV();
-    sv_2mortal((SV *)values);
-    for (SSize_t i = base + 1; i <= top; i++)
-        av_push(values, SvREFCNT_inc(PL_stack_base[i]));
-    answer.clear();
-    answer.push_back((goperl_gword_t)(top > base ? top - base : 0));
-    const I32 marks_now = (I32)(PL_markstack_ptr - PL_markstack);
-    answer.push_back((goperl_gword_t)(marks_now > markbase ? marks_now - markbase : 0));
-    answer.push_back(GOPERL_ADDR(values));
-    for (I32 i = markbase + 1; i <= marks_now; i++)
-        answer.push_back((goperl_gword_t)(int64_t)(PL_markstack[i] - base));
-    PL_stack_sp = PL_stack_base + (base < top ? base : top);
-    PL_markstack_ptr = PL_markstack + (markbase < marks_now ? markbase : marks_now);
-    return (uint64_t)(uintptr_t)answer.data();
 }
 
 /* ---- what native code hands the interpreter -------------------------------
@@ -5889,19 +5842,35 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         save_aelem_flags(av, idx, svp, (U32)(b >> 32));
         return 0;
     }
+    case GOPERL_INT_OP_MIRROR: {
+        /* An op of native code's own as PL_op (Scope::Upper's: the
+         * interpreter goes on from its op_next): a copy of it in this
+         * memory, which stays, with what native code's op says. */
+        if (b < 32) return 0;
+        goperl_gword_t w[4];
+        memcpy(w, s, sizeof w);
+        const unsigned type = (unsigned)(w[0] & 0xffff);
+        if (type >= OP_max && type != OP_CUSTOM) return 0;
+        OP *const o = lo ? GOPERL_MEMARG(OP, lo) : (OP *)PerlMemShared_calloc(1, sizeof(LISTOP));
+        o->op_type = (OPCODE)type;
+        o->op_flags = (U8)(w[0] >> 16);
+        o->op_private = (U8)(w[0] >> 24);
+        o->op_targ = (PADOFFSET)w[1];
+        o->op_next = w[2] ? GOPERL_MEMARG(OP, w[2]) : NULL;
+        o->op_ppaddr = w[3] && type < OP_max ? PL_ppaddr[type] : NULL;
+        return GOPERL_ADDR(o);
+    }
     case GOPERL_INT_DOCATCH: {
         OP *const o = GOPERL_MEMARG(OP, lo);
         if (!o || o != PL_op) Perl_croak(aTHX_ "goperl: docatch of an op that is not running");
         return (uint64_t)(uintptr_t)goperl_docatch(aTHX_ o);
     }
     case GOPERL_INT_RUNOPS: {
-        OP *start = GOPERL_MEMARG(OP, lo);
-        if (b >> 63) { /* the stack is the interpreter's already */
-            PL_op = start;
-            CALLRUNOPS(aTHX);
-            return 0;
-        }
-        return goperl_runops_with_stack(aTHX_ start, s, (size_t)b);
+        /* the ops from start on, on the stacks as native code left them,
+         * which are the interpreter's */
+        PL_op = GOPERL_MEMARG(OP, lo);
+        CALLRUNOPS(aTHX);
+        return 0;
     }
     case GOPERL_INT_COP_LABEL: {
         STRLEN len = 0;
@@ -6426,50 +6395,20 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         save_op();
         return 0;
     case GOPERL_OP_RUN_PP: {
-        /* a = op_private<<40 | op_flags<<32 | op_type;
-         * s = words: [marks][op_targ][an offset for each mark][the SVs ...],
-         * b = its length in bytes.
+        /* a = op_private<<40 | op_flags<<32 | op_type; b = op_targ; c = the
+         * op's next op when it is one of the interpreter's, or 0.
          *
          * The pp function of an op type, run for an op native code made
          * itself and called through PL_ppaddr (`BINOP myop; ... PL_op =
-         * (OP *)&myop; PL_ppaddr[myop.op_type](aTHX)`). It finds what the
-         * native function has on its stack: every value, and a mark above
-         * as many of them as each offset says. It takes what it takes of
-         * both, as any pp function does, and the answer is what is on the
-         * stack afterwards and how many of the marks are gone: an array of
-         * the count values; second: taken<<32 | count.
-         *
-         * The op is the type, the flags, the private flags and the target
-         * of the module's op and nothing else: no children, no other op. */
+         * (OP *)&myop; PL_ppaddr[myop.op_type](aTHX)`), on the stacks as
+         * native code left them, as perl runs it: what it takes and leaves
+         * there is native code's stack afterwards. The op is the type, the
+         * flags, the private flags, the target and the next op of the
+         * module's op: no children. -> the op the function returned, or
+         * GOPERL_RUN_PP_SELF when that is the op it ran for; second: what
+         * the op is now. */
         const uint32_t op_type = (uint32_t)a;
-        if (op_type >= OP_max || b < 16) return 0;
-        goperl_gword_t nmarks, targ;
-        memcpy(&nmarks, s, 8);
-        memcpy(&targ, s + 8, 8);
-        if (nmarks > b / 8 || (uint64_t)16 + (uint64_t)nmarks * 8 > b) return 0;
-        const char *const mark_offs = s + 16;
-        const char *const toks = mark_offs + (size_t)nmarks * 8;
-        const size_t n = ((size_t)b - 16 - (size_t)nmarks * 8) / 8;
-        const SSize_t base = PL_stack_sp - PL_stack_base;
-        const SSize_t marks_before = PL_markstack_ptr - PL_markstack;
-        dSP;
-        EXTEND(SP, (SSize_t)n);
-        goperl_gword_t next_mark = 0;
-        for (size_t i = 0; i <= n; i++) {
-            /* the marks above i values */
-            while (next_mark < nmarks) {
-                goperl_gword_t off;
-                memcpy(&off, mark_offs + (size_t)next_mark * 8, 8);
-                if (off > i) break;
-                PUSHMARK(SP);
-                next_mark++;
-            }
-            if (i == n) break;
-            goperl_gword_t tok;
-            memcpy(&tok, toks + i * 8, 8);
-            PUSHs(GOPERL_SVARG(tok));
-        }
-        PUTBACK;
+        if (op_type >= OP_max) return 0;
         union {
             OP op;
             UNOP unop;
@@ -6488,24 +6427,22 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         scratch.op.op_type = op_type;
         scratch.op.op_flags = (U8)(a >> 32);
         scratch.op.op_private = (U8)(a >> 40);
-        scratch.op.op_targ = (PADOFFSET)targ;
+        scratch.op.op_targ = (PADOFFSET)b;
+        scratch.op.op_next = c ? GOPERL_MEMARG(OP, c) : NULL;
         scratch.op.op_ppaddr = PL_ppaddr[op_type];
+        /* &PL_sv_undef, &PL_sv_yes and &PL_sv_no as code that ran before
+         * the module was booted has them, among the values handed over */
+        for (SV **p = PL_stack_base + TOPMARK + 1; p <= PL_stack_sp; p++)
+            if ((uint64_t)(uintptr_t)*p < 0x40) {
+                SV *const imm = goperl_static_immortal(aTHX_ (uint64_t)(uintptr_t)*p);
+                if (imm) *p = imm;
+            }
         OP *const saved = PL_op;
         PL_op = &scratch.op;
-        scratch.op.op_ppaddr(aTHX);
+        OP *const next = scratch.op.op_ppaddr(aTHX);
         PL_op = saved;
-        SSize_t taken = marks_before + (SSize_t)next_mark - (PL_markstack_ptr - PL_markstack);
-        if (taken < 0) taken = 0;
-        if (taken > (SSize_t)next_mark) taken = (SSize_t)next_mark;
-        PL_markstack_ptr = PL_markstack + marks_before;
-        SSize_t count = (PL_stack_sp - PL_stack_base) - base;
-        if (count < 0) count = 0;
-        AV *const res = newAV();
-        for (SSize_t i = 0; i < count; i++)
-            av_store(res, i, SvREFCNT_inc(PL_stack_base[base + 1 + i]));
-        PL_stack_sp = PL_stack_base + base;
-        sv_2mortal((SV *)res);
-        return goperl_two(GOPERL_ADDR(res), ((uint64_t)(uint32_t)taken << 32) | (uint32_t)count);
+        if (next == &scratch.op) return goperl_two(GOPERL_RUN_PP_SELF, 0);
+        return goperl_two((uint64_t)(uintptr_t)next, goperl_op_fields(next));
     }
     case GOPERL_OP_MAGIC_ATTACH: { /* b = obj token, c = host id */
         SV *obj = GOPERL_SVARG(b);
@@ -6543,6 +6480,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_DBSUB: return (uint64_t)(uintptr_t)PL_DBsub;
         case GOPERL_PL_DBGV: return (uint64_t)(uintptr_t)PL_DBgv;
         case GOPERL_PL_INTERRUPT_ADDR: return GOPERL_ADDR(&g_interrupt);
+        case GOPERL_PL_OP_ADDR: return GOPERL_ADDR(&PL_op);
         case GOPERL_PL_DBSINGLE: return (uint64_t)(uintptr_t)PL_DBsingle;
         case GOPERL_PL_ENDAV: return (uint64_t)(uintptr_t)(SV *)PL_endav;
         case GOPERL_PL_CHECKAV: return (uint64_t)(uintptr_t)(SV *)PL_checkav;
