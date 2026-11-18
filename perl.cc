@@ -4152,8 +4152,12 @@ enum {
     GOPERL_CALL_STACK_ROOM = 38, /* a = an address in the stack (native code's
                                  * sp), b = how many: room for them above it,
                                  * as EXTEND makes it -> where that slot is now */
-    GOPERL_CALL_MARK_ROOM = 39  /* room for another mark above
+    GOPERL_CALL_MARK_ROOM = 39, /* room for another mark above
                                  * PL_markstack_ptr */
+    GOPERL_CALL_FN_CLASSES = 200 /* -> the address of two arrays of MAXO
+                                  * uint16: for each type, the first type
+                                  * whose pp function is the same, then the
+                                  * first whose checker is */
 };
 /* The words of CALL_PARSER. */
 enum {
@@ -8905,6 +8909,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_TMPS_ROOM:
         case GOPERL_CALL_STACK_ROOM:
         case GOPERL_CALL_MARK_ROOM:
+        case GOPERL_CALL_FN_CLASSES:
             break;
         default: (void)GOPERL_SVARG(a);
         }
@@ -9041,6 +9046,23 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 Perl_croak(aTHX_ "goperl: EXTEND of a stack pointer outside the stack");
             if (PL_stack_max - sp < (SSize_t)(int64_t)b) sp = stack_grow(sp, sp, (SSize_t)(int64_t)b);
             return GOPERL_ADDR(sp);
+        }
+        case GOPERL_CALL_FN_CLASSES: {
+            /* the interpreter's own functions: what a hook of native code
+             * replaced is the one it keeps */
+            static uint16_t classes[2 * MAXO];
+            for (unsigned t = 0; t < MAXO; t++) {
+                const Perl_ppaddr_t pp = goperl_pp_original(t);
+                const Perl_check_t ck =
+                    PL_check[t] == goperl_newop_tramps[t] ? g_newop_orig[t] : PL_check[t];
+                unsigned p = 0, c = 0;
+                while (goperl_pp_original(p) != pp) p++;
+                while ((PL_check[c] == goperl_newop_tramps[c] ? g_newop_orig[c] : PL_check[c]) != ck)
+                    c++;
+                classes[t] = (uint16_t)p;
+                classes[MAXO + t] = (uint16_t)c;
+            }
+            return GOPERL_ADDR(classes);
         }
         case GOPERL_CALL_MARK_ROOM: {
             const SSize_t top = PL_markstack_ptr - PL_markstack;
