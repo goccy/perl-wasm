@@ -4050,7 +4050,9 @@ enum {
      * and its stash */
     GOPERL_OPREC_HINTSHASH = GOPERL_OPREC_SV,
     GOPERL_OPREC_FILEGV = GOPERL_OPREC_PV,
-    GOPERL_OPREC_COPSTASH = GOPERL_OPREC_AUX
+    GOPERL_OPREC_COPSTASH = GOPERL_OPREC_AUX,
+    /* a METHOP's class SV (op_rclass_sv) */
+    GOPERL_OPREC_RCLASS = GOPERL_OPREC_PV
 };
 static_assert(COP_FEATURE_SIZE == 1, "a COP's feature bits are one word in the op record");
 #define GOPERL_OPBIT_MORESIB 1
@@ -4611,7 +4613,8 @@ enum {
     GOPERL_OPF_PMSTASHSTART = 403,
     GOPERL_OPF_PMCODELIST = 404,
     GOPERL_OPF_PADIX = 405,
-    GOPERL_OPF_SV = 406 /* the SV of an SVOP */
+    GOPERL_OPF_SV = 406, /* the SV of an SVOP */
+    GOPERL_OPF_RCLASS = 407 /* the class SV of a METHOP */
 };
 enum {
     GOPERL_LEX_READ_SPACE = 0,
@@ -5083,6 +5086,7 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, std::vector<goperl_gword_
     case OPclass_METHOP:
         if (!(o->op_flags & OPf_KIDS))
             w[GOPERL_OPREC_SV] = GOPERL_ADDR(cMETHOPx_meth(o));
+        w[GOPERL_OPREC_RCLASS] = GOPERL_ADDR(cMETHOPx_rclass(o));
         break;
     case OPclass_PVOP:
         w[GOPERL_OPREC_PV] = GOPERL_ADDR(cPVOPx(o)->op_pv);
@@ -7628,6 +7632,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             if (op_class(o) != OPclass_SVOP)
                 Perl_croak(aTHX_ "goperl: the SV of an op that is no SVOP");
             cSVOPx(o)->op_sv = val ? GOPERL_STORED(val) : NULL;
+            return 0;
+        case GOPERL_OPF_RCLASS:
+            /* the member, stored as it is, as GOPERL_OPF_SV's */
+            if (op_class(o) != OPclass_METHOP)
+                Perl_croak(aTHX_ "goperl: the class SV of an op that is no METHOP");
+            cMETHOPx(o)->op_rclass_sv = val ? GOPERL_STORED(val) : NULL;
             return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown op field %d", sel);
