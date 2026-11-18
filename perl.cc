@@ -3780,6 +3780,9 @@ enum {
                                      * that mask */
     GOPERL_INT_RAISE = 65,          /* b: a signal: it arrives for the
                                      * program, as raise sends it */
+    GOPERL_INT_DIR = 120,           /* a: an IO; c's high half: what
+                                     * (GOPERL_DIR_*); b: its operand ->
+                                     * its answer; second: errno */
     GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
                                      * functions; a: the flags, and in its
                                      * high half the operation
@@ -3792,6 +3795,22 @@ enum {
                                      * errors, the messages (an AV or HV the
                                      * caller owns, or 0), then the bytes of
                                      * an encoded character */
+};
+/* What INTERNAL DIR does with the directory stream of an IO (IoDIRP). */
+enum {
+    GOPERL_DIR_HAS = 0,    /* -> whether the IO has one */
+    GOPERL_DIR_READ = 1,   /* -> the address of words: the inode, the type,
+                            * the address of the name, its length; 0 at the
+                            * end (errno 0) or on an error */
+    GOPERL_DIR_TELL = 2,   /* -> telldir */
+    GOPERL_DIR_SEEK = 3,   /* b: a position of telldir */
+    GOPERL_DIR_REWIND = 4,
+    GOPERL_DIR_CLOSE = 5,  /* closedir; the IO has none after it -> 0 or -1 */
+    GOPERL_DIR_FD = 6,     /* -> dirfd, the interpreter's descriptor */
+    GOPERL_DIR_ADOPT = 7,  /* b: a descriptor, the IO's DIR from now on
+                            * (fdopendir) -> 0 or -1 */
+    GOPERL_DIR_UNSET = 8,  /* the IO has none (its DIR is left as it is) */
+    GOPERL_DIR_SHARE = 9   /* b: another IO, whose DIR the IO has too */
 };
 /* The operations of INTERNAL UTF8, and the bit asking for the messages. */
 enum {
@@ -6148,6 +6167,59 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
             w[29] = (uint32_t)STRUCT_OFFSET(HEK, hek_key);
         }
         return (uint64_t)(uintptr_t)w;
+    }
+    case GOPERL_INT_DIR: { /* the directory stream of a dirhandle (IoDIRP) */
+        IO *const io = GOPERL_IOARG(lo);
+        if (!io || SvTYPE((SV *)io) != SVt_PVIO) Perl_croak(aTHX_ "goperl: IoDIRP of no IO");
+        DIR *const d = IoDIRP(io);
+        const uint32_t what = c_hi;
+        if (what == GOPERL_DIR_HAS) return d ? 1 : 0;
+        if (what == GOPERL_DIR_ADOPT) {
+            DIR *const nd = fdopendir((int)(int64_t)b);
+            if (!nd) return goperl_two((uint64_t)-1, (uint64_t)errno);
+            IoDIRP(io) = nd;
+            return 0;
+        }
+        if (what == GOPERL_DIR_UNSET) {
+            IoDIRP(io) = NULL;
+            return 0;
+        }
+        if (what == GOPERL_DIR_SHARE) {
+            IO *const other = GOPERL_IOARG(b);
+            if (!other || SvTYPE((SV *)other) != SVt_PVIO) Perl_croak(aTHX_ "goperl: IoDIRP of no IO");
+            IoDIRP(io) = IoDIRP(other);
+            return 0;
+        }
+        if (!d) return goperl_two(0, (uint64_t)EBADF);
+        errno = 0;
+        switch (what) {
+        case GOPERL_DIR_READ: {
+            static goperl_gword_t w[4];
+            const struct dirent *const e = readdir(d);
+            if (!e) return goperl_two(0, (uint64_t)errno);
+            w[0] = (goperl_gword_t)e->d_ino;
+            w[1] = (goperl_gword_t)e->d_type;
+            w[2] = GOPERL_ADDR(e->d_name);
+            w[3] = (goperl_gword_t)strlen(e->d_name);
+            return goperl_two(GOPERL_ADDR(w), 0);
+        }
+        case GOPERL_DIR_TELL: {
+            const long pos = telldir(d);
+            return goperl_two((uint64_t)(int64_t)pos, pos < 0 ? (uint64_t)errno : 0);
+        }
+        case GOPERL_DIR_SEEK: seekdir(d, (long)(int64_t)b); return 0;
+        case GOPERL_DIR_REWIND: rewinddir(d); return 0;
+        case GOPERL_DIR_CLOSE: {
+            const int rc = closedir(d);
+            IoDIRP(io) = NULL;
+            return goperl_two((uint64_t)(int64_t)rc, rc ? (uint64_t)errno : 0);
+        }
+        case GOPERL_DIR_FD: {
+            const int fd = dirfd(d);
+            return goperl_two((uint64_t)(int64_t)fd, fd < 0 ? (uint64_t)errno : 0);
+        }
+        default: Perl_croak(aTHX_ "goperl: no such operation on a directory stream: %u", (unsigned)what);
+        }
     }
     case GOPERL_INT_SAVE_PLVAR:
         goperl_save_plvar(aTHX_ (int)lo, (int)b);
