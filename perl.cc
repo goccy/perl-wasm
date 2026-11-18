@@ -670,6 +670,11 @@ extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
 /* The program's signal mask as native code changes it (perl_signal.cc):
  * kind 0 blocks, 1 unblocks, 2 sets, 3 only asks; the mask before. */
 extern "C" uint64_t perl_signal_native_mask(int kind, uint64_t mask);
+/* The mask a sigset_t holds, and a sigset_t made to hold a mask
+ * (perl_signal.cc: the byte of a sigset_t names a set of its table);
+ * perl_signal_set_store returns 0, or -1 when the table is full. */
+extern "C" uint64_t perl_signal_set_mask(const sigset_t *set);
+extern "C" int perl_signal_set_store(sigset_t *set, uint64_t mask);
 
 /* Words the host writes with plain linear-memory writes, no wasm code
  * running on the instance (perl_interrupt_addr returns their address):
@@ -3874,7 +3879,12 @@ enum {
     GOPERL_INT_SIGMASK = 63,        /* a: how (0 block, 1 unblock, 2 set, 3
                                      * ask), b: the mask (a bit for each
                                      * signal of the program's, 1 << (sig -
-                                     * 1)) -> the mask before */
+                                     * 1)) -> the mask before; or a: 4, b:
+                                     * the address of a sigset_t of this
+                                     * memory -> the mask it holds */
+    GOPERL_INT_SIGSET_STORE = 64,   /* a: the address of a sigset_t of this
+                                     * memory, b: a mask: the set becomes
+                                     * that mask */
     GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
                                      * functions; a: the flags, and in its
                                      * high half the operation
@@ -5698,9 +5708,23 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         return goperl_two(old, (uint64_t)ran);
     }
     case GOPERL_INT_SIGMASK:
+        if (lo == 4) {
+            /* the set of POSIX::SigSet native code hands sigprocmask as it
+             * is: one byte here, naming a set (perl_signal.cc) */
+            return perl_signal_set_mask((const sigset_t *)goperl_mem_arg(
+                aTHX_ b, 1, GOPERL_OP_INTERNAL, "a sigset_t"));
+        }
         /* sigprocmask and pthread_sigmask of native code: the program's
          * mask, as POSIX::sigprocmask changes it (perl_signal.cc) */
         return perl_signal_native_mask((int)lo, b);
+    case GOPERL_INT_SIGSET_STORE: {
+        /* the set before, into a POSIX::SigSet native code handed over */
+        sigset_t *set = (sigset_t *)goperl_mem_arg(aTHX_ a, 1, GOPERL_OP_INTERNAL, "a sigset_t");
+        const int saved = errno;
+        const int r = perl_signal_set_store(set, b);
+        errno = saved;
+        return (uint64_t)(int64_t)r;
+    }
     case GOPERL_INT_SIGACTION: {
         /* native code shares the process's signals with the program, whose
          * actions are its C library's: the action native code finds where

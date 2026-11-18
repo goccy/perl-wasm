@@ -438,17 +438,23 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
  * unblocks that came meanwhile is delivered before it returns, as
  * sigprocmask delivers it. The mask before. */
 uint64_t perl_signal_native_mask(int kind, uint64_t mask) {
-    sigset_t set, old;
-    sigemptyset(&set);
-    sigemptyset(&old);
-    for (int sig = 1; sig <= 64; sig++)
-        if (mask & sig_bit(sig)) sigaddset(&set, sig);
+    /* the set in one entry of the table, not one for each signal added */
+    sigset_t set = 0, old = 0;
+    if (kind != 3 && set_assign(&set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1))) != 0)
+        return g_blocked;
     const int how = kind == 0 ? SIG_BLOCK : kind == 1 ? SIG_UNBLOCK : SIG_SETMASK;
     if (sigprocmask(how, kind == 3 ? NULL : &set, &old) != 0) return g_blocked;
-    uint64_t was = 0;
-    for (int sig = 1; sig <= 64; sig++)
-        if (sigismember(&old, sig) == 1) was |= sig_bit(sig);
-    return was;
+    return set_mask(&old);
+}
+
+/* The mask a sigset_t of the program's holds, and a sigset_t made to hold
+ * a mask, in one entry of the table (perl.cc: the sets of POSIX::SigSet
+ * native code hands sigprocmask). perl_signal_set_store returns 0, or -1
+ * with errno set when the table is full. */
+uint64_t perl_signal_set_mask(const sigset_t *set) { return set_mask(set); }
+
+int perl_signal_set_store(sigset_t *set, uint64_t mask) {
+    return set_assign(set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1)));
 }
 
 /* What the host posted while a call of the program's was made, delivered
