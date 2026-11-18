@@ -667,6 +667,9 @@ extern "C" void perl_wasm_locale_start_up(int on);
 /* Ends the process by a signal, as the signal's default action does
  * (perl_signal.cc). Does not return. */
 extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
+/* The program's signal mask as native code changes it (perl_signal.cc):
+ * kind 0 blocks, 1 unblocks, 2 sets, 3 only asks; the mask before. */
+extern "C" uint64_t perl_signal_native_mask(int kind, uint64_t mask);
 
 /* Words the host writes with plain linear-memory writes, no wasm code
  * running on the instance (perl_interrupt_addr returns their address):
@@ -3890,6 +3893,10 @@ enum {
     GOPERL_INT_PADNAMELIST_NEW = 60, /* b: max -> newPADNAMELIST's list */
     GOPERL_INT_PADNAMELIST_FREE = 61, /* a: the list: PadnamelistREFCNT_dec */
     GOPERL_INT_PADNAME_OUTER = 62,  /* a: a pad name -> newPADNAMEouter's */
+    GOPERL_INT_SIGMASK = 63,        /* a: how (0 block, 1 unblock, 2 set, 3
+                                     * ask), b: the mask (a bit for each
+                                     * signal of the program's, 1 << (sig -
+                                     * 1)) -> the mask before */
     GOPERL_INT_UTF8 = 42            /* one character's UTF-8 by perl's own
                                      * functions; a: the flags, and in its
                                      * high half the operation
@@ -5655,6 +5662,10 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         const int ran = perl_signal_wait_mask(lo != 0, mask, &old);
         return goperl_two(old, (uint64_t)ran);
     }
+    case GOPERL_INT_SIGMASK:
+        /* sigprocmask and pthread_sigmask of native code: the program's
+         * mask, as POSIX::sigprocmask changes it (perl_signal.cc) */
+        return perl_signal_native_mask((int)lo, b);
     case GOPERL_INT_SIGACTION: {
         /* native code shares the process's signals with the program, whose
          * actions are its C library's: the action native code finds where

@@ -432,6 +432,25 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     return 0;
 }
 
+/* The program's mask as native code changes it with sigprocmask or
+ * pthread_sigmask (perl.cc's GOPERL_INT_SIGMASK): kind 0 blocks the signals
+ * of mask, 1 unblocks them, 2 makes mask the mask, 3 only asks; a signal it
+ * unblocks that came meanwhile is delivered before it returns, as
+ * sigprocmask delivers it. The mask before. */
+uint64_t perl_signal_native_mask(int kind, uint64_t mask) {
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigemptyset(&old);
+    for (int sig = 1; sig <= 64; sig++)
+        if (mask & sig_bit(sig)) sigaddset(&set, sig);
+    const int how = kind == 0 ? SIG_BLOCK : kind == 1 ? SIG_UNBLOCK : SIG_SETMASK;
+    if (sigprocmask(how, kind == 3 ? NULL : &set, &old) != 0) return g_blocked;
+    uint64_t was = 0;
+    for (int sig = 1; sig <= 64; sig++)
+        if (sigismember(&old, sig) == 1) was |= sig_bit(sig);
+    return was;
+}
+
 int sigpending(sigset_t *set) {
     absorb_posted(); /* the host holds the blocked signals it recorded */
     return set_assign(set, g_held);
