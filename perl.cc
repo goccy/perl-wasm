@@ -3328,6 +3328,11 @@ static const MGVTBL *goperl_anchor_vtbl(unsigned mask) {
     }
     return &goperl_anchor_vtbls[mask & (GOPERL_ANCHOR_VTBLS - 1)];
 }
+/* perl's volatile API, declared for its core alone: the passes run on a
+ * finished optree, which native code runs on a block it built
+ * (List::Keywords) */
+EXTERN_C void Perl_optimize_optree(pTHX_ OP *o);
+EXTERN_C void Perl_finalize_optree(pTHX_ OP *o);
 static bool goperl_is_anchor(const MAGIC *mg) {
     return mg->mg_virtual >= &goperl_anchor_vtbls[0] &&
            mg->mg_virtual < &goperl_anchor_vtbls[GOPERL_ANCHOR_VTBLS];
@@ -4012,7 +4017,24 @@ enum {
     GOPERL_OPREC_AUX = 22,  /* address of the items of a multideref */
     GOPERL_OPREC_AUX_N = 23,
     GOPERL_OPREC_FEATURES = 24, /* cop_features.bits[0] */
-    GOPERL_OPREC_WORDS = 25
+    GOPERL_OPREC_WORDS = 25,
+    /* The words of a class's own fields, in words the class does not use
+     * otherwise. A PMOP: its regexp, its flags, and the raw words of its
+     * two unions (op_pmreplrootu: an op of a substitution, the GV of a
+     * split; op_pmstashstartu: the op a substitution's replacement starts
+     * at, the stash of a match once) and its code list. */
+    GOPERL_OPREC_PMREGEXP = GOPERL_OPREC_SV,
+    GOPERL_OPREC_PMFLAGS = GOPERL_OPREC_HINTS,
+    GOPERL_OPREC_PMREPLROOT = GOPERL_OPREC_REDOOP,
+    GOPERL_OPREC_PMSTASHSTART = GOPERL_OPREC_NEXTOP,
+    GOPERL_OPREC_PMCODELIST = GOPERL_OPREC_LASTOP,
+    /* a PADOP: the index of its pad entry */
+    GOPERL_OPREC_PADIX = GOPERL_OPREC_AUX_N,
+    /* a COP: its hints hash (a chain of refcounted_he), its file's glob
+     * and its stash */
+    GOPERL_OPREC_HINTSHASH = GOPERL_OPREC_SV,
+    GOPERL_OPREC_FILEGV = GOPERL_OPREC_PV,
+    GOPERL_OPREC_COPSTASH = GOPERL_OPREC_AUX
 };
 static_assert(COP_FEATURE_SIZE == 1, "a COP's feature bits are one word in the op record");
 #define GOPERL_OPBIT_MORESIB 1
@@ -4525,7 +4547,9 @@ enum {
     GOPERL_OPC_CONDOP = 10,
     GOPERL_OPC_SLICEOP = 11,
     GOPERL_OPC_RAW = 12,
-    GOPERL_OPC_ASSIGNOP = 13
+    GOPERL_OPC_ASSIGNOP = 13,
+    GOPERL_OPC_PMOP = 400,
+    GOPERL_OPC_METHOP = 401 /* a method named by the op below it (k1) */
 };
 enum {
     GOPERL_OPM_APPEND_ELEM = 0,
@@ -4538,7 +4562,10 @@ enum {
     GOPERL_OPM_FREE = 7,
     GOPERL_OPM_NULL = 8,
     GOPERL_OPM_FORCE_LIST = 9,
-    GOPERL_OPM_SIBLING_SPLICE = 10
+    GOPERL_OPM_SIBLING_SPLICE = 10,
+    /* 11 is the SDK's own (op_class, answered here) */
+    GOPERL_OPM_OPTIMIZE = 12, /* optimize_optree(o1) */
+    GOPERL_OPM_FINALIZE = 13  /* finalize_optree(o1) */
 };
 enum {
     GOPERL_OPF_NEXT = 0,
@@ -4552,7 +4579,14 @@ enum {
     GOPERL_OPF_PRIVATE = 8,
     GOPERL_OPF_PPADDR_HOOK = 9,
     GOPERL_OPF_MORESIB = 10,
-    GOPERL_OPF_PPADDR_OWN = 11 /* the pp function of the op's type again */
+    GOPERL_OPF_PPADDR_OWN = 11, /* the pp function of the op's type again */
+    /* the fields of a PMOP and a PADOP (see GOPERL_OPREC_PMREGEXP) */
+    GOPERL_OPF_PMFLAGS = 400,
+    GOPERL_OPF_PMREGEXP = 401,
+    GOPERL_OPF_PMREPLROOT = 402,
+    GOPERL_OPF_PMSTASHSTART = 403,
+    GOPERL_OPF_PMCODELIST = 404,
+    GOPERL_OPF_PADIX = 405
 };
 enum {
     GOPERL_LEX_READ_SPACE = 0,
@@ -4771,7 +4805,15 @@ enum {
 #define GOPERL_PL_TMPS_STACK_ADDR 120  /* the address of the temporaries (SV *[]) */
 #define GOPERL_PL_SAVESTACK_MAX 121
 #define GOPERL_PL_TMPS_MAX 122
-#define GOPERL_PL_CATCH 123            /* CATCH_GET */
+#define GOPERL_PL_CATCH 123            /* CATCH_GET, CATCH_SET */
+/* the roots and starts of the main program and of the eval being compiled
+ * (ops), and the custom op tables of before XOPs (hashes) */
+#define GOPERL_PL_MAIN_ROOT 400
+#define GOPERL_PL_MAIN_START 401
+#define GOPERL_PL_EVAL_ROOT 402
+#define GOPERL_PL_EVAL_START 403
+#define GOPERL_PL_CUSTOM_OP_NAMES 404
+#define GOPERL_PL_CUSTOM_OP_DESCS 405
 #define GOPERL_PL_TOP_ENV 125          /* the address of PL_top_env's JMPENV */
 #define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
 #define GOPERL_PL_YES 128              /* the address of PL_Yes, the buffer of true */
@@ -4974,9 +5016,18 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
     switch (cls) {
     case OPclass_BINOP:
     case OPclass_LISTOP:
-    case OPclass_PMOP:
         w[GOPERL_OPREC_LAST] = GOPERL_ADDR(cBINOPx(o)->op_last);
         break;
+    case OPclass_PMOP: {
+        PMOP *const pm = cPMOPx(o);
+        w[GOPERL_OPREC_LAST] = GOPERL_ADDR(pm->op_last);
+        w[GOPERL_OPREC_PMREGEXP] = GOPERL_ADDR(PM_GETRE(pm));
+        w[GOPERL_OPREC_PMFLAGS] = pm->op_pmflags;
+        w[GOPERL_OPREC_PMREPLROOT] = GOPERL_ADDR(pm->op_pmreplrootu.op_pmreplroot);
+        w[GOPERL_OPREC_PMSTASHSTART] = GOPERL_ADDR(pm->op_pmstashstartu.op_pmreplstart);
+        w[GOPERL_OPREC_PMCODELIST] = GOPERL_ADDR(pm->op_code_list);
+        break;
+    }
     case OPclass_LOGOP:
         w[GOPERL_OPREC_OTHER] = GOPERL_ADDR(cLOGOPx(o)->op_other);
         break;
@@ -4991,6 +5042,7 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
         break;
     case OPclass_PADOP:
         w[GOPERL_OPREC_SV] = GOPERL_ADDR(PAD_SVl(cPADOPx(o)->op_padix));
+        w[GOPERL_OPREC_PADIX] = (goperl_gword_t)cPADOPx(o)->op_padix;
         break;
     case OPclass_METHOP:
         if (!(o->op_flags & OPf_KIDS))
@@ -5028,6 +5080,16 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
             w[GOPERL_OPREC_AUX] = GOPERL_ADDR(items);
             w[GOPERL_OPREC_AUX_N] = (uint32_t)items[-1].uv;
         }
+        if (o->op_type == OP_MULTICONCAT && cUNOP_AUXx(o)->op_aux) {
+            /* the header, then the lengths of the nargs + 1 constant
+             * segments, twice when there is a UTF-8 variant (peep.c) */
+            UNOP_AUX_item *items = cUNOP_AUXx(o)->op_aux;
+            const SSize_t nargs = items[PERL_MULTICONCAT_IX_NARGS].ssize;
+            w[GOPERL_OPREC_AUX] = GOPERL_ADDR(items);
+            w[GOPERL_OPREC_AUX_N] =
+                (uint32_t)(PERL_MULTICONCAT_HEADER_SIZE +
+                           (nargs + 1) * (items[PERL_MULTICONCAT_IX_UTF8_PV].pv ? 2 : 1));
+        }
         break;
     case OPclass_COP: {
         COP *cop = (COP *)o;
@@ -5042,6 +5104,9 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
         w[GOPERL_OPREC_WARNINGS] = GOPERL_ADDR(cop->cop_warnings);
         w[GOPERL_OPREC_SEQ] = (uint32_t)cop->cop_seq;
         w[GOPERL_OPREC_FEATURES] = cop->cop_features.bits[0];
+        w[GOPERL_OPREC_HINTSHASH] = GOPERL_ADDR(CopHINTHASH_get(cop));
+        w[GOPERL_OPREC_FILEGV] = GOPERL_ADDR(CopFILEGV(cop));
+        w[GOPERL_OPREC_COPSTASH] = GOPERL_ADDR(CopSTASH(cop));
         break;
     }
     default: break;
@@ -6574,6 +6639,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_SAVESTACK_MAX: return (uint64_t)(int64_t)PL_savestack_max;
         case GOPERL_PL_TMPS_MAX: return (uint64_t)(int64_t)PL_tmps_max;
         case GOPERL_PL_CATCH: return CATCH_GET ? 1 : 0;
+        case GOPERL_PL_MAIN_ROOT: return GOPERL_ADDR(PL_main_root);
+        case GOPERL_PL_MAIN_START: return GOPERL_ADDR(PL_main_start);
+        case GOPERL_PL_EVAL_ROOT: return GOPERL_ADDR(PL_eval_root);
+        case GOPERL_PL_EVAL_START: return GOPERL_ADDR(PL_eval_start);
+        case GOPERL_PL_CUSTOM_OP_NAMES: return GOPERL_ADDR(PL_custom_op_names);
+        case GOPERL_PL_CUSTOM_OP_DESCS: return GOPERL_ADDR(PL_custom_op_descs);
         case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
         case GOPERL_PL_TOP_ENV: return GOPERL_ADDR(PL_top_env);
         case GOPERL_PL_RESTARTJMPENV: return GOPERL_ADDR(PL_restartjmpenv);
@@ -6744,6 +6815,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             PL_tmps_ix = (SSize_t)(int64_t)b;
             return 0;
         case GOPERL_PL_CURPM: PL_curpm = GOPERL_MEMARG(PMOP, b); return 0;
+        /* CATCH_SET: whether the run loop of the jump environment native
+         * code runs in must catch a die an eval inside it catches */
+        case GOPERL_PL_CATCH: CATCH_SET(b != 0); return 0;
+        /* plain stores of the op pointers, as perl's variables take them */
+        case GOPERL_PL_MAIN_ROOT: PL_main_root = GOPERL_MEMARG(OP, b); return 0;
+        case GOPERL_PL_MAIN_START: PL_main_start = GOPERL_MEMARG(OP, b); return 0;
+        case GOPERL_PL_EVAL_ROOT: PL_eval_root = GOPERL_MEMARG(OP, b); return 0;
+        case GOPERL_PL_EVAL_START: PL_eval_start = GOPERL_MEMARG(OP, b); return 0;
         case GOPERL_PL_RESTARTJMPENV: PL_restartjmpenv = (JMPENV *)(uintptr_t)b; return 0;
         case GOPERL_PL_DEFSTASH: PL_defstash = GOPERL_HVARG(b); return 0;
         case GOPERL_PL_PARSER:
@@ -7403,6 +7482,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_OPC_METHOP_NAMED:
             o = newMETHOP_named(type, flags, GOPERL_SVARG(k1));
             break;
+        case GOPERL_OPC_PMOP: o = newPMOP(type, flags); break;
+        case GOPERL_OPC_METHOP: o = newMETHOP(type, flags, first); break;
         case GOPERL_OPC_STATEOP:
             if (k1)
                 Perl_croak(aTHX_ "goperl: newSTATEOP labels are not bridged");
@@ -7468,6 +7549,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_OPM_CONTEXTUALIZE:
             return (uint64_t)(uintptr_t)op_contextualize(o1, aux);
         case GOPERL_OPM_SCOPE: return (uint64_t)(uintptr_t)op_scope(o1);
+        case GOPERL_OPM_OPTIMIZE: Perl_optimize_optree(aTHX_ o1); return 0;
+        case GOPERL_OPM_FINALIZE: Perl_finalize_optree(aTHX_ o1); return 0;
         case GOPERL_OPM_LINKLIST:
             if (!o1) return 0;
             return (uint64_t)(uintptr_t)(o1->op_next ? o1->op_next
@@ -7507,6 +7590,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                                                        : goperl_pp_hooked_op;
             return 0;
         case GOPERL_OPF_PPADDR_OWN: o->op_ppaddr = PL_ppaddr[o->op_type]; return 0;
+        /* plain stores, as perl's macros and members are: PM_SETRE takes
+         * the reference it is given and drops none */
+        case GOPERL_OPF_PMFLAGS: cPMOPx(o)->op_pmflags = (U32)val; return 0;
+        case GOPERL_OPF_PMREGEXP:
+            PM_SETRE(cPMOPx(o), val ? (REGEXP *)goperl_sv_arg(aTHX_ val, op) : NULL);
+            return 0;
+        case GOPERL_OPF_PMREPLROOT:
+            /* an op of a substitution, the glob of a split: the word as it is */
+            cPMOPx(o)->op_pmreplrootu.op_pmreplroot = (OP *)(uintptr_t)val;
+            return 0;
+        case GOPERL_OPF_PMSTASHSTART:
+            cPMOPx(o)->op_pmstashstartu.op_pmreplstart = (OP *)(uintptr_t)val;
+            return 0;
+        case GOPERL_OPF_PMCODELIST: cPMOPx(o)->op_code_list = GOPERL_MEMARG(OP, val); return 0;
+        case GOPERL_OPF_PADIX: cPADOPx(o)->op_padix = (PADOFFSET)val; return 0;
         }
         Perl_croak(aTHX_ "goperl: unknown op field %d", sel);
     }
