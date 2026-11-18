@@ -1028,6 +1028,49 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"op numbers outside the memory taken in {path}")
 PYPATCH
+# ---- POSIX: CHAR_MIN and CHAR_MAX are the host's ------------------------------
+# char is signed where the interpreter is built (wasm) and may be unsigned
+# where native code runs (aarch64 Linux), and a module that passes a char
+# between the two compares with POSIX::CHAR_MIN and CHAR_MAX (FFI::Raw's
+# tests). Where the host's char is unsigned (perl.cc
+# goperl_host_char_unsigned) they are 0 and UCHAR_MAX, as perl has them
+# there. Idempotent.
+python3 - <<'PYPATCH'
+path = "ext/POSIX/POSIX.xs"
+t = open(path).read()
+if "goperl_host_char_unsigned" in t:
+    print(f"the host's CHAR_MIN and CHAR_MAX already present in {path}")
+else:
+    old = "INCLUDE: const-xs.inc\n"
+    assert t.count(old) == 1, path
+    t = t.replace(old, old +
+        "\n"
+        "BOOT:\n"
+        "{\n"
+        "    /* CHAR_MIN and CHAR_MAX are the host's (perl-wasm\n"
+        "     * scripts/wasi-configure.sh) */\n"
+        "    extern int goperl_host_char_unsigned(void);\n"
+        "    if (goperl_host_char_unsigned()) {\n"
+        "        HV *const stash = gv_stashpvs(\"POSIX\", 0);\n"
+        "        static const char *const names[2] = {\"CHAR_MIN\", \"CHAR_MAX\"};\n"
+        "        const IV values[2] = {0, UCHAR_MAX};\n"
+        "        int i;\n"
+        "        for (i = 0; stash && i < 2; i++) {\n"
+        "            SV **const svp = hv_fetch(stash, names[i], (I32)strlen(names[i]), 0);\n"
+        "            if (svp && SvROK(*svp) && !SvOBJECT(SvRV(*svp))) {\n"
+        "                SV *const old = SvRV(*svp);\n"
+        "                SV *const value = newSViv(values[i]);\n"
+        "                SvREADONLY_on(value);\n"
+        "                SvRV_set(*svp, value);\n"
+        "                SvREADONLY_off(old);\n"
+        "                SvREFCNT_dec(old);\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}\n")
+    open(path, "w").write(t)
+    print(f"the host's CHAR_MIN and CHAR_MAX applied to {path}")
+PYPATCH
 # ---- Encode: a table that is no address of this memory ------------------------
 # An Encode::XS object holds the address of its encode_t table. A native
 # module made by enc2xs (Encode::EUCJPASCII, Encode::HanExtra) defines its

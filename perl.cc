@@ -673,15 +673,26 @@ extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
  *   +0  the interrupt flag. The host trips a runaway eval by storing 1 here;
  *       the interruptible run loop clears it and croaks. `volatile` so the
  *       compiler always reloads it in the op loop.
+ *   +4  facts of the host's C ABI, which native code has and this build
+ *       does not, written before any code runs (GOPERL_HOSTABI_*).
  *   +8  where the host process has this memory: an address of this memory
  *       is that much higher in the process (see goperl_pack_address). The
  *       host writes it before any code runs in an instance that runs native
  *       code, and never changes it; 0 (no base) otherwise. */
 static volatile struct {
     uint32_t interrupt;
-    uint32_t unused;
+    uint32_t abi;
     uint64_t membase;
 } g_hostwords = {0, 0, 0};
+/* The bits of g_hostwords.abi. */
+enum {
+    GOPERL_HOSTABI_CHAR_UNSIGNED = 1 /* char is unsigned in the host's C */
+};
+/* Whether char is unsigned for the native code of the host (POSIX's
+ * CHAR_MIN and CHAR_MAX, scripts/wasi-configure.sh). */
+extern "C" int goperl_host_char_unsigned(void) {
+    return (g_hostwords.abi & GOPERL_HOSTABI_CHAR_UNSIGNED) != 0;
+}
 #define g_interrupt (g_hostwords.interrupt)
 
 /* pp hooks: a host-native module (via the go-perl XS SDK) can claim op
