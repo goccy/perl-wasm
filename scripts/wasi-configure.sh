@@ -1029,6 +1029,67 @@ else:
     open(path, "w").write(t.replace(old, new))
     print(f"op numbers outside the memory taken in {path}")
 PYPATCH
+# ---- B: the numbers of pad structures ----------------------------------------
+# The number of a B::PADLIST, B::PADNAMELIST or B::PADNAME object is the
+# structure's address with bit 61 set and the kind of structure in bits 59
+# and 60 (0 a pad name, 1 a list of names, 2 a padlist), which no address of
+# the host process has: a native module that takes the structure of such an
+# object (B::Flags reads PadnameFLAGS of a B::PADNAME) gets the SDK's view
+# of it, which an address of this memory cannot tell from one of its own
+# (go-perl's xs/sdk/include/goperl_compiler.h, GOPERL_PAD_NUMBER_TAG). B's
+# typemaps take tagged and untagged numbers. No structure is still 0.
+# Idempotent.
+python3 - <<'PYPATCH'
+def patch(path, marker, edits):
+    t = open(path).read()
+    if marker in t:
+        print(f"pad structure numbers already in {path}")
+        return
+    for old, new in edits:
+        assert t.count(old) == 1, (path, old[:60], t.count(old))
+        t = t.replace(old, new)
+    open(path, "w").write(t)
+    print(f"pad structure numbers applied to {path}")
+
+patch("ext/B/B.xs", "GOPERL_PAD_NUMBER", [
+    ('#define GOPERL_OP_NUMBER_TAG ((IV)1 << 62)\n',
+     '#define GOPERL_OP_NUMBER_TAG ((IV)1 << 62)\n'
+     '/* The number of a pad structure: its address with bit 61 set and its\n'
+     ' * kind in bits 59 and 60 (0 a pad name, 1 a list of names, 2 a\n'
+     ' * padlist). No structure is 0. */\n'
+     '#define GOPERL_PAD_NUMBER_TAG ((IV)1 << 61)\n'
+     '#define GOPERL_PAD_NUMBER(p, kind) \\\n'
+     '    ((p) ? (PTR2IV(p) | GOPERL_PAD_NUMBER_TAG | ((IV)(kind) << 59)) : (IV)0)\n'
+     '#define GOPERL_NUMBER_PAD(type, iv) INT2PTR(type, (iv) & (((IV)1 << 59) - 1))\n'),
+    ('\t    sv_setiv(newSVrv(rv, padlist ? "B::PADLIST" : "B::NULL"),\n'
+     '\t\t     PTR2IV(padlist));\n',
+     '\t    sv_setiv(newSVrv(rv, padlist ? "B::PADLIST" : "B::NULL"),\n'
+     '\t\t     GOPERL_PAD_NUMBER(padlist, 2));\n'),
+    ('\t\t     PTR2IV(PadlistNAMES(padlist)));\n',
+     '\t\t     GOPERL_PAD_NUMBER(PadlistNAMES(padlist), 1));\n'),
+    ('\t\t\t PTR2IV(padp[i]));\n',
+     '\t\t\t GOPERL_PAD_NUMBER(padp[i], 0));\n'),
+])
+inp = ('\tif (SvROK($arg)) {\n'
+       '\t    IV tmp = SvIV((SV*)SvRV($arg));\n'
+       '\t    $var = INT2PTR($type,tmp);\n')
+inp_new = ('\tif (SvROK($arg)) {\n'
+           '\t    IV tmp = SvIV((SV*)SvRV($arg));\n'
+           '\t    $var = GOPERL_NUMBER_PAD($type,tmp);\n')
+edits = []
+for name in ("T_PL_OBJ", "T_PNL_OBJ", "T_PN_OBJ"):
+    edits.append((name + '\n' + inp, name + '\n' + inp_new))
+for name, cls, kind in (("T_PL_OBJ", "B::PADLIST", 2), ("T_PNL_OBJ", "B::PADNAMELIST", 1),
+                        ("T_PN_OBJ", "B::PADNAME", 0)):
+    null = "B::SPECIAL" if kind == 0 else "B::NULL"
+    edits.append((name + '\n'
+                  '\tsv_setiv(newSVrv($arg, $var ? "' + cls + '" : "' + null + '"),\n'
+                  '\t\t PTR2IV($var));\n',
+                  name + '\n'
+                  '\tsv_setiv(newSVrv($arg, $var ? "' + cls + '" : "' + null + '"),\n'
+                  '\t\t GOPERL_PAD_NUMBER($var, ' + str(kind) + '));\n'))
+patch("ext/B/typemap", "GOPERL_NUMBER_PAD", edits)
+PYPATCH
 # ---- POSIX: CHAR_MIN and CHAR_MAX are the host's ------------------------------
 # char is signed where the interpreter is built (wasm) and may be unsigned
 # where native code runs (aarch64 Linux), and a module that passes a char
