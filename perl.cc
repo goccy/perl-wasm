@@ -7615,7 +7615,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 w.push_back((goperl_gword_t)(*l)->tab->kind);
                 w.push_back((goperl_gword_t)(*l)->flags);
                 if (b == 1) {
-                    if ((*l)->tab->kind & PERLIO_K_BUFFERED) {
+                    if (!((*l)->tab->kind & PERLIO_K_BUFFERED)) {
+                        w.insert(w.end(), 5, 0);
+                    } else if ((*l)->tab->Get_base == PerlIOBuf_get_base) {
+                        /* a PerlIOBuf (:perlio, :crlf): its fields */
                         const PerlIOBuf *pb = PerlIOSelf(l, PerlIOBuf);
                         w.push_back(GOPERL_ADDR(pb->buf));
                         w.push_back(GOPERL_ADDR(pb->end));
@@ -7623,7 +7626,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                         w.push_back((goperl_gword_t)pb->bufsiz);
                         w.push_back((goperl_gword_t)(int64_t)pb->posn);
                     } else {
-                        w.insert(w.end(), 5, 0);
+                        /* a buffered layer that is not a PerlIOBuf: the
+                         * struct of :scalar is a PerlIOScalar, shorter than
+                         * a PerlIOBuf, and the fields read past it were
+                         * whatever lay there (FileHandle::Fmode's view of an
+                         * in-memory handle died "guest_mem: pointer outside
+                         * linear memory" in some runs). Its buffer is what
+                         * its own functions give; it has no posn. */
+                        STDCHAR *const base = PerlIO_get_base(l);
+                        STDCHAR *const ptr = PerlIO_get_ptr(l);
+                        const SSize_t cnt = PerlIO_get_cnt(l);
+                        w.push_back(GOPERL_ADDR(base));
+                        w.push_back(GOPERL_ADDR(ptr && cnt > 0 ? ptr + cnt : ptr));
+                        w.push_back(GOPERL_ADDR(ptr));
+                        w.push_back((goperl_gword_t)PerlIO_get_bufsiz(l));
+                        w.push_back(0);
                     }
                 }
                 w[0]++;
