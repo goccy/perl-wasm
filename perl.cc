@@ -4837,6 +4837,9 @@ enum {
 #define GOPERL_PL_EVAL_START 403
 #define GOPERL_PL_CUSTOM_OP_NAMES 404
 #define GOPERL_PL_CUSTOM_OP_DESCS 405
+/* the addresses of the two static pad names (pad.h) */
+#define GOPERL_PL_PADNAME_UNDEF 406
+#define GOPERL_PL_PADNAME_CONST 407
 #define GOPERL_PL_TOP_ENV 125          /* the address of PL_top_env's JMPENV */
 #define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
 #define GOPERL_PL_YES 128              /* the address of PL_Yes, the buffer of true */
@@ -6630,6 +6633,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_EVAL_START: return GOPERL_ADDR(PL_eval_start);
         case GOPERL_PL_CUSTOM_OP_NAMES: return GOPERL_ADDR(PL_custom_op_names);
         case GOPERL_PL_CUSTOM_OP_DESCS: return GOPERL_ADDR(PL_custom_op_descs);
+        case GOPERL_PL_PADNAME_UNDEF: return GOPERL_ADDR(&PL_padname_undef);
+        case GOPERL_PL_PADNAME_CONST: return GOPERL_ADDR(&PL_padname_const);
         case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
         case GOPERL_PL_TOP_ENV: return GOPERL_ADDR(PL_top_env);
         case GOPERL_PL_RESTARTJMPENV: return GOPERL_ADDR(PL_restartjmpenv);
