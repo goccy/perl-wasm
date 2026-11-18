@@ -6611,8 +6611,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             PL_curpad = PL_comppad ? AvARRAY(PL_comppad) : NULL;
             return 0;
         case GOPERL_PL_COMPPAD_NAME: PL_comppad_name = GOPERL_MEMARG(PADNAMELIST, b); return 0;
-        /* b: the array whose values PL_curpad is to be */
-        case GOPERL_PL_CURPAD: PL_curpad = GOPERL_SVARG(b) ? AvARRAY(GOPERL_AVARG(b)) : NULL; return 0;
+        /* b: the address of the values, in this memory (a pad's body) */
+        case GOPERL_PL_CURPAD: PL_curpad = b ? GOPERL_MEMARG(SV *, b) : NULL; return 0;
         case GOPERL_PL_COP_SEQMAX: PL_cop_seqmax = (U32)b; return 0;
         case GOPERL_PL_PADIX: PL_padix = (PADOFFSET)(int64_t)b; return 0;
         case GOPERL_PL_CONSTPADIX: PL_constpadix = (PADOFFSET)(int64_t)b; return 0;
