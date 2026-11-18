@@ -9024,16 +9024,24 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         }
         case GOPERL_CALL_XOP: {
-            if (g_xop_n >= GOPERL_PP_TRAMPS)
+            /* a: 0, or the number of a custom op registered before, whose
+             * pp function native code registers again: what it is
+             * registered with is replaced, as perl's custom_op_register
+             * replaces it, and every op that runs it has the new name */
+            if (a && (a > (uint64_t)g_xop_n))
+                Perl_croak(aTHX_ "goperl: no registered custom op %" UVuf, (UV)a);
+            if (!a && g_xop_n >= GOPERL_PP_TRAMPS)
                 Perl_croak(aTHX_ "goperl: too many registered custom ops");
+            const int at = a ? (int)a - 1 : g_xop_n;
             const char *name = s ? s : "";
             const char *desc = name + strlen(name) + 1;
-            XOP *xop = &g_xops[g_xop_n];
+            XOP *xop = &g_xops[at];
             XopENTRY_set(xop, xop_name, savepv(name));
             XopENTRY_set(xop, xop_desc, savepv(desc));
             XopENTRY_set(xop, xop_class, (U32)b);
-            Perl_custom_op_register(aTHX_ goperl_pp_tramps[g_xop_n], xop);
-            return (uint64_t)(++g_xop_n);
+            Perl_custom_op_register(aTHX_ goperl_pp_tramps[at], xop);
+            if (!a) ++g_xop_n;
+            return (uint64_t)(at + 1);
         }
         case GOPERL_CALL_COP_SAVE: {
             COP *cop = GOPERL_MEMARG(COP, a);
