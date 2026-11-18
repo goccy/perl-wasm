@@ -4182,7 +4182,10 @@ enum {
      * (which in the high half of c) takes b, or a copy of the text s for
      * a name */
     GOPERL_FIELD_IO_WORD = 24,
-    GOPERL_FIELD_IO_WORD_SET = 25
+    GOPERL_FIELD_IO_WORD_SET = 25,
+    /* a hash's xhv_rand and xhv_last_rand (0 without its aux struct) */
+    GOPERL_FIELD_HVAUX_RAND = 26,
+    GOPERL_FIELD_HVAUX_LAST_RAND = 27
 };
 enum {
     GOPERL_IOWORD_LINES = 0,
@@ -4757,6 +4760,8 @@ enum {
 #define GOPERL_PL_CATCH 123            /* CATCH_GET */
 #define GOPERL_PL_TOP_ENV 125          /* the address of PL_top_env's JMPENV */
 #define GOPERL_PL_RESTARTJMPENV 127    /* PL_restartjmpenv, the JMPENV's address */
+#define GOPERL_PL_YES 128              /* the address of PL_Yes, the buffer of true */
+#define GOPERL_PL_NO 129               /* the address of PL_No, the buffer of false */
 #define GOPERL_PL_DTOR_THUNK 130       /* the function a destructor of the host's
                                         * is to the save stack (goperl_dtor_thunk) */
 #define GOPERL_PL_PP_VARS 124          /* the address of the record of where the
@@ -6544,6 +6549,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PL_PP_VARS: return goperl_pp_vars(aTHX);
         case GOPERL_PL_TOP_ENV: return GOPERL_ADDR(PL_top_env);
         case GOPERL_PL_RESTARTJMPENV: return GOPERL_ADDR(PL_restartjmpenv);
+        case GOPERL_PL_YES: return GOPERL_ADDR(PL_Yes);
+        case GOPERL_PL_NO: return GOPERL_ADDR(PL_No);
         case GOPERL_PL_DTOR_THUNK: return (uint64_t)(uintptr_t)&goperl_dtor_thunk;
         case GOPERL_PL_IN_EVAL: return (uint64_t)PL_in_eval;
         case GOPERL_PL_PHASE: return (uint64_t)PL_phase;
@@ -8505,6 +8512,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_FIELD_HVAUX_EITER:
             if (SvTYPE(sv) != SVt_PVHV) return 0;
             return (uint64_t)(uintptr_t)HvEITER_get((HV *)sv);
+        case GOPERL_FIELD_HVAUX_RAND:
+            if (SvTYPE(sv) != SVt_PVHV || !HvHasAUX((HV *)sv)) return 0;
+            return (uint64_t)HvAUX((HV *)sv)->xhv_rand;
+        case GOPERL_FIELD_HVAUX_LAST_RAND:
+            if (SvTYPE(sv) != SVt_PVHV || !HvHasAUX((HV *)sv)) return 0;
+            return (uint64_t)HvAUX((HV *)sv)->xhv_last_rand;
         case GOPERL_FIELD_HVAUX_EITER_SET:
             if (SvTYPE(sv) == SVt_PVHV)
                 HvEITER_set((HV *)sv, GOPERL_MEMARG(HE, b));
@@ -8832,8 +8845,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return (uint64_t)(uintptr_t)mess_sv(sv, cBOOL(b));
         case GOPERL_CALL_MG_FIND: { /* the interpreter's own magic of a type
                  * (what the host attached is the host's to find): [type]
-                 * [flags][len][obj][ptr][private] */
-            static goperl_gword_t w[6];
+                 * [flags][len][obj][ptr][private][the MAGIC's address] */
+            static goperl_gword_t w[7];
             if (SvTYPE(sv) < SVt_PVMG) return 0;
             for (MAGIC *mg = SvMAGIC(sv); mg; mg = mg->mg_moremagic) {
                 if (mg->mg_type != (char)(int)b) continue;
@@ -8844,6 +8857,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 w[3] = GOPERL_ADDR(mg->mg_obj);
                 w[4] = GOPERL_ADDR(mg->mg_ptr);
                 w[5] = mg->mg_private;
+                w[6] = GOPERL_ADDR(mg);
                 return (uint64_t)(uintptr_t)w;
             }
             return 0;
