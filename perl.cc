@@ -94,6 +94,7 @@ void boot_Hash__Util(pTHX_ CV *cv);
 void boot_Hash__Util__FieldHash(pTHX_ CV *cv);
 void boot_I18N__Langinfo(pTHX_ CV *cv);
 void boot_IO(pTHX_ CV *cv);
+void boot_IPC__SysV(pTHX_ CV *cv);
 void boot_List__Util(pTHX_ CV *cv);
 void boot_Math__BigInt__FastCalc(pTHX_ CV *cv);
 void boot_MIME__Base64(pTHX_ CV *cv);
@@ -156,6 +157,7 @@ const StaticExtension static_extensions[] = {
     {"Hash::Util::FieldHash", boot_Hash__Util__FieldHash},
     {"I18N::Langinfo", boot_I18N__Langinfo},
     {"IO", boot_IO},
+    {"IPC::SysV", boot_IPC__SysV},
     {"List::Util", boot_List__Util},
     {"Math::BigInt::FastCalc", boot_Math__BigInt__FastCalc},
     {"MIME::Base64", boot_MIME__Base64},

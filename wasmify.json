@@ -86,7 +86,8 @@
       "perl_signal.cc",
       "perl_libc.cc",
       "perl_numbers.cc",
-      "perl_syslog.cc"
+      "perl_syslog.cc",
+      "perl_ipc.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",

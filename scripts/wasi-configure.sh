@@ -101,7 +101,7 @@ Devel/Peek Digest/MD5 Digest/SHA Encode Fcntl File/DosGlob File/Glob \
 Filter/Util/Call Hash/Util Hash/Util/FieldHash I18N/Langinfo IO List/Util \
 Math/BigInt/FastCalc MIME/Base64 Opcode POSIX PerlIO/encoding \
 PerlIO/via SDBM_File Socket Storable Sys/Hostname Sys/Syslog Time/HiRes \
-Time/Piece Unicode/Collate Unicode/Normalize mro re"
+Time/Piece Unicode/Collate Unicode/Normalize mro re IPC/SysV"
 # Time/HiRes builds as the REAL core XS module: gettimeofday, usleep,
 # nanosleep, sleep, time, the interval timer (alarm/ualarm/setitimer/
 # getitimer), clock_gettime and clock_getres. wasi's clockid_t is
@@ -358,27 +358,37 @@ d_ipv6_mreq='define'
 d_vfork='undef'
 d_syscall='define'
 d_wait4='undef'
-# No System V IPC under wasi (sys/ipc.h, sys/msg.h, sys/sem.h, sys/shm.h).
-# perl.h gates these headers on HAS_SEM/HAS_MSG/HAS_SHM (d_sem/d_msg/d_shm), not
-# the i_sys* header vars.
-i_sysipc='undef'
-i_sysmsg='undef'
-i_syssem='undef'
-i_sysshm='undef'
-d_sem='undef'
-d_msg='undef'
-d_shm='undef'
-d_semget='undef'
-d_semctl='undef'
-d_semop='undef'
-d_msgget='undef'
-d_msgctl='undef'
-d_msgsnd='undef'
-d_msgrcv='undef'
-d_shmget='undef'
-d_shmctl='undef'
-d_shmat='undef'
-d_shmdt='undef'
+# wasi-libc has no System V IPC; this project has it: scripts/include/sys/
+# ipc.h, msg.h, sem.h and shm.h, and the functions in perl_ipc.cc, which ask
+# the host (its semaphore sets, message queues and shared memory segments).
+# perl.h gates the headers on HAS_SEM/HAS_MSG/HAS_SHM (d_sem/d_msg/d_shm).
+# semctl takes perl's own union semun. A segment cannot be mapped into the
+# interpreter's memory: shmread and shmwrite copy through shm_copy (the
+# doio.c patch below), and IPC::SysV's functions of an attached segment's
+# address die (the SysV.xs patch below).
+i_sysipc='define'
+i_sysmsg='define'
+i_syssem='define'
+i_sysshm='define'
+d_sem='define'
+d_msg='define'
+d_shm='define'
+d_semget='define'
+d_semctl='define'
+d_semop='define'
+d_msgget='define'
+d_msgctl='define'
+d_msgsnd='define'
+d_msgrcv='define'
+d_shmget='define'
+d_shmctl='define'
+d_shmat='define'
+d_shmdt='define'
+d_shmatprototype='define'
+shmattype='void *'
+d_union_semun='undef'
+d_semctl_semun='define'
+d_semctl_semid_ds='undef'
 # No shadow passwords (shadow.h / getspnam) under wasi.
 i_shadow='undef'
 d_getspnam='undef'
@@ -1436,6 +1446,76 @@ else:
         t = t.replace(old, new)
     open(path, "w").write(t)
     print(f"op release reports applied to {path}")
+PYPATCH
+# ---- doio.c: shmread and shmwrite copy through the host ------------------------
+# A shared memory segment is the host's memory, which cannot be mapped into
+# the interpreter's (shmat fails, perl_ipc.cc): do_shmio copies between the
+# segment and the string with shm_copy where it attached the segment and
+# copied. Idempotent.
+python3 - <<'PYPATCH'
+path = "doio.c"
+t = open(path).read()
+if "shm_copy" in t:
+    print(f"shm_copy already present in {path}")
+else:
+    start = t.index("    char *const shm = (char *)shmat(id, NULL, (optype == OP_SHMREAD) ? SHM_RDONLY : 0);\n")
+    end = t.index("    return shmdt(shm);\n", start) + len("    return shmdt(shm);\n")
+    t = (t[:start] +
+         "    if (optype == OP_SHMREAD) {\n"
+         "        char *buf;\n"
+         "        Newx(buf, msize ? msize : 1, char);\n"
+         "        if (shm_copy(id, buf, mpos, msize, 0) == -1) {\n"
+         "            Safefree(buf);\n"
+         "            return -1;\n"
+         "        }\n"
+         "        sv_setpvn(mstr, buf, msize);\n"
+         "        Safefree(buf);\n"
+         "        SvUTF8_off(mstr);\n"
+         "        SvSETMAGIC(mstr);\n"
+         "        /* who knows who has been playing with this shared memory? */\n"
+         "        SvTAINTED_on(mstr);\n"
+         "        return 0;\n"
+         "    }\n"
+         "    else {\n"
+         "        assert(optype == OP_SHMWRITE);\n"
+         "\n"
+         "        STRLEN len;\n"
+         "        const char *const mbuf = SvPVbyte(mstr, len);\n"
+         "        const STRLEN n = (len > msize) ? msize : len;\n"
+         "        char *buf;\n"
+         "        Newxz(buf, msize ? msize : 1, char);\n"
+         "        Copy(mbuf, buf, n, char);\n"
+         "        const int ret = shm_copy(id, buf, mpos, msize, 1);\n"
+         "        Safefree(buf);\n"
+         "        return ret;\n"
+         "    }\n" +
+         t[end:])
+    open(path, "w").write(t)
+    print(f"shm_copy applied to {path}")
+PYPATCH
+# ---- IPC::SysV: no segment is attached to the interpreter's memory --------------
+# shmat, shmdt, memread and memwrite hand out or take the address a segment
+# is attached at, and no segment can be attached here (perl_ipc.cc): each
+# dies, saying so, where it would have made the call. Idempotent.
+python3 - <<'PYPATCH'
+path = "cpan/IPC-SysV/SysV.xs"
+t = open(path).read()
+if "GOPERL_NO_ATTACH" in t:
+    print(f"the refusal of attached segments already present in {path}")
+else:
+    t = t.replace('#include "XSUB.h"\n',
+                  '#include "XSUB.h"\n'
+                  '#define GOPERL_NO_ATTACH(what) croak("%s: a shared memory segment cannot be "'
+                  ' "attached to the interpreter\'s memory under gperl; use shmread and shmwrite", what)\n', 1)
+    for name, at in [("shmat", "    if (id >= 0) {\n"),
+                     ("shmdt", "    void *caddr = sv2addr(addr);\n"),
+                     ("memread", "    char *caddr = (char *) sv2addr(addr);\n"),
+                     ("memwrite", "    char *caddr = (char *) sv2addr(addr);\n")]:
+        head = t.index("\n" + name + "(")
+        i = t.index(at, head)
+        t = t[:i] + '    GOPERL_NO_ATTACH("' + name + '");\n' + t[i:]
+    open(path, "w").write(t)
+    print(f"the refusal of attached segments applied to {path}")
 PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of

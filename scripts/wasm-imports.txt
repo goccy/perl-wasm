@@ -37,6 +37,12 @@ wasi_snapshot_preview1 fd_tell func
 wasi_snapshot_preview1 fd_write func
 wasi_snapshot_preview1 host_number_at func
 wasi_snapshot_preview1 host_numbering func
+wasi_snapshot_preview1 ipc_ctl func
+wasi_snapshot_preview1 ipc_get func
+wasi_snapshot_preview1 ipc_msgrcv func
+wasi_snapshot_preview1 ipc_msgsnd func
+wasi_snapshot_preview1 ipc_semop func
+wasi_snapshot_preview1 ipc_shmcopy func
 wasi_snapshot_preview1 path_access func
 wasi_snapshot_preview1 path_chmod func
 wasi_snapshot_preview1 path_chown func
