@@ -1001,44 +1001,44 @@ patch("ext/B/typemap", "GOPERL_NUMBER_OP", [
      '\t    $var = GOPERL_NUMBER_OP($type,tmp);\n'),
 ])
 PYPATCH
-# ---- B: an op number that is no address of this memory dies -------------------
+# ---- B: an op number that is no address of this memory ------------------------
 # A number without bit 62 that B takes as an op is an address of this
 # memory, or one of the host process: a native module that makes a B::OP
 # object of an op of its own (B::CallChecker builds one on its C stack and
-# asks B for its next op) hands B an address outside this memory, and
-# reading it traps. B dies saying so instead. Idempotent.
+# asks B for its next op) hands B an address outside this memory. B is given
+# an op of this memory that stands for it (perl.cc goperl_native_op).
+# Idempotent.
 python3 - <<'PYPATCH'
 path = "ext/B/B.xs"
 t = open(path).read()
 if "goperl_number_op" in t:
-    print(f"op numbers outside the memory already refused in {path}")
+    print(f"op numbers outside the memory already taken in {path}")
 else:
     old = ('#define GOPERL_NUMBER_OP(type, iv) INT2PTR(type, (iv) & ~GOPERL_OP_NUMBER_TAG)\n')
     new = ('#define GOPERL_NUMBER_OP(type, iv) ((type)goperl_number_op(aTHX_ (iv)))\n'
+           'extern OP *goperl_native_op(pTHX_ UV addr);\n'
            'static void *goperl_number_op(pTHX_ IV iv) {\n'
            '    const UV addr = (UV)iv & ~(UV)GOPERL_OP_NUMBER_TAG;\n'
            '    if (!(iv & GOPERL_OP_NUMBER_TAG) &&\n'
            '        addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
-           '        Perl_croak(aTHX_ "go-perl gives native code no access to this interpreter "\n'
-           '                         "internal: a B::OP object of an op of native code (0x%" UVxf ")",\n'
-           '                   addr);\n'
+           '        return goperl_native_op(aTHX_ addr);\n'
            '    return INT2PTR(void *, addr);\n'
            '}\n')
     assert t.count(old) == 1, (path, t.count(old))
     open(path, "w").write(t.replace(old, new))
-    print(f"op numbers outside the memory refused in {path}")
+    print(f"op numbers outside the memory taken in {path}")
 PYPATCH
-# ---- Encode: a table that is no address of this memory dies -------------------
+# ---- Encode: a table that is no address of this memory ------------------------
 # An Encode::XS object holds the address of its encode_t table. A native
 # module made by enc2xs (Encode::EUCJPASCII, Encode::HanExtra) defines its
 # encodings with tables of its own, in the host process: an address outside
-# this memory, and reading it traps. Encode dies saying so instead.
-# Idempotent.
+# this memory. Encode is given a copy of the table in this memory (perl.cc
+# goperl_native_encode_table). Idempotent.
 python3 - <<'PYPATCH'
 path = "cpan/Encode/Encode.xs"
 t = open(path).read()
 if "goperl_encode_table" in t:
-    print(f"tables outside the memory already refused in {path}")
+    print(f"tables outside the memory already taken in {path}")
 else:
     old = 'INT2PTR(encode_t *, SvIV(SvRV(obj)))'
     n = t.count(old)
@@ -1047,20 +1047,19 @@ else:
     anchor = '\nstatic void\nEncode_XSEncoding(pTHX_ encode_t * enc)\n'
     assert t.count(anchor) == 1, path
     t = t.replace(anchor,
-        '\n/* The table of an Encode::XS object: one of this memory (perl-wasm\n'
-        ' * scripts/wasi-configure.sh). */\n'
+        '\n/* The table of an Encode::XS object: one of this memory, or a copy\n'
+        ' * of one native code made (perl-wasm scripts/wasi-configure.sh). */\n'
+        'extern void *goperl_native_encode_table(pTHX_ UV addr);\n'
         'static encode_t *\n'
         'goperl_encode_table(pTHX_ SV *obj)\n'
         '{\n'
         '    const UV addr = (UV)SvIV(SvRV(obj));\n'
         '    if (addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
-        '        Perl_croak(aTHX_ "go-perl gives native code no access to this interpreter "\n'
-        '                         "internal: an Encode::XS table of native code (0x%" UVxf ")",\n'
-        '                   addr);\n'
+        '        return (encode_t *)goperl_native_encode_table(aTHX_ addr);\n'
         '    return INT2PTR(encode_t *, addr);\n'
         '}\n' + anchor)
     open(path, "w").write(t)
-    print(f"tables outside the memory refused in {path} ({n} places)")
+    print(f"tables outside the memory taken in {path} ({n} places)")
 PYPATCH
 # ---- $! and the status of a die are numbers the program sees ------------------
 # errno holds the error numbers of this C library. A program that is the

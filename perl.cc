@@ -544,8 +544,16 @@ enum {
     GOPERL_HOST_INFIX = 9,  /* an infix operator of native code: [0][def][opdata]
                              * -> [opdata] (its parse), or [1][def][opdata][lhs]
                              * [rhs] -> [opdata][op] (its build_op) */
-    GOPERL_HOST_SIGHANDLER = 10 /* the signal handler of native code that is
-                                 * PL_sighandlerp: [id][signal] */
+    GOPERL_HOST_SIGHANDLER = 10, /* the signal handler of native code that is
+                                  * PL_sighandlerp: [id][signal] */
+    GOPERL_HOST_NATIVE_OP = 100 /* an op of native code: [address] -> [1][the
+                                 * interpreter's op] for a shadow of one, or
+                                 * [2][type | flags << 16 | private << 24 |
+                                 * moresib << 32][targ][next][sibparent]
+                                 * [first][last] for an op of the module's
+                                 * own, each op the interpreter's with bit 62
+                                 * set or another of the module's (its
+                                 * address), or 0 */
 };
 /* The hooks of GOPERL_HOST_MAGIC, and the bits of an anchor's mask. */
 enum {
@@ -2483,6 +2491,188 @@ extern "C" SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len) {
     }
     /* newSVpv and newSVpvn make undef of a null pointer */
     return len < 0 ? newSVpv(p, 0) : newSVpvn(p, static_cast<STRLEN>(len));
+}
+
+/* ---- what native code made that the interpreter is handed ---------------- */
+
+/* The bytes of the memory of the process at addr, which is not this
+ * memory (an op or a table native code made), read by the host: len of
+ * them, or with len -1 those up to the NUL there. -> a buffer the caller
+ * frees, and its length at *got. */
+static unsigned char *goperl_procmem_read(pTHX_ uint64_t addr, int64_t len, uint32_t *got) {
+    if (!g_go_cb)
+        Perl_croak(aTHX_ "goperl: no host to read the memory of the process at 0x%" UVxf, (UV)addr);
+    goperl_gword_t req[2] = {addr, static_cast<goperl_gword_t>(len)};
+    const int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_PROCMEM_METHOD_ID, req, sizeof req);
+    if (rc == GOPERL_CALLBACK_JUMPED) Perl_croak(aTHX_ "goperl: reading the memory of the process failed");
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr || resp_len < 1)
+        Perl_croak(aTHX_ "goperl: reading the memory of the process: empty response");
+    if (resp[0] != GOPERL_RESP_OK || (len >= 0 && resp_len - 1 != (uint64_t)len)) {
+        SV *const msg = newSVpvn_flags(reinterpret_cast<const char *>(resp + 1), resp_len - 1, SVs_TEMP);
+        free(resp);
+        Perl_croak(aTHX_ "goperl: reading the memory of the process: %" SVf, SVfARG(msg));
+    }
+    *got = resp_len - 1;
+    return resp;
+}
+/* len bytes of the memory of the process at addr into out. */
+static void goperl_procmem_copy(pTHX_ uint64_t addr, size_t len, void *out) {
+    uint32_t got;
+    unsigned char *const resp = goperl_procmem_read(aTHX_ addr, (int64_t)len, &got);
+    memcpy(out, resp + 1, len);
+    free(resp);
+}
+/* The string at addr in the memory of the process, up to its NUL, as a
+ * string of this memory that stays; NULL for none. */
+static const char *goperl_procmem_string(pTHX_ uint64_t addr) {
+    if (!addr) return NULL;
+    uint32_t got;
+    unsigned char *const resp = goperl_procmem_read(aTHX_ addr, -1, &got);
+    char *const copy = static_cast<char *>(PerlMemShared_malloc((size_t)got + 1));
+    memcpy(copy, resp + 1, got);
+    copy[got] = '\0';
+    free(resp);
+    return copy;
+}
+
+/* An op of native code that B is asked about. A module makes a B::OP object
+ * of an op of its own, a struct on its C stack or a static one whose
+ * op_next or op_first is the op it wants the object of, and asks B for that
+ * op (B::CallChecker asks for the next op, B::OPCheck for the first): B is
+ * handed the op's address in the host process. The host says what is
+ * there: the interpreter's op that the shadow there stands for, or the
+ * fields of the module's own op, whose ops are the interpreter's or others
+ * of the module's. B gets an op of this memory with those fields: one for
+ * each address, filled again each time B is asked (the module changes its
+ * op between calls), and once in one asking (an op that leads back to
+ * itself). */
+static OP *goperl_native_op_at(pTHX_ uint64_t addr, uint64_t asking);
+static OP *goperl_native_op_word(pTHX_ goperl_gword_t w, uint64_t asking) {
+    const goperl_gword_t tag = (goperl_gword_t)1 << 62;
+    if (!w) return NULL;
+    if (w & tag) return (OP *)(uintptr_t)(w & ~tag);
+    return goperl_native_op_at(aTHX_ w, asking);
+}
+static OP *goperl_native_op_at(pTHX_ uint64_t addr, uint64_t asking) {
+    struct ghost {
+        OP *op;
+        uint64_t asking;
+    };
+    static std::unordered_map<uint64_t, ghost> ghosts;
+    ghost &g = ghosts[addr];
+    if (g.op && g.asking == asking) return g.op;
+    if (g_go_cb == 0)
+        Perl_croak(aTHX_ "go-perl: no native code to ask for its op at 0x%" UVxf, (UV)addr);
+    const goperl_gword_t words[1] = {addr};
+    uint32_t rlen = 0;
+    unsigned char *resp = goperl_host_call(aTHX_ GOPERL_HOST_NATIVE_OP, words, 1, &rlen);
+    goperl_gword_t w[7];
+    for (uint32_t i = 0; i < 7; i++) w[i] = goperl_resp_word(resp, rlen, i);
+    free(resp);
+    if (w[0] == 1) return (OP *)(uintptr_t)w[1];
+    if (w[0] != 2)
+        Perl_croak(aTHX_ "go-perl: native code did not say what its op at 0x%" UVxf " is", (UV)addr);
+    /* room for the largest kind of op */
+    const size_t size = sizeof(LOOP) > sizeof(PMOP) ? sizeof(LOOP) : sizeof(PMOP);
+    if (!g.op) g.op = static_cast<OP *>(PerlMemShared_calloc(1, size > sizeof(COP) ? size : sizeof(COP)));
+    g.asking = asking;
+    OP *const o = g.op;
+    o->op_type = (OPCODE)(w[1] & 0xFFFF);
+    if (o->op_type >= OP_max) o->op_type = OP_NULL;
+    o->op_flags = (U8)(w[1] >> 16);
+    o->op_private = (U8)(w[1] >> 24);
+    o->op_moresib = (w[1] >> 32) & 1;
+    o->op_ppaddr = PL_ppaddr[o->op_type];
+    o->op_targ = (PADOFFSET)w[2];
+    o->op_next = goperl_native_op_word(aTHX_ w[3], asking);
+    o->op_sibparent = goperl_native_op_word(aTHX_ w[4], asking);
+    cUNOPx(o)->op_first = goperl_native_op_word(aTHX_ w[5], asking);
+    cBINOPx(o)->op_last = goperl_native_op_word(aTHX_ w[6], asking);
+    return o;
+}
+extern "C" OP *goperl_native_op(pTHX_ UV addr) {
+    static uint64_t asking;
+    return goperl_native_op_at(aTHX_ (uint64_t)addr, ++asking);
+}
+
+/* The encode_t table of an Encode::XS object of native code: a module made
+ * by enc2xs (Encode::EUCJPASCII, Encode::HanExtra) defines its encodings
+ * with tables of its own in the host process. Encode is given a copy of the
+ * table in this memory, made once for each table: its pages, each down to
+ * its last entry (the one that ends at 0xff), the sequences of their
+ * entries, the replacement and the names. The layout is Encode's
+ * (Encode/encode.h), which is the same in the host (LP64) and here. */
+struct goperl_encpage {
+    const U8 *seq;
+    const goperl_encpage *next;
+    U8 min, max, dlen, slen;
+};
+struct goperl_encode {
+    const goperl_encpage *t_utf8;
+    const goperl_encpage *f_utf8;
+    const U8 *rep;
+    int replen;
+    U8 min_el, max_el;
+    const char *name[2];
+};
+static_assert(sizeof(goperl_encpage) == 24 && sizeof(goperl_encode) == 48,
+              "the layout of Encode's tables in the host");
+static const goperl_encpage *goperl_native_encpage(pTHX_ uint64_t addr,
+                                                   std::unordered_map<uint64_t, goperl_encpage *> &pages) {
+    if (!addr) return NULL;
+    auto it = pages.find(addr);
+    if (it != pages.end()) return it->second;
+    std::vector<goperl_encpage> entries;
+    for (;;) {
+        goperl_encpage e;
+        goperl_procmem_copy(aTHX_ addr + entries.size() * sizeof e, sizeof e, &e);
+        entries.push_back(e);
+        if (e.max == 0xff) break;
+        if (entries.size() > 256)
+            Perl_croak(aTHX_ "Encode: a page of the table of native code at 0x%" UVxf " does not end",
+                       (UV)addr);
+    }
+    goperl_encpage *const copy =
+        static_cast<goperl_encpage *>(PerlMemShared_calloc(entries.size(), sizeof(goperl_encpage)));
+    pages[addr] = copy;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const goperl_encpage &e = entries[i];
+        copy[i] = e;
+        copy[i].seq = NULL;
+        if (e.seq && e.dlen && e.max >= e.min) {
+            const size_t n = (size_t)e.dlen * ((size_t)e.max - e.min + 1);
+            U8 *const seq = static_cast<U8 *>(PerlMemShared_malloc(n));
+            goperl_procmem_copy(aTHX_ (uint64_t)(uintptr_t)e.seq, n, seq);
+            copy[i].seq = seq;
+        }
+        copy[i].next = goperl_native_encpage(aTHX_ (uint64_t)(uintptr_t)e.next, pages);
+    }
+    return copy;
+}
+extern "C" void *goperl_native_encode_table(pTHX_ UV addr) {
+    static std::unordered_map<uint64_t, goperl_encode *> tables;
+    auto it = tables.find(addr);
+    if (it != tables.end()) return it->second;
+    goperl_encode host;
+    goperl_procmem_copy(aTHX_ addr, sizeof host, &host);
+    std::unordered_map<uint64_t, goperl_encpage *> pages;
+    goperl_encode *const t = static_cast<goperl_encode *>(PerlMemShared_calloc(1, sizeof *t));
+    t->t_utf8 = goperl_native_encpage(aTHX_ (uint64_t)(uintptr_t)host.t_utf8, pages);
+    t->f_utf8 = goperl_native_encpage(aTHX_ (uint64_t)(uintptr_t)host.f_utf8, pages);
+    if (host.rep && host.replen > 0) {
+        U8 *const rep = static_cast<U8 *>(PerlMemShared_malloc((size_t)host.replen));
+        goperl_procmem_copy(aTHX_ (uint64_t)(uintptr_t)host.rep, (size_t)host.replen, rep);
+        t->rep = rep;
+    }
+    t->replen = host.rep ? host.replen : 0;
+    t->min_el = host.min_el;
+    t->max_el = host.max_el;
+    t->name[0] = goperl_procmem_string(aTHX_ (uint64_t)(uintptr_t)host.name[0]);
+    t->name[1] = goperl_procmem_string(aTHX_ (uint64_t)(uintptr_t)host.name[1]);
+    tables[addr] = t;
+    return t;
 }
 
 /* ---- protected operation driver ------------------------------------------
