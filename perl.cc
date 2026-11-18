@@ -3752,6 +3752,15 @@ enum {
                                      * what the algorithm resolves (an AV) */
     GOPERL_INT_MRO_BY_NAME = 48,    /* a: a name -> the registered struct
                                      * mro_alg of that name's address, or 0 */
+    GOPERL_INT_HV_PLACEHOLDERS = 49, /* a: a hash; b: 1 to set it to c's high
+                                     * half -> its placeholder count */
+    GOPERL_INT_YYLEX = 50,          /* -> the next token yylex reads */
+    GOPERL_INT_PARSER_FIELD = 51,   /* -> where yy_parser has nexttoke,
+                                     * nexttype, nextval and yylval: four
+                                     * signed 16-bit distances from its
+                                     * tokenbuf, from the low half up */
+    GOPERL_INT_AV_REIFY = 52,       /* a: an array: av_reify */
+    GOPERL_INT_VIVIFY_DEFELEM = 53, /* a: an lvalue scalar: vivify_defelem */
     GOPERL_INT_OP_MIRROR = 45,      /* a: the copy made before, or 0; s+b:
                                      * words [type | flags<<16 |
                                      * private<<24][targ][next op][1: the
@@ -4159,7 +4168,9 @@ enum {
     GOPERL_CX_POPEVAL = 6,   /* b = index of the top context: cx_popeval */
     GOPERL_CX_POPBLOCK = 7,  /* b = index of the top context: cx_popblock */
     GOPERL_CX_POP = 8,       /* b = index of the top context: CX_POP */
-    GOPERL_CX_PUSHTRY = 9    /* s = [index][retop]: cx_pushtry on the top context */
+    GOPERL_CX_PUSHTRY = 9,   /* s = [index][retop]: cx_pushtry on the top context */
+    GOPERL_CX_POPSUB = 10,   /* b = index of the top context: cx_popsub */
+    GOPERL_CX_POPFORMAT = 11 /* b = index of the top context: cx_popformat */
 };
 
 /* PERLIO selectors: the handle functions of perlio.h. */
@@ -6433,6 +6444,42 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     }
     case GOPERL_INT_MRO_BY_NAME:
         return lo ? (uint64_t)(uintptr_t)Perl_mro_get_from_name(aTHX_ GOPERL_SVARG(lo)) : 0;
+    case GOPERL_INT_HV_PLACEHOLDERS: {
+        HV *const hv = (HV *)GOPERL_SVARG(lo);
+        if (!hv || SvTYPE((SV *)hv) != SVt_PVHV) Perl_croak(aTHX_ "goperl: HvPLACEHOLDERS of something that is no hash");
+        if (b & 1) Perl_hv_placeholders_set(aTHX_ hv, (I32)c_hi);
+        return (uint64_t)(uint32_t)Perl_hv_placeholders_get(aTHX_ hv);
+    }
+    case GOPERL_INT_YYLEX:
+        /* from a check function or a keyword plugin, while the lexer runs */
+        if (!PL_parser) Perl_croak(aTHX_ "goperl: yylex with no parser");
+        return (uint64_t)(int64_t)Perl_yylex(aTHX);
+    case GOPERL_INT_PARSER_FIELD: {
+        const ptrdiff_t tb = (ptrdiff_t)offsetof(yy_parser, tokenbuf);
+        const ptrdiff_t at[4] = {(ptrdiff_t)offsetof(yy_parser, nexttoke) - tb,
+                                 (ptrdiff_t)offsetof(yy_parser, nexttype) - tb,
+                                 (ptrdiff_t)offsetof(yy_parser, nextval) - tb,
+                                 (ptrdiff_t)offsetof(yy_parser, yylval) - tb};
+        uint64_t r = 0;
+        for (int i = 0; i < 4; i++) {
+            if (at[i] < INT16_MIN || at[i] > INT16_MAX) Perl_croak(aTHX_ "goperl: a parser field far from tokenbuf");
+            r |= (uint64_t)(uint16_t)(int16_t)at[i] << (16 * i);
+        }
+        return r;
+    }
+    case GOPERL_INT_AV_REIFY: {
+        AV *const av = (AV *)GOPERL_SVARG(lo);
+        if (!av || SvTYPE((SV *)av) != SVt_PVAV) Perl_croak(aTHX_ "goperl: av_reify of something that is no array");
+        Perl_av_reify(aTHX_ av);
+        return 0;
+    }
+    case GOPERL_INT_VIVIFY_DEFELEM: {
+        SV *const sv = GOPERL_SVARG(lo);
+        if (!sv || SvTYPE(sv) != SVt_PVLV || LvTYPE(sv) != 'y')
+            Perl_croak(aTHX_ "goperl: vivify_defelem of something that is no element's lvalue");
+        Perl_vivify_defelem(aTHX_ sv);
+        return 0;
+    }
     case GOPERL_INT_OP_MIRROR: {
         /* An op of native code's own as PL_op (Scope::Upper's: the
          * interpreter goes on from its op_next): a copy of it in this
@@ -10210,6 +10257,20 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             if (si != PL_curstackinfo || (I32)(int64_t)w[0] != cxstack_ix || cxstack_ix < 0)
                 Perl_croak(aTHX_ "goperl: cx_pushtry is given a context that is not the top one");
             cx_pushtry(&cxstack[cxstack_ix], w[1] ? GOPERL_MEMARG(OP, w[1]) : NULL);
+            return 0;
+        }
+        case GOPERL_CX_POPSUB:
+        case GOPERL_CX_POPFORMAT: {
+            if (si != PL_curstackinfo || (I32)(int64_t)b != cxstack_ix || cxstack_ix < 0)
+                Perl_croak(aTHX_ "goperl: a context is popped from the top only");
+            PERL_CONTEXT *cx = &cxstack[cxstack_ix];
+            if (c == GOPERL_CX_POPSUB) {
+                if (CxTYPE(cx) != CXt_SUB) Perl_croak(aTHX_ "goperl: cx_popsub of a context that is not a sub's");
+                cx_popsub(cx);
+            } else {
+                if (CxTYPE(cx) != CXt_FORMAT) Perl_croak(aTHX_ "goperl: cx_popformat of a context that is not a format's");
+                cx_popformat(cx);
+            }
             return 0;
         }
         case GOPERL_CX_POPEVAL:
