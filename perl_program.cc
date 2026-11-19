@@ -448,6 +448,12 @@ void program_execute(pTHX_ const ProgramSpec &ps) {
             PERL_SET_PHASE(PERL_PHASE_INIT);
             call_list(oldscope, PL_initav);
         }
+        /* the main program's op tree is finished, where perl's S_run_body
+         * makes it read-only under PERL_DEBUG_READONLY_OPS: the XS bridge
+         * keeps the descriptions of its ops across native calls (perl.cc,
+         * goperl_op_dump) */
+        if (PL_main_root && PL_main_root->op_slabbed)
+            goperl_slab_finished(OpSLAB(PL_main_root));
         PERL_SET_PHASE(PERL_PHASE_RUN);
         if (PL_main_start) {
             CvDEPTH(PL_main_cv) = 1;
