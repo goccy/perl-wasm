@@ -3857,13 +3857,15 @@ enum {
 };
 
 
-/* OP_DUMP modes (b = mode; bit 7 of the mode: the op is a COP whatever its
- * type says, as PL_compiling is). */
+/* OP_DUMP modes (b = cap<<8 | mode; bit 7 of the mode: the op is a COP
+ * whatever its type says, as PL_compiling is). */
 enum {
-    GOPERL_OPDUMP_DESCRIBE = 0, /* the op and every op its links lead to */
-    GOPERL_OPDUMP_FREED = 3     /* no op: the described ops freed or written
-                                 * into since the last time, as tokens (the
-                                 * address of them; second: their number) */
+    GOPERL_OPDUMP_ONE = 0,     /* the op */
+    GOPERL_OPDUMP_SUBTREE = 1, /* and the ops below it */
+    GOPERL_OPDUMP_REACH = 2,   /* and every op that can be reached from it */
+    GOPERL_OPDUMP_FREED = 3    /* no op: the described ops freed since the
+                                * last time, as tokens (the address of them;
+                                * second: their number) */
 };
 /* One op in the answer of OP_DUMP, as words. */
 enum {
@@ -3917,6 +3919,7 @@ static_assert(COP_FEATURE_SIZE == 1, "a COP's feature bits are one word in the o
 #define GOPERL_OPBIT_MORESIB 1
 #define GOPERL_OPBIT_COP 2
 #define GOPERL_OPBIT_HOOKED 4
+#define GOPERL_OPBIT_EDGE 8 /* outside what was asked for: no links */
 #define GOPERL_OPBIT_RAW 16 /* backs a module's own op struct */
 #define GOPERL_OPBIT_OPT 0x10000
 #define GOPERL_OPBIT_SLABBED 0x20000
@@ -3925,11 +3928,6 @@ static_assert(COP_FEATURE_SIZE == 1, "a COP's feature bits are one word in the o
 #define GOPERL_OPBIT_FOLDED 0x100000
 #define GOPERL_OPBIT_TYPEHOOK 0x200000 /* made while native code claimed its
                                         * type: PL_ppaddr's function then */
-#define GOPERL_OPBIT_FINISHED 0x400000 /* of a finished op tree (see
-                                        * goperl_slab_finished) */
-/* A report of OP_DUMP's FREED list with this bit is of an op perl wrote
- * into, not of one it freed (goperl_op_changed). */
-#define GOPERL_OPREPORT_CHANGED 1
 
 /* CALL selectors (c = selector, a = token). */
 enum {
@@ -4880,16 +4878,8 @@ static std::unordered_map<OP *, OPclass> g_custom_built;
 
 /* The classes of ops, as the op-class word of OP_DUMP names them: the
  * interpreter's own OPclass. */
-/* Whether an op is of a finished op tree: one perl compiled to the end,
- * which it writes into at run time only where goperl_op_changed is told.
- * perl marks it where PERL_DEBUG_READONLY_OPS makes the slab read-only (the
- * slab's opslab_readonly, which go-perl's op.h has in every build; op.c
- * reads it, see scripts/wasi-configure.sh). An op made outside a slab (at
- * run time, by native code) is never finished. */
-extern "C" bool goperl_op_in_finished_tree(const OP *o);
-static bool goperl_op_finished(const OP *o) { return goperl_op_in_finished_tree(o); }
-
-static void goperl_op_record(pTHX_ OP *o, bool is_cop, std::vector<goperl_gword_t> &out) {
+static void goperl_op_record(pTHX_ OP *o, bool is_cop, bool edge,
+                             std::vector<goperl_gword_t> &out) {
     goperl_gword_t w[GOPERL_OPREC_WORDS];
     memset(w, 0, sizeof w);
     if (o->op_type == OP_FREED) {
@@ -4898,6 +4888,7 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, std::vector<goperl_gword_
          * else of it means anything */
         w[GOPERL_OPREC_TOK] = GOPERL_ADDR(o);
         w[GOPERL_OPREC_TYPE] = (uint32_t)OP_FREED;
+        w[GOPERL_OPREC_BITS] = edge ? GOPERL_OPBIT_EDGE : 0;
         out.insert(out.end(), w, w + GOPERL_OPREC_WORDS);
         return;
     }
@@ -4921,7 +4912,11 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, std::vector<goperl_gword_
     if (o->op_static) bits |= GOPERL_OPBIT_STATIC;
     if (o->op_folded) bits |= GOPERL_OPBIT_FOLDED;
     if (cls == OPclass_COP) bits |= GOPERL_OPBIT_COP;
-    if (goperl_op_finished(o)) bits |= GOPERL_OPBIT_FINISHED;
+    if (edge) {
+        w[GOPERL_OPREC_BITS] = bits | GOPERL_OPBIT_EDGE;
+        out.insert(out.end(), w, w + GOPERL_OPREC_WORDS);
+        return;
+    }
     if (OpHAS_SIBLING(o)) bits |= GOPERL_OPBIT_MORESIB;
     const bool raw = g_raw_ops.count(o) != 0;
     if (raw) bits |= GOPERL_OPBIT_RAW;
@@ -5059,100 +5054,78 @@ static void goperl_op_record(pTHX_ OP *o, bool is_cop, std::vector<goperl_gword_
  * of them with their links; every op one of those links to and that is not
  * among them follows as an edge record, so that no link of the answer
  * leads to an op the answer does not describe. */
+static void goperl_op_dump(pTHX_ OP *root, int mode, bool root_is_cop,
+                           size_t cap, std::vector<goperl_gword_t> &out) {
+    std::vector<OP *> todo;
+    std::vector<OP *> full;
+    std::unordered_map<OP *, bool> seen; /* true: with its links */
+    todo.push_back(root);
+    while (!todo.empty() && full.size() < cap) {
+        OP *o = todo.back();
+        todo.pop_back();
+        if (!o || seen.count(o)) continue;
+        seen[o] = true;
+        full.push_back(o);
+        if (mode == GOPERL_OPDUMP_ONE) break;
+        if (o->op_type == OP_FREED) continue; /* its links are the slab's */
+        if (o->op_flags & OPf_KIDS)
+            for (OP *kid = cUNOPx(o)->op_first; kid; kid = OpSIBLING(kid))
+                todo.push_back(kid);
+        if (mode != GOPERL_OPDUMP_REACH) continue;
+        todo.push_back(o->op_next);
+        todo.push_back(o->op_sibparent);
+        if (g_raw_ops.count(o)) {
+            todo.push_back(cLOGOPx(o)->op_other);
+            continue;
+        }
+        switch (o == root && root_is_cop ? OPclass_COP : op_class(o)) {
+        case OPclass_LOGOP: todo.push_back(cLOGOPx(o)->op_other); break;
+        case OPclass_LOOP:
+            todo.push_back(cLOOPx(o)->op_redoop);
+            todo.push_back(cLOOPx(o)->op_nextop);
+            todo.push_back(cLOOPx(o)->op_lastop);
+            break;
+        default: break;
+        }
+    }
+    const size_t first = out.size();
+    for (OP *o : full) goperl_op_record(aTHX_ o, o == root && root_is_cop, false, out);
+    const size_t nfull = full.size();
+    static const int links[] = {GOPERL_OPREC_NEXT, GOPERL_OPREC_SIBPARENT, GOPERL_OPREC_FIRST,
+                                GOPERL_OPREC_LAST, GOPERL_OPREC_OTHER, GOPERL_OPREC_REDOOP,
+                                GOPERL_OPREC_NEXTOP, GOPERL_OPREC_LASTOP};
+    for (size_t i = 0; i < nfull; i++)
+        for (int l : links) {
+            OP *t = (OP *)(uintptr_t)out[first + i * GOPERL_OPREC_WORDS + l];
+            if (!t || seen.count(t)) continue;
+            seen[t] = false;
+            goperl_op_record(aTHX_ t, false, true, out);
+        }
+}
+
 /* The ops the host holds a description of (every op OP_DUMP answered
- * with), each with whether it was of a finished op tree then: such a
- * description is good until the interpreter frees the op, since only then
- * can the address name another op, or writes into it at run time; the
- * others the host asks for again in a later native call. The host reads the
- * count of reports straight from this memory, and asks for the list when it
- * is not zero: the tokens of the ops freed, and of the ops written into with
- * GOPERL_OPREPORT_CHANGED.
+ * with), and the ones of them the interpreter has freed since the host last
+ * asked: a description is good until its op is freed, since only then can
+ * the address name another op. The host reads the count straight from this
+ * memory, and asks for the list when it is not zero.
  *
  * Every op perl frees goes back through Slab_Free, by op_free, which tells
  * PL_opfreehook, or by op_destroy, which does not (the list op_append_list
  * moved into another, the loop op newFOROP makes anew); and newFOROP moves
  * a loop op made outside a slab with realloc. The patch to op.c (see
- * scripts/wasi-configure.sh) reports each of them here; it also reports
- * where perl writes into an op at run time (goperl_op_changed).
- *
- * The descriptions are the ones one host registry holds: the host names it
- * with every request, and a request of another (a forked process's, which
- * has this memory and a registry of its own) starts afresh. */
-static std::unordered_map<OP *, bool> g_ops_described;
+ * scripts/wasi-configure.sh) reports each of them here. */
+static std::unordered_set<OP *> g_ops_described;
 static std::vector<goperl_gword_t> g_ops_freed;
 static uint32_t g_ops_freed_count = 0;
-static uint64_t g_ops_described_for = 0;
-static void goperl_ops_described_for(uint64_t registry) {
-    if (registry == g_ops_described_for) return;
-    g_ops_described.clear();
-    g_ops_freed.clear();
-    g_ops_freed_count = 0;
-    g_ops_described_for = registry;
-}
 extern "C" void goperl_op_released(OP *o) {
     if (!g_raw_ops.empty()) g_raw_ops.erase(o);
     if (!g_custom_built.empty()) g_custom_built.erase(o);
-    if (!g_ops_described.empty() && g_ops_described.erase(o)) {
-        g_ops_freed.push_back(GOPERL_ADDR(o));
-        g_ops_freed_count = (uint32_t)g_ops_freed.size();
-    }
-}
-/* perl writes into an op at run time (pp_regcomp's regexp, a match-once
- * flag, a breakpoint, the reference count of a sub's root, ...: see
- * scripts/wasi-configure.sh): a description of it from a finished tree is
- * told changed, and the op is described again when the host asks. The op
- * stays among the described ones, as not lasting: a description reaching it
- * gives it again, and its free is reported (op_free writes the reference
- * count of a root it then frees). */
-extern "C" void goperl_op_changed(OP *o) {
-    if (!o || g_ops_described.empty()) return;
-    auto it = g_ops_described.find(o);
-    if (it == g_ops_described.end() || !it->second) return;
-    it->second = false;
-    g_ops_freed.push_back(GOPERL_ADDR(o) | GOPERL_OPREPORT_CHANGED);
-    g_ops_freed_count = (uint32_t)g_ops_freed.size();
-}
-
-/* The ops OP_DUMP describes: the op asked for, and every op its links lead
- * to, and theirs, so that native code that walks links in its own memory
- * (o->op_next->op_next, a tree walk by op_first and the siblings) finds
- * every op it reaches described, with its links, and an op has the same
- * description whichever op it was reached from. An op of a finished tree
- * the host holds is not described again (nor followed: what it leads to
- * the host holds too). The links followed are the ones the host makes
- * shadows of (go-perl's SDK, goperl_op_apply). */
-static void goperl_op_dump(pTHX_ OP *root, bool root_is_cop, std::vector<goperl_gword_t> &out) {
-    std::vector<OP *> todo;
-    std::unordered_set<OP *> seen;
-    todo.push_back(root);
-    while (!todo.empty()) {
-        OP *o = todo.back();
-        todo.pop_back();
-        if (!o || !seen.insert(o).second) continue;
-        if (o != root) {
-            auto it = g_ops_described.find(o);
-            if (it != g_ops_described.end() && it->second) continue;
-        }
-        const size_t at = out.size();
-        goperl_op_record(aTHX_ o, o == root && root_is_cop, out);
-        if (o->op_type == OP_FREED) continue; /* its links are the slab's */
-        const goperl_gword_t *const w = &out[at];
-        const unsigned cls = (unsigned)((w[GOPERL_OPREC_BITS] >> 8) & 0xFF);
-        static const int links[] = {GOPERL_OPREC_NEXT, GOPERL_OPREC_SIBPARENT, GOPERL_OPREC_FIRST,
-                                    GOPERL_OPREC_LAST, GOPERL_OPREC_OTHER};
-        for (int l : links) todo.push_back((OP *)(uintptr_t)w[l]);
-        if (cls == OPclass_PMOP) {
-            /* a substitution's replacement and its start are ops; a split's
-             * glob and a match's stash in the same words are not */
-            todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_PMCODELIST]);
-            if (o->op_type == OP_SUBST) {
-                todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_PMREPLROOT]);
-                todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_PMSTASHSTART]);
-            }
-        } else if (!(w[GOPERL_OPREC_BITS] & (GOPERL_OPBIT_COP | GOPERL_OPBIT_RAW))) {
-            todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_REDOOP]);
-            todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_NEXTOP]);
-            todo.push_back((OP *)(uintptr_t)w[GOPERL_OPREC_LASTOP]);
+    if (!g_ops_described.empty()) {
+        auto it = g_ops_described.find(o);
+        if (it != g_ops_described.end()) {
+            g_ops_described.erase(it);
+            g_ops_freed.push_back(GOPERL_ADDR(o));
+            g_ops_freed_count = (uint32_t)g_ops_freed.size();
         }
     }
 }
@@ -9477,23 +9450,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         Perl_croak(aTHX_ "goperl: unknown hook call %d", (int)a);
     }
-    case GOPERL_OP_OP_DUMP: { /* a = op token; b = mode; c = the host's
-                 * registry -> the address of the records; second: their
-                 * number */
+    case GOPERL_OP_OP_DUMP: { /* a = op token; b = cap<<8 | mode -> the
+                 * address of the records; second: their number */
         static std::vector<goperl_gword_t> records;
         OP *o = GOPERL_MEMARG(OP, a);
         records.clear();
-        goperl_ops_described_for(c);
         if ((int)(b & 0x7F) == GOPERL_OPDUMP_FREED) {
             records.swap(g_ops_freed);
             g_ops_freed_count = 0;
             return goperl_two(GOPERL_ADDR(records.data()), (uint64_t)records.size());
         }
         if (!o) return goperl_two(0, 0);
-        goperl_op_dump(aTHX_ o, cBOOL(b & 0x80), records);
+        const size_t cap = (size_t)(b >> 8);
+        goperl_op_dump(aTHX_ o, (int)(b & 0x7F), cBOOL(b & 0x80), cap ? cap : 1, records);
         for (size_t i = 0; i < records.size(); i += GOPERL_OPREC_WORDS)
-            g_ops_described[(OP *)(uintptr_t)records[i + GOPERL_OPREC_TOK]] =
-                (records[i + GOPERL_OPREC_BITS] & GOPERL_OPBIT_FINISHED) != 0;
+            g_ops_described.insert((OP *)(uintptr_t)records[i]);
         return goperl_two(GOPERL_ADDR(records.data()),
                           (uint64_t)(records.size() / GOPERL_OPREC_WORDS));
     }
