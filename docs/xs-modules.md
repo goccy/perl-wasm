@@ -59,7 +59,8 @@ Notes:
 - `I18N-Langinfo` (`nl_langinfo`) and `Sys-Hostname` (`gethostname`) may need a
   small host-capability stub under wasi; they are kept as porting targets.
 - `Socket` is included because the wasm layer enables host sockets
-  (`HostSockets: true`); connection *policy* is enforced on the go-perl side.
+  (`"network": true` in `wasmify.json`'s `host`); connection *policy* is enforced on the
+  go-perl side.
 - `Time-HiRes`: `time`/`gettimeofday`/`tv_interval`/`sleep`/`usleep`/
   `nanosleep` are the real implementations, and so are `clock_gettime` and
   `clock_getres` (`CLOCK_REALTIME`, `CLOCK_MONOTONIC`, and the process and

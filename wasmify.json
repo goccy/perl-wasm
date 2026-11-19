@@ -82,9 +82,6 @@
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
-    "HostSockets": true,
-    "HostSubprocess": true,
-    "HostFS": true,
     "StackSize": 8388608,
     "ExportFunctions": [
       "perl_new",
@@ -115,6 +112,21 @@
       "perl_fork_child",
       "perl_run_program"
     ]
+  },
+  "host": {
+    "filesystem": true,
+    "network": true,
+    "process": {
+      "spawn": true,
+      "fork": true,
+      "job_control": true,
+      "resources": true
+    },
+    "signals": true,
+    "terminal": true,
+    "users": true,
+    "ipc": true,
+    "system": true
   },
   "phases": {
     "gen-proto": {

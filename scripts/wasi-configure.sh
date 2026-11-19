@@ -314,7 +314,7 @@ d_pthreads_created_joinable='undef'
 
 # Capabilities. wasi-libc lacks these natively, but wasmify's POSIX-compat /
 # host-subprocess stub headers (injected at BOTH the capture build and wasm-build
-# when wasmify.json opts into HostSockets/HostSubprocess) DECLARE them and the
+# when wasmify.json gives the host capabilities ("host")) DECLARE them and the
 # host-import shims IMPLEMENT them at link. So sockets, netdb, exec, fork, pipe,
 # wait/waitpid, sigaction, dup/dup2, kill, alarm, getgroups, mkstemp are left
 # ENABLED (arm base values) and resolved through wasmify — NOT disabled here.
@@ -435,8 +435,9 @@ d_getgrnam_r='undef'
 d_getgrgid_r='undef'
 d_getgrent_r='undef'
 # futimes: the arm base answers 'undef', and wasi-libc has none. wasmify's
-# host-fs shim (bridge.HostFS in wasmify.json) defines it over futimens and
-# scripts/wasi-posix-shim.h declares it, so `utime` works on a filehandle.
+# file system shim (filesystem.attributes in wasmify.json's "host") defines
+# it over futimens and scripts/wasi-posix-shim.h declares it, so `utime`
+# works on a filehandle.
 d_futimes='define'
 # wasi-libc's FILE is opaque; Perl must not poke its glibc _IO_FILE internals.
 d_stdstdio='undef'

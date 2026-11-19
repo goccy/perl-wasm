@@ -26,7 +26,7 @@
 
 /* ---- fork-free subprocess (PERL_WASI_SPAWN) ------------------------------
  * WASI has no fork; the runtime's subprocess support is posix_spawn-shaped
- * (wasmify HostSubprocess). These back perl's piped opens and system():
+ * (wasmify's process.spawn). These back perl's piped opens and system():
  * util.c's Perl_my_popen/_list route here (configure-time patch), and
  * pp_system's non-fork branch calls system(3), defined below over
  * posix_spawn + waitpid. my_pclose stays stock perl — it just waitpids the

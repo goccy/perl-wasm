@@ -5,7 +5,7 @@
  * Most guarded-out POSIX (sockets, netdb, exec, kill, dup, alarm, getgroups,
  * mkstemp, sigaction, wait/waitpid, ...) is supplied by wasmify's POSIX-compat /
  * host-subprocess stub headers, which `wasmify build`/`wasm-build` inject via
- * -isystem when wasmify.json opts into HostSockets/HostSubprocess. This file
+ * -isystem when wasmify.json gives the host capabilities ("host"). This file
  * only fills the small remaining gap. Force-included via -include in cflags.
  * libperl.a is an archive, so the symbols stay unresolved until the perl.wasm
  * link supplies host shims or ENOSYS stubs.
@@ -318,7 +318,7 @@ void endgrent(void);
 
 /* ---- fork-free piped opens (PERL_WASI_SPAWN) -----------------------------
  * WASI has no fork: the runtime's subprocess support is posix_spawn-shaped
- * (wasmify HostSubprocess: posix_spawn + waitpid + pipe over host imports).
+ * (wasmify's process.spawn: posix_spawn + waitpid + pipe over host imports).
  * The perl build defines PERL_WASI_SPAWN and routes my_popen/my_popen_list
  * into these spawn-based implementations (perl.cc); my_pclose keeps perl's
  * own implementation, which only needs waitpid. */
