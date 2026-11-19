@@ -46,11 +46,12 @@ Notes:
   own inside the `Encode` distribution and has its own `boot_*` registration.
 - `SDBM_File` bundles its own `sdbm` implementation, so it needs no external
   DBM library and is kept.
-- `Sys-Syslog`: wasi-libc has neither `<syslog.h>` nor `syslog(3)`, so the
-  project supplies both (`scripts/include/syslog.h`, `perl_syslog.cc`).
+- `Sys-Syslog`: wasi-libc has neither `<syslog.h>` nor `syslog(3)`; wasmify's
+  host shims supply both (`<syslog.h>` and `host_syslog.cc`).
   `openlog`/`syslog`/`closelog` hand each message to the host as typed
   values (the `proc_syslog*` imports); the host delivers it to a system
-  logger when the embedder enabled one, and otherwise `openlog` fails. A
+  logger when the embedder enabled one, and otherwise `openlog` fails with
+  a Perl exception (`perl_syslog.cc`). A
   configure-time patch makes `connect_native` report that failure as "this
   mechanism is unavailable", so the module falls through to its other
   mechanisms (`tcp`, `udp`, `unix`, ...) instead of dying or losing the
@@ -67,8 +68,8 @@ Notes:
   `wasi-configure.sh` gives its XS integer clock ids (Linux's numbers) over
   the wasi clocks. `clock_nanosleep` is configured off and fails cleanly, so
   feature probes fall back. The interval timer (`alarm`/`ualarm`/`setitimer`/`getitimer`
-  with `ITIMER_REAL`) is implemented in `perl_signal.cc` over a timer the
-  host keeps; the CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) do not
+  with `ITIMER_REAL`) is implemented in wasmify's `host_signal.cc` over a
+  timer the host keeps; the CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) do not
   exist.
 
 ## Excluded (NOT linked) and why

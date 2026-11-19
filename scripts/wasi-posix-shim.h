@@ -124,7 +124,8 @@ struct sockaddr_un {
  * (`shutdown($sock, 1)`, documented that way in perlfunc). wasi-libc gives
  * the three names the bits of the WASI call instead (1, 2 and 3), so that
  * a literal 1 stopped reads and a 0 was refused. The names get the usual
- * numbers here, and shutdown() itself (perl_libc.cc) translates them. */
+ * numbers here, and shutdown() itself (wasmify's host_sockets.cc)
+ * translates them. */
 #undef SHUT_RD
 #undef SHUT_WR
 #undef SHUT_RDWR
@@ -209,7 +210,7 @@ int guest_errno_of(long long host_errno);
 mode_t umask(mode_t);
 /* The real-time interval timer. wasi-libc guards setitimer, getitimer and
  * their types out of <sys/time.h> ("WASI has no getitimer") and shows ualarm
- * only to _GNU_SOURCE code; perl_signal.cc implements all three on the timer
+ * only to _GNU_SOURCE code; wasmify's host_signal.cc implements all three on the timer
  * the host keeps, the one alarm() sets. ITIMER_REAL is the only timer there
  * is: the process CPU-time timers (ITIMER_VIRTUAL, ITIMER_PROF) have nothing
  * to count, and stay undefined so that nothing offers them. */
@@ -254,28 +255,11 @@ pid_t tcgetpgrp(int);
 int tcsetpgrp(int, pid_t);
 int lchown(const char *, uid_t, gid_t);
 
-/* The netdb ITERATION / by-net / by-serv / by-proto lookups: wasmify's netdb.h
- * stub supplies struct hostent + gethostbyname/gethostbyaddr, but not these.
- * Perl uses the system prototypes (d_*protos=define in config) so it does not
- * redeclare them — supply the structs + prototypes here. struct hostent /
- * addrinfo come from wasmify's netdb.h; do not redefine them. */
-struct netent {
-	char         *n_name;
-	char        **n_aliases;
-	int           n_addrtype;
-	uint32_t      n_net;
-};
-struct servent {
-	char  *s_name;
-	char **s_aliases;
-	int    s_port;
-	char  *s_proto;
-};
-struct protoent {
-	char  *p_name;
-	char **p_aliases;
-	int    p_proto;
-};
+/* The netdb ITERATION / by-net / by-serv / by-proto lookups. Perl uses the
+ * system prototypes (d_*protos=define in config) so it does not redeclare
+ * them. struct netent, servent and protoent, like struct hostent and
+ * addrinfo, come from wasmify's netdb.h (whose shim implements the
+ * lookups); do not redefine them. */
 struct hostent  *gethostent(void);
 struct netent   *getnetent(void);
 struct netent   *getnetbyname(const char *);

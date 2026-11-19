@@ -51,9 +51,6 @@ WASI_EMU='-D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL -D_WASI_EMULAT
 # core references (dup/exec/kill/... — see the header). Absolute path, baked
 # into config.sh (regenerated per host, so CI-portable).
 POSIX_SHIM="-include $HERE/scripts/wasi-posix-shim.h"
-# Headers of system interfaces wasi-libc has no header for and this project
-# implements (<syslog.h>, see perl_syslog.cc).
-SYSTEM_HEADERS="-I$HERE/scripts/include"
 CLANG="$WASI_SDK_PATH/bin/clang"
 
 [ -d "$PERL/.git" ] || [ -f "$PERL/Configure" ] || {
@@ -209,12 +206,12 @@ d_sigsetjmp='undef'
 # are wasi-libc's, reached through integer clock ids (the HiRes.xs patch
 # further down): a program that finds no clock_gettime falls back to worse
 # time sources (AnyEvent's loop to POSIX::times). clock_nanosleep stays
-# off: the sleeps of this build are perl_signal.cc's, which a signal
+# off: the sleeps of this build are wasmify's (its host_signal.cc), which a signal
 # interrupts, and wasi-libc's clock_nanosleep is not one of them. nanosleep
 # and usleep DO exist in wasi-libc; the base disables nanosleep, so
 # re-enable it. setitimer, getitimer and ualarm have no wasi-libc symbols:
-# perl_signal.cc defines them over the host's real-time interval timer
-# (ITIMER_REAL, the only timer there is), and scripts/wasi-posix-shim.h
+# wasmify's host_signal.cc defines them over the host's real-time interval
+# timer (ITIMER_REAL, the only timer there is), and scripts/wasi-posix-shim.h
 # declares them.
 d_clock_gettime='define'
 d_clock_getres='define'
@@ -248,8 +245,8 @@ d_nanosleep='define'
 # down). Upstream Perl's Configure always adds this for gcc/clang (the arm base
 # config.sh we derive from carries it); the wasi override dropped it. Restore it.
 # Applies to core .c AND every XS extension (MakeMaker reads ccflags via %Config).
-ccflags='--target=$TARGET --sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
-cppflags='--target=$TARGET --sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM $SYSTEM_HEADERS -fno-strict-aliasing'
+ccflags='--target=$TARGET --sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM -fno-strict-aliasing'
+cppflags='--target=$TARGET --sysroot=$SYSROOT -mllvm -wasm-enable-sjlj -D_GNU_SOURCE $WASI_EMU $POSIX_SHIM -fno-strict-aliasing'
 optimize='-O2'
 cccdlflags=' '
 ccdlflags=' '
@@ -358,9 +355,10 @@ d_ipv6_mreq='define'
 d_vfork='undef'
 d_syscall='define'
 d_wait4='undef'
-# wasi-libc has no System V IPC; this project has it: scripts/include/sys/
-# ipc.h, msg.h, sem.h and shm.h, and the functions in perl_ipc.cc, which ask
-# the host (its semaphore sets, message queues and shared memory segments).
+# wasi-libc has no System V IPC; wasmify's host shims have it: <sys/ipc.h>,
+# <sys/msg.h>, <sys/sem.h> and <sys/shm.h> in its host-include directory,
+# and the functions in its host_ipc.cc, which ask the host (its semaphore
+# sets, message queues and shared memory segments).
 # perl.h gates the headers on HAS_SEM/HAS_MSG/HAS_SHM (d_sem/d_msg/d_shm).
 # semctl takes perl's own union semun. A segment cannot be mapped into the
 # interpreter's memory: shmread and shmwrite copy through shm_copy (the
@@ -395,15 +393,16 @@ d_getspnam='undef'
 # glibc/BSD math-error-mode switch (_LIB_VERSION=_IEEE_); wasi-libc has no
 # _LIB_VERSION. Gated by LIBM_LIB_VERSION (d_libm_lib_version).
 d_libm_lib_version='undef'
-# wasi-libc has no <syslog.h> and no syslog(3); this project has both:
-# scripts/include/syslog.h, and openlog/syslog/closelog/setlogmask in
-# perl_syslog.cc, which hand each message to the host. Sys::Syslog's "native"
-# mechanism is built on them like on any libc's.
+# wasi-libc has no <syslog.h> and no syslog(3); wasmify's host shims have
+# both: <syslog.h> in its host-include directory, and openlog/syslog/
+# closelog/setlogmask in its host_syslog.cc, which hand each message to the
+# host (a message it does not take is a Perl exception, perl_syslog.cc).
+# Sys::Syslog's "native" mechanism is built on them like on any libc's.
 i_syslog='define'
-# wasi-libc has no <termios.h> and no terminal control; this project has
-# both: scripts/include/termios.h, and tcgetattr and its companions in
-# perl_libc.cc, which ask the host. POSIX is built with POSIX::Termios and
-# the tc* functions like on any libc.
+# wasi-libc has no <termios.h> and no terminal control; wasmify's host
+# shims have both: <termios.h> in its host-include directory, and tcgetattr
+# and its companions in its host_tty.cc, which ask the host. POSIX is built
+# with POSIX::Termios and the tc* functions like on any libc.
 i_termios='define'
 d_tcgetpgrp='define'
 d_tcsetpgrp='define'
@@ -1449,7 +1448,7 @@ else:
 PYPATCH
 # ---- doio.c: shmread and shmwrite copy through the host ------------------------
 # A shared memory segment is the host's memory, which cannot be mapped into
-# the interpreter's (shmat fails, perl_ipc.cc): do_shmio copies between the
+# the interpreter's (shmat fails, wasmify's host_ipc.cc): do_shmio copies between the
 # segment and the string with shm_copy where it attached the segment and
 # copied. Idempotent.
 python3 - <<'PYPATCH'
@@ -1495,7 +1494,7 @@ else:
 PYPATCH
 # ---- IPC::SysV: no segment is attached to the interpreter's memory --------------
 # shmat, shmdt, memread and memwrite hand out or take the address a segment
-# is attached at, and no segment can be attached here (perl_ipc.cc): each
+# is attached at, and no segment can be attached here (wasmify's host_ipc.cc): each
 # dies, saying so, where it would have made the call. Idempotent.
 python3 - <<'PYPATCH'
 path = "cpan/IPC-SysV/SysV.xs"

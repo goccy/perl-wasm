@@ -61,16 +61,9 @@
     "extra_ldflags": [
       "-lc-printscan-long-double",
       "-Wl,--fatal-warnings",
-      "-Wl,--wrap=setenv",
-      "-Wl,--wrap=unsetenv",
-      "-Wl,--wrap=putenv",
-      "-Wl,--wrap=clearenv",
       "-Wl,--wrap=setlocale",
       "-Wl,--wrap=waitpid",
-      "-Wl,--wrap=strerror",
-      "-Wl,--wrap=write",
-      "-Wl,--wrap=writev",
-      "-Wl,--wrap=send"
+      "-Wl,--wrap=strerror"
     ]
   },
   "user_selection": {
@@ -82,12 +75,10 @@
       "perl.cc",
       "perl_wasi.cc",
       "perl_program.cc",
-      "perl_process.cc",
       "perl_signal.cc",
       "perl_libc.cc",
       "perl_numbers.cc",
-      "perl_syslog.cc",
-      "perl_ipc.cc"
+      "perl_syslog.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",

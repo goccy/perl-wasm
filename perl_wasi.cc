@@ -15,13 +15,14 @@
 #include <spawn.h>
 #include <sys/select.h>
 #include <sys/stat.h>
-#include <sys/times.h>
 #include <sys/wait.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <unistd.h>
+
+#include "wasmify_posix.h"
 
 /* ---- fork-free subprocess (PERL_WASI_SPAWN) ------------------------------
  * WASI has no fork; the runtime's subprocess support is posix_spawn-shaped
@@ -39,8 +40,6 @@ extern char **environ;
 /* Where the failure to start a command is told, as perl tells it (doio.c,
  * S_exec_failed: "Can't exec", under the exec warnings). */
 enum wasi_exec_failure {
-    /* nowhere: libc's execv and execvp, whose callers say what they say */
-    WASI_EXEC_QUIET,
     /* in this process: exec, whose failure leaves the program running */
     WASI_EXEC_IN_PLACE,
     /* in the child perl forks for the command: system, a piped open and
@@ -75,7 +74,7 @@ static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_std
         /* What perl says when its exec fails (doio.c, S_exec_failed); a
          * file that is no program (ENOEXEC) goes to the shell instead, as
          * execvp does. */
-        if (rc != ENOEXEC && how != WASI_EXEC_QUIET) {
+        if (rc != ENOEXEC) {
             dTHX;
             if (ckWARN(WARN_EXEC)) {
                 if (how == WASI_EXEC_IN_PLACE)
@@ -239,33 +238,6 @@ static PerlIO *wasi_spawn_finish(pTHX_ int parent_fd, const char *mode,
  *
  * wasi_fork_point is how the forking parent tells the child, through the
  * copied memory, where and how to resume. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_fork")))
-extern "C" int wasi_host_proc_fork(int *pid_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_kill")))
-extern "C" int wasi_host_proc_kill(int pid, int sig);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_closefrom")))
-extern "C" int wasi_host_fd_closefrom(int low_fd);
-
-/* Waits for the command pid in the command's name: from here on every
- * signal sent to this process goes to the command. Returns 0 with the
- * command's wait status, or a negative errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exec")))
-extern "C" int wasi_host_proc_exec(int pid, int *status_out);
-
-/* Says (on 1) that the next command this process starts is the one it
- * becomes: the host then starts it with what the process made of its
- * session (a process that leads a session of its own is replaced by a
- * command that leads one, with its controlling terminal). on 0 takes it
- * back, for a command that could not be started. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exec_next")))
-extern "C" int wasi_host_proc_exec_next(int on);
-
-/* Ends the process as one killed by sig (perl_signal.cc uses it for the
- * default action of a signal). */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_terminate"), noreturn))
-extern "C" void wasi_host_proc_terminate(int sig);
 
 enum { WASI_FORK_NONE = 0, WASI_FORK_OP = 1, WASI_FORK_PIPE_OPEN = 2, WASI_FORK_EXEC_FAILED = 3 };
 static struct {
@@ -293,83 +265,13 @@ extern "C" { SSize_t wasi_open_return_sp = 0; }
 
 extern "C" void wasi_signal_fork_child(pTHX);
 
-extern "C" int kill(pid_t pid, int sig) {
-    if (sig < 0 || sig >= NSIG) {
-        errno = EINVAL;
-        return -1;
-    }
-    /* A signal to the process itself is the host's to deliver when the
-     * process is one the host knows by that pid: the host process, whose
-     * action for the signal may be native code's handler and not the
-     * interpreter's, or a fork child. It is delivered by the time kill
-     * returns either way. Otherwise (no host process has the pid: the
-     * program is a process of its own) it is delivered here and now
-     * (perl_signal.cc). Any other process, and a process group (a pid of 0
-     * or less), is the host's to find. */
-    if (pid > 0 && pid == getpid()) {
-        if (sig == 0) return 0;
-        const int rc = wasi_host_proc_kill((int)pid, sig);
-        if (rc == 0) return 0;
-        if (rc != -ESRCH && rc != ESRCH) {
-            errno = rc < 0 ? -rc : rc;
-            return -1;
-        }
-        return raise(sig);
-    }
-    int rc = wasi_host_proc_kill((int)pid, sig);
-    if (rc != 0) {
-        errno = rc < 0 ? -rc : rc;
-        return -1;
-    }
-    return 0;
-}
-
-/* The CPU time of the process, in nanoseconds: user and system time of the
- * process itself, then of the children it has waited for. 0 or a negative
- * errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_times")))
-extern "C" int wasi_host_proc_times(uint64_t times[4]);
-
-/* times(2). wasi-libc's emulation reports process time in clock()'s unit,
- * nanoseconds, while perl divides what times returns by the clock tick it
- * established at start-up (PL_clocktick: sysconf(_SC_CLK_TCK), or its
- * fallback). This one reports in that unit, and what the host accounts to
- * the process: user and system time, its own and its children's. Where the
- * host keeps no such account the process time is the emulated clock's:
- * time elapsed since the instance started, all of it user time. */
-extern "C" clock_t times(struct tms *buf) {
-    const long ticks_per_sec = PL_clocktick;
-    if (ticks_per_sec <= 0) {
-        errno = ENOSYS; /* no interpreter has set the unit yet */
-        return (clock_t)-1;
-    }
-    const clock_t elapsed = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
-    uint64_t nanos[4] = {0, 0, 0, 0};
-    const bool accounted = wasi_host_proc_times(nanos) == 0;
-    if (buf) {
-        if (accounted) {
-            const uint64_t per_tick = 1000000000ull / (uint64_t)ticks_per_sec;
-            buf->tms_utime = (clock_t)(nanos[0] / per_tick);
-            buf->tms_stime = (clock_t)(nanos[1] / per_tick);
-            buf->tms_cutime = (clock_t)(nanos[2] / per_tick);
-            buf->tms_cstime = (clock_t)(nanos[3] / per_tick);
-        } else {
-            buf->tms_utime = elapsed;
-            buf->tms_stime = 0;
-            buf->tms_cutime = 0;
-            buf->tms_cstime = 0;
-        }
-    }
-    return elapsed;
-}
-
 /* Forks at the current op. Returns the child's pid, or -1 with errno set.
  * Only the parent ever returns from this. */
 static pid_t wasi_fork_here(pTHX_ int kind) {
     wasi_fork_point.kind = kind;
     wasi_fork_point.resume_op = PL_op ? PL_op->op_next : NULL;
     int pid = -1;
-    int rc = wasi_host_proc_fork(&pid);
+    int rc = __wasmify_host_proc_fork(&pid);
     wasi_fork_point.kind = WASI_FORK_NONE;
     if (rc != 0) {
         errno = rc < 0 ? -rc : rc;
@@ -430,7 +332,7 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     if (kind == WASI_FORK_NONE) return -1;
     wasi_fork_point.kind = WASI_FORK_NONE;
     /* The host knows this instance as the process pid: getpid and getppid
-     * ask it (perl_process.cc). */
+     * ask it (wasmify's host_process.cc). */
     (void)pid;
 
     /* The jump environments the copied interpreter points at lived in
@@ -558,79 +460,18 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     return 0;
 }
 
-/* The second half of exec. A process image cannot be replaced, so exec
- * starts the command with this process's current fds and environment
- * (wasi_spawn_argv and friends) and then this process stands in for it
- * until it ends:
- *
- *   - It gives up every descriptor it holds, as exec does for the
- *     close-on-exec ones (all but stdio, in perl) — the command has its own
- *     stdio. A peer waiting for end-of-file on one of them (the status pipe
- *     IPC::Open3 reads to learn that exec succeeded) must not wait until the
- *     command ends.
- *   - It waits in the host, which passes every signal this process is sent
- *     on to the command: the pid others know is this one's, and the program
- *     that had the handlers is gone. SIGKILL included.
- *   - It ends the way the command ended: with its exit status, or killed by
- *     the signal that killed it, so that whoever waits for this process
- *     sees what happened to the command.
- *
- * All of it without running anything of the interpreter (_exit, not exit):
- * a replaced program runs neither END blocks nor destructors. */
-__attribute__((noreturn)) static void wasi_become(pid_t pid) {
-    wasi_host_fd_closefrom(0);
-    int status = 0;
-    if (wasi_host_proc_exec((int)pid, &status) != 0) _exit(255);
-    if (WIFSIGNALED(status)) wasi_host_proc_terminate(WTERMSIG(status));
-    _exit(WEXITSTATUS(status));
-}
-
-/* execv and execvp, for the callers that exec without going through
- * pp_exec: the lexer, when the #! line of the program names another
- * interpreter (toke.c hands the program to it), and POSIX-level code. They
- * return only when the command could not be started, with errno set. */
-extern "C" int execv(const char *path, char *const argv[]) {
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, 0, 0);
-    posix_spawn_file_actions_adddup2(&fa, 1, 1);
-    posix_spawn_file_actions_adddup2(&fa, 2, 2);
-    pid_t pid = -1;
-    wasi_host_proc_exec_next(1);
-    const int rc = posix_spawn(&pid, path, &fa, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    if (rc != 0) {
-        wasi_host_proc_exec_next(0);
-        errno = rc;
-        return -1;
-    }
-    wasi_become(pid);
-}
-
-extern "C" int execvp(const char *file, char *const argv[]) {
-    wasi_host_proc_exec_next(1);
-    const pid_t pid = wasi_spawn_file(file, argv, -1, -1, -1, WASI_EXEC_QUIET);
-    if (pid < 0) {
-        const int e = errno;
-        wasi_host_proc_exec_next(0);
-        errno = e;
-        return -1;
-    }
-    wasi_become(pid);
-}
-
 /* pp_exec (configure patch): starts the command and becomes it
- * (wasi_become). Returns only when the command could not be started, with
+ * (wasmify's __wasmify_exec_become). Returns only when the command could not be started, with
  * errno set. */
 extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
     pid_t pid;
     if (!stacked && sp - mark == 1) {
         /* exec STRING */
         bool blank = false;
-        wasi_host_proc_exec_next(1);
+        __wasmify_host_proc_exec_next(1);
         pid = wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank, WASI_EXEC_IN_PLACE);
         if (blank) {
-            wasi_host_proc_exec_next(0);
+            __wasmify_host_proc_exec_next(0);
             return; /* nothing to run: exec fails, as perl's does */
         }
     } else {
@@ -651,19 +492,19 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         }
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
-        wasi_host_proc_exec_next(1);
+        __wasmify_host_proc_exec_next(1);
         pid = wasi_spawn_argv(argv, -1, -1, -1, WASI_EXEC_IN_PLACE);
         free(argv);
     }
     if (pid < 0) {
         /* (the spawn has said "Can't exec") */
         const int e = errno;
-        wasi_host_proc_exec_next(0);
+        __wasmify_host_proc_exec_next(0);
         errno = e;
         return;
     }
     /* The program is gone from here on: only the command remains. */
-    wasi_become(pid);
+    __wasmify_exec_become(pid);
 }
 
 extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {

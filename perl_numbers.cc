@@ -50,36 +50,16 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include "scripts/include/termios.h"
+#include <termios.h>
 #include <unordered_map>
 #include <vector>
+
+#include "wasmify_posix.h"
 
 extern "C" {
 #include <EXTERN.h>
 #include <perl.h>
 #include <XSUB.h>
-
-/* Whose numbers the program sees: 0 the C library's own, otherwise the
- * host's. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("host_numbering")))
-int wasi_host_numbering(void);
-
-/* The index-th number of a family of the host's: its name in C (name_len
- * bytes at name, which holds name_cap) and its value. 0, or a negative
- * errno: ENOENT past the last one. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("host_number_at")))
-int wasi_host_number_at(int family, int index, char *name, int name_cap, int *name_len,
-                        long long *value);
-
-/* A request of ioctl that this C library does not answer, made of the host:
- * request is the host's number, and the argument is a number (buffer 0:
- * arg is it) or memory the request reads and writes (arg_len bytes at arg,
- * in the host's layout). What the call returned is written at result. 0,
- * or a negative errno: EINVAL for a request that is not one of a
- * terminal's. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_ioctl")))
-int wasi_host_fd_ioctl(int fd, unsigned int request, int buffer, uintptr_t arg,
-                       unsigned int arg_len, int *result);
 
 /* the C library's waitpid and strerror: the link gives the names to
  * __wrap_waitpid and __wrap_strerror, below */
@@ -153,7 +133,7 @@ struct Family {
 };
 Family g_families[FAMILY_END];
 
-bool active() { return wasi_host_numbering() != 0; }
+bool active() { return __wasmify_host_numbering() != 0; }
 
 const FamilyInfo *family_info(int id) {
     for (const FamilyInfo &info : family_infos)
@@ -167,7 +147,7 @@ Family &family(int id) {
     char name[64];
     int len = 0;
     long long value = 0;
-    for (int i = 0; wasi_host_number_at(id, i, name, (int)sizeof(name), &len, &value) == 0; i++)
+    for (int i = 0; __wasmify_host_number_at(id, i, name, (int)sizeof(name), &len, &value) == 0; i++)
         f.host.emplace_back(std::string(name, (size_t)len), value);
     for (const GuestNumber &g : guest_numbers) {
         if (g.family != id) continue;
@@ -527,7 +507,7 @@ OP *builtin_ioctl(pTHX) {
     }
     TAINT_PROPER(PL_op_desc[OP_IOCTL]);
     int result = 0;
-    const int rc = wasi_host_fd_ioctl(PerlIO_fileno(IoIFP(io)), (unsigned int)request, buffer,
+    const int rc = __wasmify_host_fd_ioctl(PerlIO_fileno(IoIFP(io)), (unsigned int)request, buffer,
                                       buffer ? (uintptr_t)s : (uintptr_t)value,
                                       buffer ? (unsigned int)SvCUR(argsv) : 0, &result);
     IV retval = result;

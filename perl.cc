@@ -51,6 +51,7 @@ extern "C" {
 }
 
 #include "perl_program.h"
+#include "wasmify_posix.h"
 
 /* ---- linked-in extensions -------------------------------------------------
  * The XS extensions of this build are part of perl.wasm: one boot function
@@ -367,9 +368,6 @@ XS(XS_Internals_site_directories) {
  * program up with it. */
 extern "C" int __real_chdir(const char *path);
 
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_chdir")))
-extern "C" int wasi_host_proc_chdir(const char *path, int len);
-
 XS(XS_Internals_start_directory) {
     dXSARGS;
     if (items != 1) croak_xs_usage(cv, "dir");
@@ -378,7 +376,7 @@ XS(XS_Internals_start_directory) {
     if (len == 0 || dir[0] != '/' || strlen(dir) != len)
         croak("Internals::start_directory: %s is not an absolute path", dir);
     if (__real_chdir(dir) != 0) XSRETURN_NO;
-    (void)wasi_host_proc_chdir(dir, (int)len);
+    (void)__wasmify_host_proc_chdir(dir, (int)len);
     XSRETURN_YES;
 }
 
@@ -664,20 +662,11 @@ static SV *goperl_die_hook(pTHX_ SV *msg) {
 
 /* Connects this module instance to the host's signal delivery
  * (perl_signal.cc). Every entry point that runs Perl code calls it: the
- * instance may be a snapshot copy the host has not seen yet. */
+ * instance may be a snapshot copy the host has not seen yet. The signal
+ * layer, which the native code's masks and sets go to, is wasmify's
+ * (wasmify_posix.h). */
 extern "C" void wasi_signal_attach(pTHX);
 extern "C" void perl_wasm_locale_start_up(int on);
-/* Ends the process by a signal, as the signal's default action does
- * (perl_signal.cc). Does not return. */
-extern "C" __attribute__((noreturn)) void wasi_signal_die(int sig);
-/* The program's signal mask as native code changes it (perl_signal.cc):
- * kind 0 blocks, 1 unblocks, 2 sets, 3 only asks; the mask before. */
-extern "C" uint64_t perl_signal_native_mask(int kind, uint64_t mask);
-/* The mask a sigset_t holds, and a sigset_t made to hold a mask
- * (perl_signal.cc: the byte of a sigset_t names a set of its table);
- * perl_signal_set_store returns 0, or -1 when the table is full. */
-extern "C" uint64_t perl_signal_set_mask(const sigset_t *set);
-extern "C" int perl_signal_set_store(sigset_t *set, uint64_t mask);
 
 /* Words the host writes with plain linear-memory writes, no wasm code
  * running on the instance (perl_interrupt_addr returns their address):
@@ -1261,7 +1250,7 @@ static void goperl_interrupt_now(pTHX) {
     const uint32_t flag = g_interrupt;
     g_interrupt = 0;
     if (flag & GOPERL_INTERRUPT_SIGNAL)
-        wasi_signal_die((int)(flag & 0x7f));
+        __wasmify_host_proc_terminate((int)(flag & 0x7f));
     Perl_croak(aTHX_ "Perl execution interrupted");
 }
 /* What PERL_ASYNC_CHECK delivers, as a sub: native code asks for it in the
@@ -5290,7 +5279,6 @@ static void goperl_save_mem(pTHX_ void *loc, int width, int kind) {
  * address are kept here and brought up to date from the head of the chain
  * whenever it has moved: telling a scalar is a search of them, where perl
  * keeps nothing to find an arena by an address in it. */
-extern "C" int perl_signal_wait_mask(int begin, uint64_t mask, uint64_t *old);
 
 static std::vector<const SV *> g_sv_arenas;
 static const SV *g_sv_arenas_head;
@@ -6207,7 +6195,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         return 0;
     case GOPERL_INT_WAIT_MASK: {
         /* the sigset_t of POSIX::SigSet, which native code hands its wait
-         * as it is: one byte here, naming a set (perl_signal.cc) */
+         * as it is: one byte here, naming a set (wasmify's host_signal.cc) */
         uint64_t mask = b;
         if (c_hi & 1) {
             const sigset_t *set = (const sigset_t *)goperl_mem_arg(aTHX_ b, 1, GOPERL_OP_INTERNAL,
@@ -6217,19 +6205,19 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
                 if (sigismember(set, sig) == 1) mask |= (uint64_t)1 << (sig - 1);
         }
         uint64_t old = 0;
-        const int ran = perl_signal_wait_mask(lo != 0, mask, &old);
+        const int ran = __wasmify_signal_wait_mask(lo != 0, mask, &old);
         return goperl_two(old, (uint64_t)ran);
     }
     case GOPERL_INT_SIGMASK:
         if (lo == 4) {
             /* the set of POSIX::SigSet native code hands sigprocmask as it
-             * is: one byte here, naming a set (perl_signal.cc) */
-            return perl_signal_set_mask((const sigset_t *)goperl_mem_arg(
+             * is: one byte here, naming a set (wasmify's host_signal.cc) */
+            return __wasmify_signal_set_mask((const sigset_t *)goperl_mem_arg(
                 aTHX_ b, 1, GOPERL_OP_INTERNAL, "a sigset_t"));
         }
         /* sigprocmask and pthread_sigmask of native code: the program's
-         * mask, as POSIX::sigprocmask changes it (perl_signal.cc) */
-        return perl_signal_native_mask((int)lo, b);
+         * mask, as POSIX::sigprocmask changes it (wasmify's host_signal.cc) */
+        return __wasmify_signal_native_mask((int)lo, b);
     case GOPERL_INT_RAISE: {
         /* a signal native code's call raised for the process (SIGPIPE of a
          * write into a pipe nobody reads), which the kernel delivers as
@@ -6244,7 +6232,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         /* the set before, into a POSIX::SigSet native code handed over */
         sigset_t *set = (sigset_t *)goperl_mem_arg(aTHX_ a, 1, GOPERL_OP_INTERNAL, "a sigset_t");
         const int saved = errno;
-        const int r = perl_signal_set_store(set, b);
+        const int r = __wasmify_signal_set_store(set, b);
         errno = saved;
         return (uint64_t)(int64_t)r;
     }
