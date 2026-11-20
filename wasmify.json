@@ -109,7 +109,6 @@
       "perl_xs_helper",
       "perl_xs_op",
       "perl_xs_opbox",
-      "perl_fork_child",
       "perl_run_program"
     ]
   },

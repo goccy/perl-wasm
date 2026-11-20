@@ -223,8 +223,9 @@ static PerlIO *wasi_spawn_finish(pTHX_ int parent_fd, const char *mode,
  * do) and returns the child's pid here, in the parent. The new instance
  * holds an exact copy of the interpreter — heap, perl stacks, the very op
  * that was forking — but no native call stack: nothing is "inside"
- * pp_fork there. So the host starts the child through
- * wasi_fork_child_run, which finishes the forking op by hand (pushes the
+ * pp_fork there. So the host starts the child through the function
+ * given to __wasmify_fork, perl_fork_child_entry, which runs
+ * wasi_fork_child_run: it finishes the forking op by hand (pushes the
  * child's result, 0) and runs a fresh run loop from the next op, exactly
  * what win32's fork emulation does after perl_clone. The child ends when
  * that run loop ends or the program exits.
@@ -263,21 +264,17 @@ static struct {
  * pp_open without the C frame that held it. */
 extern "C" { SSize_t wasi_open_return_sp = 0; }
 
-extern "C" void wasi_signal_fork_child(pTHX);
+extern "C" void wasi_signal_attach(pTHX);
+extern "C" int perl_fork_child_entry(void *arg);
 
 /* Forks at the current op. Returns the child's pid, or -1 with errno set.
  * Only the parent ever returns from this. */
 static pid_t wasi_fork_here(pTHX_ int kind) {
     wasi_fork_point.kind = kind;
     wasi_fork_point.resume_op = PL_op ? PL_op->op_next : NULL;
-    int pid = -1;
-    int rc = __wasmify_host_proc_fork(&pid);
+    const pid_t pid = __wasmify_fork(perl_fork_child_entry, &wasi_fork_point);
     wasi_fork_point.kind = WASI_FORK_NONE;
-    if (rc != 0) {
-        errno = rc < 0 ? -rc : rc;
-        return -1;
-    }
-    return (pid_t)pid;
+    return pid;
 }
 
 /* A command that system, a piped open or backticks could not start. perl
@@ -324,16 +321,13 @@ extern "C" OP *wasi_fork(pTHX) {
     return NORMAL;
 }
 
-/* Runs a forked child to its end. Called by the host on the NEW instance,
- * once, before anything else runs there. Returns 0 with the child's exit
+/* Runs a forked child to its end. Called on the NEW instance, once,
+ * before anything else runs there. Returns 0 with the child's exit
  * status in *status_out, or -1 when this instance is not a fork child. */
-extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
+extern "C" int wasi_fork_child_run(pTHX_ int *status_out) {
     const int kind = wasi_fork_point.kind;
     if (kind == WASI_FORK_NONE) return -1;
     wasi_fork_point.kind = WASI_FORK_NONE;
-    /* The host knows this instance as the process pid: getpid and getppid
-     * ask it (wasmify's host_process.cc). */
-    (void)pid;
 
     /* The jump environments the copied interpreter points at lived in
      * native frames this instance does not have. */
@@ -343,10 +337,11 @@ extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out) {
     if (PL_psig_pend)
         for (int sig = 1; sig < SIG_SIZE; sig++) PL_psig_pend[sig] = 0;
     /* This instance is new to the host: no signal state of the parent's
-     * came along. Attaching comes after the reset above — the host may
-     * already hold a signal for this child, sent the moment it was forked,
-     * and raises PL_sig_pending for it right here. */
-    wasi_signal_fork_child(aTHX);
+     * came along (the signals the shim held for the parent were dropped
+     * before this was entered). Attaching comes after the reset above —
+     * the host may already hold a signal for this child, sent the moment
+     * it was forked, and raises PL_sig_pending for it right here. */
+    wasi_signal_attach(aTHX);
 #ifdef PERL_USES_PL_PIDSTATUS
     hv_clear(PL_pidstatus); /* no kids, so don't wait for 'em */
 #endif

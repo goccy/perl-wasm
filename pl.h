@@ -316,24 +316,6 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, uint64_t
 uint64_t perl_xs_opbox(uint64_t h);
 uint32_t perl_xs_op(void);
 
-/* Run a forked child to its end.
- *
- * fork is emulated the way perl emulates it on Windows: when the guest
- * forks, the host duplicates the whole instance (the proc_fork host import)
- * and the duplicate becomes the child. The host calls this once on the NEW
- * instance, before any other entry point, with the pid it registered the
- * child under. The call resumes the program right after the forking op,
- * with fork's result being 0, and returns when the child's program ends.
- *
- * The child's program ends like a process: its END blocks run, PerlIO is
- * flushed, and the interpreter is destroyed (global destruction), all inside
- * this call. Returns the exit status (0..255) that leaves — a destructor
- * may still assign $? during global destruction — or UINT32_MAX when the
- * instance is not a freshly forked child. A destructor that calls exit or
- * _exit there ends the instance through proc_exit, as it ends a perl
- * process. Afterwards there is no interpreter: perl_close is a no-op. */
-uint32_t perl_fork_child(uint64_t h, int32_t pid);
-
 /* Run a whole program, the way the perl command runs the one its command
  * line names: compiled as the MAIN program (no caller at its top level,
  * __END__/__DATA__ attached, the switches of its #! line honoured), then

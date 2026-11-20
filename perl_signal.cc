@@ -58,12 +58,4 @@ void wasi_signal_attach(pTHX) {
         __wasmify_signal_report();
 }
 
-/* The child side of fork: signals pending for the parent are not pending
- * for the child (the interval timer is not inherited either; the host
- * starts the child without one). */
-void wasi_signal_fork_child(pTHX) {
-    __wasmify_signal_fork_child();
-    wasi_signal_attach(aTHX);
-}
-
 } /* extern "C" */

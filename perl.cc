@@ -2331,7 +2331,7 @@ std::string perl_eval(uint64_t h, const char *src) {
     return out;
 }
 
-extern "C" int wasi_fork_child_run(pTHX_ int pid, int *status_out);
+extern "C" int wasi_fork_child_run(pTHX_ int *status_out);
 
 /* The end of the interpreter, as perl's main() performs it: perl_destruct
  * (the END blocks, the flush of PerlIO, global destruction) and perl_free.
@@ -2369,14 +2369,23 @@ void perl_close(uint64_t h) {
     destroy_interpreter();
 }
 
-uint32_t perl_fork_child(uint64_t h, int32_t pid) {
-    if (!g_my_perl || h == 0) return UINT32_MAX;
+/* Runs a forked child to its end: what fork gives __wasmify_fork to run in
+ * the new instance (perl_wasi.cc). It resumes the program right after the
+ * forking op, with fork's result being 0, and returns when the child's
+ * program ends.
+ *
+ * The child's program ends like a process: its END blocks run, PerlIO is
+ * flushed, and the interpreter is destroyed (global destruction), all inside
+ * this call. Returns the exit status (0..255) that leaves — a destructor
+ * may still assign $? during global destruction. A destructor that calls
+ * exit or _exit there ends the instance through proc_exit, as it ends a
+ * perl process. Afterwards there is no interpreter: perl_close is a no-op. */
+extern "C" int perl_fork_child_entry(void *) {
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
     int status = 0;
-    if (wasi_fork_child_run(aTHX_ static_cast<int>(pid), &status) != 0)
-        return UINT32_MAX;
-    return static_cast<uint32_t>(destroy_interpreter()) & 0xff;
+    if (wasi_fork_child_run(aTHX_ &status) != 0) return 255;
+    return destroy_interpreter() & 0xff;
 }
 
 /* ---- whole-program execution (perl_program.cc) -------------------------- */
