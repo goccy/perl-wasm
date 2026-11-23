@@ -9302,8 +9302,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_FIELD_OP_SV:
         case GOPERL_FIELD_OP_GV:
             break;
-        case GOPERL_FIELD_IS_FREED:
-            (void)goperl_sv_arg(aTHX_ a, op, true);
+        case GOPERL_FIELD_IS_FREED: /* a freed scalar too */
+            sv = goperl_sv_arg(aTHX_ a, op, true, false);
             break;
         default: sv = GOPERL_SVSUBJ(a);
         }

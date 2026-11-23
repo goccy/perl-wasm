@@ -375,12 +375,11 @@ def without_build_paths(config: str) -> str:
     config = config.replace(clang.group(1) + "/clang", "clang")
     for key in ("libc", "hostperl", "hostgenerate"):
         config = replace_once(config, rf"^{key}='[^'\n]*'$", f"{key}=''", f"Config_heavy.pl: {key}")
-    # the build's directories, as the whole of a path or its first components,
-    # also after a compiler option (-I/x, -L/x, -isystem/x)
+    # the build's directories (absolute paths) as the whole of a path or its
+    # first components, whatever is before them (-I/x, -Wl,-rpath,/x, (-L/x))
     for directory in (os.path.dirname(os.path.dirname(shim.group(1))), os.path.dirname(clang.group(1)),
                       sysroot.group(1)):
-        if re.search(r"(?:^|[\s'\"=(:]|(?:^|(?<=[\s'\"=]))-(?:I|L|isystem|iquote|idirafter))" + re.escape(directory)
-                     + r"(?![^/\s'\")])", config, flags=re.M):
+        if re.search(re.escape(directory) + r"(?=[/\s'\",;:)]|$)", config, flags=re.M):
             raise SystemExit(f"make-stdlib-zip: Config_heavy.pl: {directory} is still named")
     return config
 
