@@ -914,6 +914,48 @@ NUMBER(ioctl, FIONREAD)
 #ifdef FIONBIO
 NUMBER(ioctl, FIONBIO)
 #endif
+#ifdef TCGETS
+NUMBER(ioctl, TCGETS)
+#endif
+#ifdef TCSETS
+NUMBER(ioctl, TCSETS)
+#endif
+#ifdef TIOCEXCL
+NUMBER(ioctl, TIOCEXCL)
+#endif
+#ifdef TIOCNXCL
+NUMBER(ioctl, TIOCNXCL)
+#endif
+#ifdef TIOCSCTTY
+NUMBER(ioctl, TIOCSCTTY)
+#endif
+#ifdef TIOCGPGRP
+NUMBER(ioctl, TIOCGPGRP)
+#endif
+#ifdef TIOCSPGRP
+NUMBER(ioctl, TIOCSPGRP)
+#endif
+#ifdef TIOCOUTQ
+NUMBER(ioctl, TIOCOUTQ)
+#endif
+#ifdef TIOCGWINSZ
+NUMBER(ioctl, TIOCGWINSZ)
+#endif
+#ifdef TIOCSWINSZ
+NUMBER(ioctl, TIOCSWINSZ)
+#endif
+#ifdef TIOCNOTTY
+NUMBER(ioctl, TIOCNOTTY)
+#endif
+#ifdef TIOCGSID
+NUMBER(ioctl, TIOCGSID)
+#endif
+#ifdef TIOCGPTN
+NUMBER(ioctl, TIOCGPTN)
+#endif
+#ifdef TIOCSPTLCK
+NUMBER(ioctl, TIOCSPTLCK)
+#endif
 NUMBER_FAMILY(22, langinfo, ENUM)
 #ifdef ABDAY_1
 NUMBER(langinfo, ABDAY_1)

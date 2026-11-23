@@ -554,10 +554,11 @@ OP *builtin_fcntl(pTHX) {
     return next;
 }
 
-/* ioctl FILEHANDLE, FUNCTION, SCALAR. A request this C library answers
- * (perl_numbers.inc) goes to it, under its number. Every other request
- * goes to the C library as it is: its ioctl takes a terminal's requests,
- * in Linux's numbers, to the host's terminal (wasmify's host_tty.cc). */
+/* ioctl FILEHANDLE, FUNCTION, SCALAR. A request in the host's number that
+ * both sides name (perl_numbers.inc: FIONREAD, FIONBIO and a terminal's)
+ * goes to the C library under its number: its ioctl takes a terminal's
+ * requests, in Linux's numbers, to the host's terminal (wasmify's
+ * host_tty.cc). Every other request goes to it as it is. */
 OP *builtin_ioctl(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
