@@ -5,7 +5,7 @@
  * Most guarded-out POSIX (sockets, netdb, exec, kill, dup, alarm, getgroups,
  * mkstemp, sigaction, wait/waitpid, ...) is supplied by wasmify's POSIX-compat /
  * host-subprocess stub headers, which `wasmify build`/`wasm-build` inject via
- * -isystem when wasmify.json opts into HostSockets/HostSubprocess. This file
+ * -isystem when wasmify.json gives the host capabilities ("host"). This file
  * only fills the small remaining gap. Force-included via -include in cflags.
  * libperl.a is an archive, so the symbols stay unresolved until the perl.wasm
  * link supplies host shims or ENOSYS stubs.
@@ -14,6 +14,7 @@
 #define PERLWASM_WASI_POSIX_SHIM_H
 
 #include <sys/types.h> /* pid_t, uid_t, gid_t, id_t */
+#include <sys/time.h>  /* struct timeval (futimes) */
 #include <stdint.h>    /* uint32_t (netent) */
 #include <fcntl.h>     /* open + O_EXCL/O_APPEND/... (util.c uses them directly) */
 
@@ -28,10 +29,10 @@
  * CLOCK_REALTIME = &_CLOCK_REALTIME), while perl-world code moves clock ids
  * through IVs — generated constant tables (ExtUtils::Constant's const-c.inc
  * in Time::HiRes) assign the macros to IV, and feature probes assign them to
- * clockid_t. The clock_* FUNCTIONS are configured off for perl
- * (d_clock_gettime='undef' & friends in wasi-configure.sh), so nothing can
- * ever pass these ids to wasi-libc; replace the pointer macros with the
- * conventional integer ids so both idioms compile. CLOCK_REALTIME must be 0:
+ * clockid_t. Replace the pointer macros with the conventional integer ids
+ * so both idioms compile. An integer id never reaches wasi-libc: the one
+ * caller of the clock functions, Time::HiRes, finds the wasi clock of an id
+ * first (the HiRes.xs patch in wasi-configure.sh). CLOCK_REALTIME must be 0:
  * feature probes assign it to clockid_t, and 0 is the one integer that is
  * also a valid null pointer constant. */
 #include <time.h>
@@ -67,6 +68,22 @@
  * include guard and the __struct_sockaddr_un.h guard) so there is no conflicting
  * redefinition. AF_UNIX then COMPILES; whether it works is up to the host socket
  * layer (go-perl) — otherwise the call fails at runtime, which is correct. */
+/* struct sockaddr_storage: wasi-libc's has 48 bytes, less than a Unix-domain
+ * address (below) takes. POSIX has it large enough for any address, and
+ * perl sizes the buffer of getsockname and getpeername by it: with wasi's,
+ * a Unix-domain name was cut after 46 bytes and the end of the string was
+ * set past the buffer. This is Linux's: 128 bytes. wasi's definer is
+ * suppressed by its include guard before <sys/socket.h> pulls it in, which
+ * is the case for everything of perl (the header is force-included); a
+ * source that includes this header after <sys/socket.h> keeps wasi's. */
+#ifndef __wasilibc___struct_sockaddr_storage_h
+#define __wasilibc___struct_sockaddr_storage_h
+#include <__typedef_sa_family_t.h>
+struct sockaddr_storage {
+	__attribute__((aligned(__BIGGEST_ALIGNMENT__))) sa_family_t ss_family;
+	char __ss_data[128 - sizeof(sa_family_t)];
+};
+#endif
 #include <sys/socket.h>
 #ifndef _SYS_UN_H
 #define _SYS_UN_H
@@ -102,11 +119,114 @@ struct sockaddr_un {
 #define SOMAXCONN 128
 #endif
 
+/* shutdown(2)'s "how": 0 stops reads, 1 writes, 2 both, on every system
+ * perl runs on, and programs pass the numbers themselves
+ * (`shutdown($sock, 1)`, documented that way in perlfunc). wasi-libc gives
+ * the three names the bits of the WASI call instead (1, 2 and 3), so that
+ * a literal 1 stopped reads and a 0 was refused. The names get the usual
+ * numbers here, and shutdown() itself (wasmify's host_sockets.cc)
+ * translates them. */
+#undef SHUT_RD
+#undef SHUT_WR
+#undef SHUT_RDWR
+#define SHUT_RD 0
+#define SHUT_WR 1
+#define SHUT_RDWR 2
+
+/* poll(2) event bits wasi-libc leaves out. Programs name them when they
+ * build an event mask (POE's IO::Poll loop asks for POLLRDBAND with every
+ * read), so the names have to exist; the bits are free ones of this C
+ * library's numbering. No descriptor here has out-of-band or priority-band
+ * data, so poll never reports them. POLLNORM is the historical name of
+ * POLLRDNORM. */
+#include <poll.h>
+#ifndef POLLRDBAND
+#define POLLRDBAND 0x0080
+#endif
+#ifndef POLLWRBAND
+#define POLLWRBAND 0x0100
+#endif
+#ifndef POLLNORM
+#define POLLNORM POLLRDNORM
+#endif
+
+/* SO_ACCEPTCONN ("is this socket listening?", read only). wasi-libc has no
+ * number for it; the host socket layer answers it (wasmify's socket shim
+ * uses this number when the C library has none). */
+#ifndef SO_ACCEPTCONN
+#define SO_ACCEPTCONN 30
+#endif
+
+/* More names programs import from Socket and POSIX at compile time, which
+ * wasi-libc's headers leave out, with Linux's numbers: the socket options
+ * that bind a socket to a device and attach a packet filter (Linux::Event,
+ * Linux::PacketFilter), the control message that passes descriptors over
+ * a Unix-domain socket (SCM_RIGHTS), and the range of the real-time
+ * signals (POSIX::SIGRTMIN, SIGRTMAX). A program that sets one of the
+ * options the host socket layer does not carry gets ENOPROTOOPT there. */
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
+#endif
+#ifndef SO_ATTACH_FILTER
+#define SO_ATTACH_FILTER 26
+#endif
+#ifndef SCM_RIGHTS
+#define SCM_RIGHTS 1
+#endif
+#ifndef SIGRTMIN
+#define SIGRTMIN 34
+#endif
+#ifndef SIGRTMAX
+#define SIGRTMAX 64
+#endif
+
+/* The old names of flags of open that Linux's headers keep, for the same
+ * flags: O_NDELAY, FNDELAY and FNONBLOCK are O_NONBLOCK, FAPPEND is
+ * O_APPEND. Fcntl exports them where they are defined. */
+#ifndef O_NDELAY
+#define O_NDELAY O_NONBLOCK
+#endif
+#ifndef FNDELAY
+#define FNDELAY O_NONBLOCK
+#endif
+#ifndef FNONBLOCK
+#define FNONBLOCK O_NONBLOCK
+#endif
+#ifndef FAPPEND
+#define FAPPEND O_APPEND
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* The number the program sees for an error number of this C library, and
+ * the C library's for one the program gives (perl_numbers.cc): what $! and
+ * the status of a die pass through (the patch to mg.c and perl.c in
+ * wasi-configure.sh). */
+int host_errno_of(int guest_errno);
+int guest_errno_of(long long host_errno);
+
 mode_t umask(mode_t);
+/* The real-time interval timer. wasi-libc guards setitimer, getitimer and
+ * their types out of <sys/time.h> ("WASI has no getitimer") and shows ualarm
+ * only to _GNU_SOURCE code; wasmify's host_signal.cc implements all three on the timer
+ * the host keeps, the one alarm() sets. ITIMER_REAL is the only timer there
+ * is: the process CPU-time timers (ITIMER_VIRTUAL, ITIMER_PROF) have nothing
+ * to count, and stay undefined so that nothing offers them. */
+#ifndef ITIMER_REAL
+#define ITIMER_REAL 0
+struct itimerval {
+	struct timeval it_interval;
+	struct timeval it_value;
+};
+#endif
+int getitimer(int, struct itimerval *);
+int setitimer(int, const struct itimerval *, struct itimerval *);
+unsigned ualarm(unsigned, unsigned);
+/* wasi-libc keeps futimes out of <sys/time.h> and out of the library as a
+ * legacy function; wasmify's host-fs shim defines it over futimens. */
+int futimes(int, const struct timeval [2]);
 pid_t getppid(void);
 int execl(const char *, const char *, ...);
 int killpg(pid_t, int);
@@ -131,30 +251,15 @@ void tzset(void);
 int nice(int);
 int mkfifo(const char *, mode_t);
 char *ttyname(int);
+pid_t tcgetpgrp(int);
+int tcsetpgrp(int, pid_t);
 int lchown(const char *, uid_t, gid_t);
 
-/* The netdb ITERATION / by-net / by-serv / by-proto lookups: wasmify's netdb.h
- * stub supplies struct hostent + gethostbyname/gethostbyaddr, but not these.
- * Perl uses the system prototypes (d_*protos=define in config) so it does not
- * redeclare them — supply the structs + prototypes here. struct hostent /
- * addrinfo come from wasmify's netdb.h; do not redefine them. */
-struct netent {
-	char         *n_name;
-	char        **n_aliases;
-	int           n_addrtype;
-	uint32_t      n_net;
-};
-struct servent {
-	char  *s_name;
-	char **s_aliases;
-	int    s_port;
-	char  *s_proto;
-};
-struct protoent {
-	char  *p_name;
-	char **p_aliases;
-	int    p_proto;
-};
+/* The netdb ITERATION / by-net / by-serv / by-proto lookups. Perl uses the
+ * system prototypes (d_*protos=define in config) so it does not redeclare
+ * them. struct netent, servent and protoent, like struct hostent and
+ * addrinfo, come from wasmify's netdb.h (whose shim implements the
+ * lookups); do not redefine them. */
 struct hostent  *gethostent(void);
 struct netent   *getnetent(void);
 struct netent   *getnetbyname(const char *);
@@ -213,7 +318,7 @@ void endgrent(void);
 
 /* ---- fork-free piped opens (PERL_WASI_SPAWN) -----------------------------
  * WASI has no fork: the runtime's subprocess support is posix_spawn-shaped
- * (wasmify HostSubprocess: posix_spawn + waitpid + pipe over host imports).
+ * (wasmify's process.spawn: posix_spawn + waitpid + pipe over host imports).
  * The perl build defines PERL_WASI_SPAWN and routes my_popen/my_popen_list
  * into these spawn-based implementations (perl.cc); my_pclose keeps perl's
  * own implementation, which only needs waitpid. */

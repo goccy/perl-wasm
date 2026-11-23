@@ -27,7 +27,7 @@
       "source_dirs": [
         "perl5"
       ],
-      "description": "Static Perl interpreter library (wasm32-wasi). The embedding API in perl.h (perl_new/perl_eval/perl_close) links against this. Perl's C core is a flat set of ~50 .c files at the repo root (perl.c, sv.c, op.c, pp*.c, regcomp.c, run.c, ...)."
+      "description": "Static Perl interpreter library (wasm64-wasi). The embedding API in perl.h (perl_new/perl_eval/perl_close) links against this. Perl's C core is a flat set of ~50 .c files at the repo root (perl.c, sv.c, op.c, pp*.c, regcomp.c, run.c, ...)."
     },
     {
       "name": "perl",
@@ -54,7 +54,17 @@
   ],
   "build_commands": {
     "configure": "bash scripts/wasi-configure.sh",
-    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs'"
+    "build": "sh -c 'make -j$(getconf _NPROCESSORS_ONLN) $(sed -n \"s/^nonxs_ext = *//p\" Makefile) && make -j$(getconf _NPROCESSORS_ONLN) libperl.a ext.libs && (cd dist/Devel-PPPort && ../../miniperl -I../../lib PPPort_pm.PL && cp PPPort.pm ../../lib/Devel/PPPort.pm) && mkdir -p lib/Sys/Syslog && cp cpan/Sys-Syslog/win32/Win32.pm lib/Sys/Syslog/Win32.pm && sh ../scripts/programs-and-pods.sh'"
+  },
+  "wasm_build": {
+    "wasm64": true,
+    "extra_ldflags": [
+      "-lc-printscan-long-double",
+      "-Wl,--fatal-warnings",
+      "-Wl,--wrap=setlocale",
+      "-Wl,--wrap=waitpid",
+      "-Wl,--wrap=strerror"
+    ]
   },
   "user_selection": {
     "target_name": "libperl",
@@ -63,13 +73,15 @@
   "bridge": {
     "CustomBridgeSources": [
       "perl.cc",
-      "perl_wasi.cc"
+      "perl_wasi.cc",
+      "perl_program.cc",
+      "perl_signal.cc",
+      "perl_libc.cc",
+      "perl_numbers.cc",
+      "perl_syslog.cc"
     ],
     "GoPackage": "github.com/goccy/go-perl/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/perlwasm2go",
-    "HostSockets": true,
-    "HostSubprocess": true,
-    "HostFS": true,
     "StackSize": 8388608,
     "ExportFunctions": [
       "perl_new",
@@ -94,8 +106,27 @@
       "perl_release",
       "perl_set_go_dispatcher",
       "perl_register_native_xs",
-      "perl_xs_helper"
+      "perl_xs_helper",
+      "perl_xs_op",
+      "perl_xs_opbox",
+      "perl_run_program"
     ]
+  },
+  "host": {
+    "filesystem": true,
+    "network": true,
+    "process": {
+      "spawn": true,
+      "fork": true,
+      "environment": true,
+      "job_control": true,
+      "resources": true
+    },
+    "signals": true,
+    "terminal": true,
+    "users": true,
+    "ipc": true,
+    "system": true
   },
   "phases": {
     "gen-proto": {
