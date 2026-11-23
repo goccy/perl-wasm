@@ -262,7 +262,7 @@ perllibs='-lm'
 # perl. The libraries a program can load at run time are the host's, so
 # these are the host's conventional library directories. Nothing in this
 # build looks a library up through it: the interpreter is linked by wasmify
-# with the libraries of `libs`, found through --sysroot.
+# with the libraries of \`libs\`, found through --sysroot.
 libpth='/usr/local/lib /usr/lib /lib'
 
 # Build-host-portable fixups. These drive the BUILD machine (not the wasm
@@ -433,7 +433,7 @@ d_getgrgid_r='undef'
 d_getgrent_r='undef'
 # futimes: the arm base answers 'undef', and wasi-libc has none. wasmify's
 # file system shim (filesystem.attributes in wasmify.json's "host") defines
-# it over futimens and scripts/wasi-posix-shim.h declares it, so `utime`
+# it over futimens and scripts/wasi-posix-shim.h declares it, so \`utime\`
 # works on a filehandle.
 d_futimes='define'
 # wasi-libc's FILE is opaque; Perl must not poke its glibc _IO_FILE internals.

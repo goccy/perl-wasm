@@ -50,6 +50,9 @@
     {
       "name": "make",
       "installed": true
+    },
+    {
+      "name": "cmake"
     }
   ],
   "build_commands": {

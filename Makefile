@@ -74,10 +74,13 @@ WASI_CLANG = $${WASI_SDK_PATH:-$$HOME/.config/wasmify/bin/wasi-sdk}/bin/clang
 
 all: wasm
 
-# Install the tools wasmify.json declares (wasi-sdk; pre-baked in the image).
-# Safe to re-run; already-installed tools are skipped.
+# Install the tools wasmify.json declares (wasi-sdk; pre-baked in the image)
+# and the wasm64 sysroot the configure and the captured build compile against
+# (the image's wasi-sdk ships wasm32 sysroots only; building it needs cmake).
+# Safe to re-run; already-installed tools and sysroot stages are skipped.
 tools:
 	wasmify ensure-tools ./perl5 --output-dir .
+	wasmify install-sdk --wasm64
 
 # Build perl.wasm + the wasm2go bundle from a clean checkout, exactly the way
 # .github/workflows/build.yml does. Outputs:
