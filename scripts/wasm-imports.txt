@@ -86,6 +86,7 @@ wasip1_posix_extension proc_setids func
 wasip1_posix_extension proc_setpgid func
 wasip1_posix_extension proc_setsid func
 wasip1_posix_extension proc_signal_dispositions func
+wasip1_posix_extension proc_signal_ignored func
 wasip1_posix_extension proc_signal_register func
 wasip1_posix_extension proc_signal_take func
 wasip1_posix_extension proc_spawn func
