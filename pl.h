@@ -258,7 +258,7 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
 /* SV micro-operations the host-side SDK vtable is built from. The full op
  * table lives in perl.cc (and mirrors the GOPERL_OP_* enum in the go-perl
  * native SDK header). An operation takes three u64 operands a, b and c and
- * a string s; a token (an address of the linear memory) is always an
+ * a string s of slen bytes, which may hold NULs; a token (an address of the linear memory) is always an
  * operand of its own, whole. It answers a u64; an operation that answers
  * two values leaves the second in the operation box (result2, see
  * perl_xs_opbox), where the host reads it right after the operation.
@@ -297,7 +297,7 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id);
  *                  behavioral (tie) magic
  * Unknown ops return 0. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, uint64_t c,
-                        const char *s);
+                        const char *s, uint64_t slen);
 
 /* perl_xs_helper without the bridge's encoding, for the operations native
  * code makes by the million: perl_xs_opbox answers the address of the
@@ -305,7 +305,7 @@ uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, uint64_t
  * ([a][b][c][result][result2] as u64, [op] as i32, [slen] as u32, then the
  * slen bytes of s: 48 bytes before s, GOPERL_OPBOX_STR bytes of room for
  * s). The host writes an operation's arguments there and calls perl_xs_op,
- * which runs it as perl_xs_helper does (s NUL-terminated) and leaves its
+ * which runs it as perl_xs_helper does and leaves its
  * result in the box; it answers 0, so that the bridge sends nothing back. A
  * string longer than the box holds goes through perl_xs_helper. Either way
  * the second value of an operation that answers two is in result2 when the

@@ -1,7 +1,7 @@
 # perl-wasm
 
 [wasmify](https://github.com/goccy/wasmify) project that compiles
-[Perl](https://github.com/Perl/perl5) (v5.42.2) to `wasm32-wasip1` and emits
+[Perl](https://github.com/Perl/perl5) (v5.42.2) to `wasm64-wasip1` and emits
 the pure-Go (wasm2go) bindings [go-perl](https://github.com/goccy/go-perl)
 consumes.
 
@@ -57,7 +57,7 @@ code generation (Config.pm, the Unicode tables, the MakeMaker-driven extension
 builds), and a wasm miniperl cannot run on the build host — so
 `scripts/wasi-configure.sh` first builds a host-native miniperl of the same
 Perl version (the analogue of python-wasm's host build-python), then generates
-the wasm32-wasi `config.sh` and assembles `perl5/lib`:
+the wasm64-wasi `config.sh` and assembles `perl5/lib`:
 
 ```
 make tools                  # ensure wasi-sdk (pre-baked in the image)

@@ -118,6 +118,7 @@
     "process": {
       "spawn": true,
       "fork": true,
+      "environment": true,
       "job_control": true,
       "resources": true
     },

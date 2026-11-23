@@ -263,7 +263,7 @@ XS(XS_DynaLoader_dl_static_boot) {
         SV *const name = sv_2mortal(newSVpvf("%s::bootstrap", ext.module));
         CV *boot = get_cv(SvPV_nolen(name), 0);
         if (!boot) {
-            boot = newXS(SvPV_nolen(name), XS_static_extension_bootstrap, __FILE__);
+            boot = newXS(SvPV_nolen(name), XS_static_extension_bootstrap, __FILE_NAME__);
             CvXSUBANY(boot).any_ptr = const_cast<StaticExtension *>(&ext);
         }
         ST(0) = sv_2mortal(newRV_inc((SV *)boot));
@@ -375,13 +375,31 @@ XS(XS_Internals_start_directory) {
     const char *dir = SvPV_const(ST(0), len);
     if (len == 0 || dir[0] != '/' || strlen(dir) != len)
         croak("Internals::start_directory: %s is not an absolute path", dir);
-    if (__real_chdir(dir) != 0) XSRETURN_NO;
-    (void)__wasmify_host_proc_chdir(dir, (int)len);
+    /* the host's directory follows, as chdir's does (wasmify's host_fs.cc);
+     * where it cannot, this one goes back, and both stay where they were */
+    char *const was = getcwd(NULL, 0);
+    if (!was) XSRETURN_NO;
+    if (__real_chdir(dir) != 0) {
+        free(was);
+        XSRETURN_NO;
+    }
+    const int rc = __wasmify_host_proc_chdir(dir, (int)len);
+    if (rc != 0) {
+        const int back = __real_chdir(was);
+        const int back_errno = errno;
+        free(was);
+        if (back != 0)
+            croak("Internals::start_directory: the host stays, and this process cannot go back: %s",
+                  Strerror(back_errno));
+        errno = -rc;
+        XSRETURN_NO;
+    }
+    free(was);
     XSRETURN_YES;
 }
 
 static void xs_init(pTHX) {
-    static const char file[] = __FILE__;
+    static const char file[] = __FILE_NAME__;
     dXSUB_SYS;
     PERL_UNUSED_CONTEXT;
 
@@ -532,6 +550,13 @@ static int32_t g_go_cb = 0;
 /* Reserved callback method id for reading memory of the process that is not
  * this memory (unpack 'p' and 'P' of such an address, goperl_unpack_address). */
 #define GOPERL_PROCMEM_METHOD_ID (-10)
+
+/* Reserved callback method id for the socket addresses of the host's C
+ * library (goperl_host_sockaddr; perl_numbers.cc says the request). The
+ * response is [1] and the address on the other side, [1] alone for an
+ * address the other side has no form of, or [0] and the message to croak
+ * with. */
+#define GOPERL_SOCKADDR_METHOD_ID (-11)
 enum {
     GOPERL_HOST_NEWOP = 0, /* an op checker: [type][op] -> [op] */
     GOPERL_HOST_PEEP = 1,  /* a peephole hook: [which][op] */
@@ -576,18 +601,30 @@ enum {
 /* The exception value a native XSUB ended with (croak_sv, or croak(NULL)
  * on $@): the host hands it over with the SV_CALL THROW operation while the
  * native code unwinds, and the thunk dies with it once the host call has
- * returned. NULL whenever no native XSUB is ending that way. */
+ * returned. NULL whenever no native XSUB is ending that way. Each call of
+ * the host that runs native code has its own (goperl_invoke_native): one
+ * made while another's value waits keeps that value aside. */
 static SV *goperl_thrown_sv = NULL;
+
+/* A call of the host that may run native code (wasmify_callback_invoke to
+ * the dispatcher): *thrown receives the value its native code threw, as a
+ * mortal, or NULL for none. */
+static int64_t goperl_invoke_native(pTHX_ SV **thrown, int32_t method_id, void *req, size_t req_len) {
+    SV *const outer = goperl_thrown_sv;
+    goperl_thrown_sv = NULL;
+    const int64_t rc = wasmify_callback_invoke(g_go_cb, method_id, req, req_len);
+    *thrown = goperl_thrown_sv ? sv_2mortal(goperl_thrown_sv) : NULL;
+    goperl_thrown_sv = outer;
+    return rc;
+}
 
 /* The host answered that the native code it ran ended by throwing a value
  * (GOPERL_RESP_THROW): the interpreter dies with that value — the object
  * itself, or the whole text with its encoding. Whatever ran the native
  * code calls this on the response first: an XSUB, a keyword plugin, a pp
  * function, a hook. The response is freed when it does not return. */
-static void goperl_die_if_thrown(pTHX_ unsigned char *resp) {
+static void goperl_die_if_thrown(pTHX_ unsigned char *resp, SV *thrown) {
     if (resp[0] != GOPERL_RESP_THROW) return;
-    SV *thrown = goperl_thrown_sv;
-    goperl_thrown_sv = NULL;
     free(resp);
     if (!thrown) Perl_croak(aTHX_ "native code: the thrown value is missing");
     /* $SIG{__DIE__} has seen it where the native code croaked (see
@@ -595,7 +632,19 @@ static void goperl_die_if_thrown(pTHX_ unsigned char *resp) {
     ENTER;
     SAVESPTR(PL_diehook);
     PL_diehook = NULL;
-    croak_sv(sv_2mortal(thrown));
+    croak_sv(thrown);
+}
+
+/* The host's answer of resp_len bytes (at least 1) to a call that ran
+ * native code: the interpreter dies with the value the native code threw
+ * (thrown, goperl_die_if_thrown), or with the whole message of a failure
+ * (GOPERL_RESP_FAIL). The response is freed when it does not return. */
+static void goperl_die_if_failed(pTHX_ unsigned char *resp, uint32_t resp_len, SV *thrown) {
+    goperl_die_if_thrown(aTHX_ resp, thrown);
+    if (resp[0] != GOPERL_RESP_FAIL) return;
+    SV *const msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
+    free(resp);
+    croak_sv(msg);
 }
 
 /* The count results of a call on top of the stack, taken off it, as words
@@ -730,23 +779,15 @@ static int goperl_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len,
         memcpy(buf, &kind, 8);
         memcpy(buf + 8, keyword_ptr, keyword_len);
         const size_t native_below = goperl_native_enter(aTHX);
-        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
+        SV *thrown;
+        int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 8 + (size_t)keyword_len);
         goperl_native_leave(native_below);
         if (rc == GOPERL_CALLBACK_JUMPED) return KEYWORD_PLUGIN_DECLINE;
         uint32_t resp_len;
         unsigned char *resp = goperl_callback_response(rc, &resp_len);
         if (resp != nullptr && resp_len >= 1) {
-            goperl_die_if_thrown(aTHX_ resp);
-            if (resp[0] == GOPERL_RESP_FAIL) {
-                char msg[512];
-                size_t ml = resp_len - 1;
-                if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-                memcpy(msg, resp + 1, ml);
-                msg[ml] = '\0';
-                free(resp);
-                Perl_croak(aTHX_ "%s", msg);
-            }
+            goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
             /* [1][handled][the plugin's result][the op] */
             if (goperl_resp_word(resp, resp_len, 0)) {
                 const int ret = (int)(int64_t)goperl_resp_word(resp, resp_len, 1);
@@ -802,23 +843,15 @@ static STRLEN goperl_infix_plugin(pTHX_ char *opname, STRLEN oplen,
         memcpy(buf, &kind, 8);
         memcpy(buf + 8, opname, oplen);
         const size_t native_below = goperl_native_enter(aTHX);
-        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_KEYWORD_METHOD_ID,
+        SV *thrown;
+        int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_KEYWORD_METHOD_ID,
                                              buf, 8 + (size_t)oplen);
         goperl_native_leave(native_below);
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_len;
         unsigned char *resp = goperl_callback_response(rc, &resp_len);
         if (resp != nullptr && resp_len >= 1) {
-            goperl_die_if_thrown(aTHX_ resp);
-            if (resp[0] == GOPERL_RESP_FAIL) {
-                char msg[512];
-                size_t ml = resp_len - 1;
-                if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-                memcpy(msg, resp + 1, ml);
-                msg[ml] = '\0';
-                free(resp);
-                Perl_croak(aTHX_ "%s", msg);
-            }
+            goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
             /* claimed: [1][1][its length][the module's struct][its
              * precedence][has parse] */
             if (goperl_resp_word(resp, resp_len, 0)) {
@@ -892,7 +925,8 @@ static unsigned char *goperl_host_call(pTHX_ goperl_gword_t kind, const goperl_g
     buf[0] = kind;
     for (uint32_t i = 0; i < nwords; i++) buf[1 + i] = words[i];
     const size_t native_below = goperl_native_enter(aTHX);
-    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_HOST_METHOD_ID, buf,
+    SV *thrown;
+    int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_HOST_METHOD_ID, buf,
                                          sizeof(goperl_gword_t) * (1 + nwords));
     goperl_native_leave(native_below);
     if (rc == GOPERL_CALLBACK_JUMPED) {
@@ -903,16 +937,7 @@ static unsigned char *goperl_host_call(pTHX_ goperl_gword_t kind, const goperl_g
     unsigned char *resp = goperl_callback_response(rc, &resp_len);
     if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "goperl: host call %u: empty response", (unsigned)kind);
-    goperl_die_if_thrown(aTHX_ resp);
-    if (resp[0] == GOPERL_RESP_FAIL) {
-        char msg[512];
-        size_t ml = resp_len - 1;
-        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-        memcpy(msg, resp + 1, ml);
-        msg[ml] = '\0';
-        free(resp);
-        Perl_croak(aTHX_ "%s", msg);
-    }
+    goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
     *rlen = resp_len;
     return resp;
 }
@@ -1140,8 +1165,8 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     buf.push_back((goperl_gword_t)op->op_type);
     goperl_pp_stack_words(aTHX_ buf);
     const size_t native_below = goperl_native_enter(aTHX);
-    int64_t rc = wasmify_callback_invoke(
-        g_go_cb, GOPERL_PP_HOOK_METHOD_ID, buf.data(),
+    SV *thrown;
+    int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_PP_HOOK_METHOD_ID, buf.data(),
         sizeof(goperl_gword_t) * buf.size());
     goperl_native_leave(native_below);
     /* nothing with a destructor may be alive across a croak */
@@ -1151,16 +1176,7 @@ static OP *goperl_call_pp_hook(pTHX_ OP *op) {
     unsigned char *resp = goperl_callback_response(rc, &resp_len);
     if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "pp hook: empty response");
-    goperl_die_if_thrown(aTHX_ resp);
-    if (resp[0] == GOPERL_RESP_FAIL) {
-        char msg[512];
-        size_t ml = resp_len - 1;
-        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-        memcpy(msg, resp + 1, ml);
-        msg[ml] = '\0';
-        free(resp);
-        Perl_croak(aTHX_ "%s", msg);
-    }
+    goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
     /* [1][next op][depth][top mark] */
     OP *const next = (OP *)(uintptr_t)goperl_resp_word(resp, resp_len, 0);
     const bool applied = resp_len >= 1 + 8 + 16 &&
@@ -1216,7 +1232,8 @@ static inline OP *goperl_exec_op(pTHX_ OP *op) {
 static void goperl_dtor_thunk(pTHX_ void *p) {
     goperl_gword_t id = GOPERL_ADDR(p);
     if (g_go_cb == 0) return;
-    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_DTOR_METHOD_ID, &id,
+    SV *thrown;
+    int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_DTOR_METHOD_ID, &id,
                                          sizeof(id));
     if (rc == GOPERL_CALLBACK_JUMPED) return;
     uint32_t resp_len;
@@ -1225,12 +1242,7 @@ static void goperl_dtor_thunk(pTHX_ void *p) {
     /* The destructor died: so does the scope's end, as with a destructor
      * of perl's own (the die goes on to the nearest eval, also when the
      * scope ends because of an earlier one). */
-    goperl_die_if_thrown(aTHX_ resp);
-    if (resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
-        SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
-        free(resp);
-        croak_sv(msg);
-    }
+    if (resp_len >= 1) goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
     free(resp);
 }
 
@@ -1259,24 +1271,35 @@ static void goperl_interrupt_now(pTHX) {
  * sub is the bridge's, no code of the program's: the debugger's DB::sub is
  * not entered for it (G_NODEBUG), as it is not on perl, which has no such
  * sub. */
+/* Whether the delivery ran to its end: a handler that dies leaves it
+ * false, which says so without asking the truth of $@ (an exception object
+ * may overload it). $@ is the program's again after a delivery that did not
+ * die, as perl's sighandler leaves it. */
+static bool g_delivered = false;
 XS(goperl_xs_deliver_pending) {
     dXSARGS;
     PERL_UNUSED_VAR(items);
     if (g_interrupt) goperl_interrupt_now(aTHX);
     PERL_ASYNC_CHECK();
+    g_delivered = true;
     XSRETURN_EMPTY;
 }
 static bool goperl_deliver_pending(pTHX) {
     if (!g_interrupt && !PL_sig_pending) return false;
     static CV *deliver = NULL;
-    if (!deliver) deliver = newXS(NULL, goperl_xs_deliver_pending, __FILE__);
+    if (!deliver) deliver = newXS(NULL, goperl_xs_deliver_pending, __FILE_NAME__);
     dSP;
     ENTER;
     SAVETMPS;
+    SV *const errsv_save = sv_2mortal(newSVsv(ERRSV));
+    const bool outer = g_delivered;
+    g_delivered = false;
     PUSHMARK(SP);
     PUTBACK;
     call_sv((SV *)deliver, G_VOID | G_DISCARD | G_NOARGS | G_EVAL | G_NODEBUG);
-    const bool died = SvTRUE(ERRSV);
+    const bool died = !g_delivered;
+    g_delivered = outer;
+    if (!died) sv_setsv(ERRSV, errsv_save);
     FREETMPS;
     LEAVE;
     return died;
@@ -1580,7 +1603,7 @@ static void encode_list(pTHX_ SV **items, I32 count, std::string &out) {
 XS(XS_goperl_go_thunk);
 
 static SV *make_go_closure(pTHX_ uint32_t id) {
-    CV *cv = newXS(NULL, XS_goperl_go_thunk, __FILE__);
+    CV *cv = newXS(NULL, XS_goperl_go_thunk, __FILE_NAME__);
     CvXSUBANY(cv).any_i32 = static_cast<int32_t>(id);
     return sv_2mortal(newRV_noinc((SV *)cv));
 }
@@ -1667,13 +1690,12 @@ static void goperl_go_dispatch(pTHX_ int32_t func_id, SV **args, I32 nargs,
     if (status != ENV_OK) {
         uint32_t elen = r.get_u32();
         const char *ep = r.get_bytes(elen);
-        char msg[512];
-        size_t n = (ep && !r.fail) ? elen : 0;
-        if (n > sizeof(msg) - 1) n = sizeof(msg) - 1;
-        memcpy(msg, ep ? ep : "", n);
-        msg[n] = '\0';
+        /* the error's text, whole, in Go's encoding (UTF-8) */
+        const size_t n = (ep && !r.fail) ? elen : 0;
+        SV *const msg = n ? newSVpvn_flags(ep, n, SVs_TEMP | (is_utf8_string((const U8 *)ep, n) ? SVf_UTF8 : 0))
+                          : newSVpvs_flags("Go function dispatch failed", SVs_TEMP);
         free(resp);
-        Perl_croak(aTHX_ "%s", n ? msg : "Go function dispatch failed");
+        croak_sv(msg);
     }
     uint32_t count = r.get_u32();
     out.reserve(count);
@@ -1750,7 +1772,8 @@ XS(XS_goperl_native_thunk) {
     req[2] = (goperl_gword_t)(int64_t)entry_errno;
     goperl_pp_stack_fill(aTHX_ req + 3);
     const size_t native_below = goperl_native_enter(aTHX);
-    int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_NATIVE_METHOD_ID, req, sizeof req);
+    SV *thrown;
+    int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_NATIVE_METHOD_ID, req, sizeof req);
     goperl_native_leave(native_below);
     if (rc == GOPERL_CALLBACK_JUMPED) return;
 
@@ -1759,16 +1782,7 @@ XS(XS_goperl_native_thunk) {
     if (resp == nullptr || resp_len < 1)
         Perl_croak(aTHX_ "native XS dispatch: empty response");
 
-    goperl_die_if_thrown(aTHX_ resp);
-    if (resp[0] == GOPERL_RESP_FAIL) { /* the rest is the croak message */
-        char msg[512];
-        size_t n = resp_len - 1;
-        if (n > sizeof(msg) - 1) n = sizeof(msg) - 1;
-        memcpy(msg, resp + 1, n);
-        msg[n] = '\0';
-        free(resp);
-        Perl_croak(aTHX_ "%s", msg);
-    }
+    goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
     /* [1][depth][top mark] */
     const bool applied = resp_len >= 1 + 16 && goperl_pp_stack_apply(aTHX_ resp + 1, resp_len - 1);
     free(resp);
@@ -1993,7 +2007,7 @@ static void install_op_cvs(pTHX) {
         {GOP_NEWA, XS_goperl_op_newa},   {GOP_NEWH, XS_goperl_op_newh},
     };
     for (const auto &op : ops)
-        g_op_cv[op.idx] = newXS(NULL, op.body, __FILE__);
+        g_op_cv[op.idx] = newXS(NULL, op.body, __FILE_NAME__);
 }
 
 /* The eval wrapper (run via eval_pv): redirect STDOUT/STDERR onto in-memory
@@ -2230,14 +2244,19 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archnam
     const bool had_perl5opt = perl5opt_env != nullptr;
     if (had_perl5opt) {
         perl5opt = perl5opt_env;
-        unsetenv("PERL5OPT");
+        if (unsetenv("PERL5OPT") != 0) {
+            perl_destruct(g_my_perl);
+            perl_free(g_my_perl);
+            g_my_perl = nullptr;
+            return 0;
+        }
     }
     /* before anything is compiled: an op is given its routine then */
     numbers_wrap_builtins();
     const int parse_failed =
         perl_parse(g_my_perl, xs_init, argc, argv, nullptr);
-    if (had_perl5opt) setenv("PERL5OPT", perl5opt.c_str(), 1);
-    if (parse_failed) {
+    /* the environment as it was, or no interpreter */
+    if ((had_perl5opt && setenv("PERL5OPT", perl5opt.c_str(), 1) != 0) || parse_failed) {
         perl_destruct(g_my_perl);
         perl_free(g_my_perl);
         g_my_perl = nullptr;
@@ -2274,7 +2293,7 @@ uint64_t perl_new(const char *lib_dir, const char *site_dir, const char *archnam
     {
         PERL_SET_CONTEXT(g_my_perl);
         dTHX;
-        newXS("main::__plwasm_go_call", XS___plwasm_go_call, __FILE__);
+        newXS("main::__plwasm_go_call", XS___plwasm_go_call, __FILE_NAME__);
         install_op_cvs(aTHX);
     }
     g_go_cb = 0;
@@ -2466,6 +2485,23 @@ extern "C" const char *goperl_pack_address(const char *p) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) + base));
 }
 
+/* Whether addr, an address native code handed over, is one of this memory:
+ * *at is then its address here. Native code has this memory at the host's
+ * base of it; without a base there is no native code, and every address is
+ * this memory's. */
+extern "C" int goperl_memory_address(UV addr, UV *at) {
+    const uint64_t base = g_hostwords.membase;
+    const uint64_t a = (uint64_t)addr;
+    if (!base) {
+        *at = addr;
+        return 1;
+    }
+    const uint64_t size = static_cast<uint64_t>(__builtin_wasm_memory_size(0)) << 16;
+    if (a < base || a - base >= size) return 0;
+    *at = (UV)(a - base);
+    return 1;
+}
+
 extern "C" SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len) {
     const uint64_t base = g_hostwords.membase;
     const uint64_t a = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
@@ -2499,6 +2535,31 @@ extern "C" SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len) {
     }
     /* newSVpv and newSVpvn make undef of a null pointer */
     return len < 0 ? newSVpv(p, 0) : newSVpvn(p, static_cast<STRLEN>(len));
+}
+
+/* Whether the host can be asked about its socket addresses: it has given
+ * the instance its dispatcher. */
+extern "C" int goperl_host_sockaddr_answered(void) { return g_go_cb != 0; }
+
+/* The host's answer about a socket address of its C library
+ * (GOPERL_SOCKADDR_METHOD_ID): the request of req_len bytes at req goes
+ * out; the bytes of the answer after its status come back as a mortal
+ * string, or NULL for an address the other side has no form of. */
+extern "C" SV *goperl_host_sockaddr(pTHX_ const void *req, size_t req_len) {
+    if (!g_go_cb)
+        Perl_croak(aTHX_ "goperl: the host's socket addresses are shown, and the host has no dispatcher "
+                         "to turn them into this C library's");
+    const int64_t rc =
+        wasmify_callback_invoke(g_go_cb, GOPERL_SOCKADDR_METHOD_ID, const_cast<void *>(req), req_len);
+    if (rc == GOPERL_CALLBACK_JUMPED) Perl_croak(aTHX_ "goperl: asking the host about a socket address failed");
+    uint32_t resp_len;
+    unsigned char *resp = goperl_callback_response(rc, &resp_len);
+    if (resp == nullptr || resp_len < 1) Perl_croak(aTHX_ "goperl: a socket address: empty response");
+    SV *const rest = newSVpvn_flags(reinterpret_cast<const char *>(resp + 1), resp_len - 1, SVs_TEMP);
+    const unsigned char status = resp[0];
+    free(resp);
+    if (status != GOPERL_RESP_OK) Perl_croak(aTHX_ "goperl: a socket address: %" SVf, SVfARG(rest));
+    return resp_len > 1 ? rest : NULL;
 }
 
 /* ---- what native code made that the interpreter is handed ---------------- */
@@ -3203,7 +3264,7 @@ void perl_register_native_xs(uint64_t h, const char *name, int32_t fn_id) {
     if (!g_my_perl || h == 0 || !name || !*name) return;
     PERL_SET_CONTEXT(g_my_perl);
     dTHX;
-    CV *cv = newXS(name, XS_goperl_native_thunk, __FILE__);
+    CV *cv = newXS(name, XS_goperl_native_thunk, __FILE_NAME__);
     CvXSUBANY(cv).any_i32 = fn_id;
 }
 
@@ -3218,21 +3279,19 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
     PERL_UNUSED_ARG(sv);
     if (g_go_cb != 0) {
         goperl_gword_t id = GOPERL_ADDR(mg->mg_ptr);
-        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_FREE_METHOD_ID,
+        SV *thrown;
+        int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_MG_FREE_METHOD_ID,
                                              &id, sizeof(id));
         if (rc != GOPERL_CALLBACK_JUMPED) {
             uint32_t resp_len;
             unsigned char *resp = goperl_callback_response(rc, &resp_len);
-            /* a svt_free of native code died ([0]+message): the free dies
-             * with it, as perl's mg_free lets a die out. The MAGIC is not
-             * touched: the hook may have had the value freed once more
-             * before it died (Variable::Magic's free does, for the rest of
-             * the chain), and that inner free has freed this MAGIC too. */
-            if (resp != nullptr && resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
-                SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
-                free(resp);
-                croak_sv(msg);
-            }
+            /* a svt_free of native code died (a thrown value, or [0] and
+             * the message): the free dies with it, as perl's mg_free lets a
+             * die out. The MAGIC is not touched: the hook may have had the
+             * value freed once more before it died (Variable::Magic's free
+             * does, for the rest of the chain), and that inner free has
+             * freed this MAGIC too. */
+            if (resp != nullptr && resp_len >= 1) goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
             free(resp);
         }
     }
@@ -3252,18 +3311,14 @@ static int goperl_host_mg_free(pTHX_ SV *sv, MAGIC *mg) {
 static int goperl_host_mg_local(pTHX_ SV *nsv, MAGIC *mg) {
     if (g_go_cb != 0) {
         goperl_gword_t req[2] = {GOPERL_ADDR(mg->mg_ptr), GOPERL_ADDR(nsv)};
-        int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_MG_LOCAL_METHOD_ID,
+        SV *thrown;
+        int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_MG_LOCAL_METHOD_ID,
                                              req, sizeof(req));
         if (rc == GOPERL_CALLBACK_JUMPED) return 0;
         uint32_t resp_len;
         unsigned char *resp = goperl_callback_response(rc, &resp_len);
         if (resp == nullptr) return 0;
-        goperl_die_if_thrown(aTHX_ resp);
-        if (resp_len >= 1 && resp[0] == GOPERL_RESP_FAIL) {
-            SV *msg = newSVpvn_flags((const char *)resp + 1, resp_len - 1, SVs_TEMP);
-            free(resp);
-            croak_sv(msg);
-        }
+        if (resp_len >= 1) goperl_die_if_failed(aTHX_ resp, resp_len, thrown);
         free(resp);
     }
     return 0;
@@ -3761,7 +3816,9 @@ enum {
     GOPERL_INT_SIGMASK = 63,        /* a: how (0 block, 1 unblock, 2 set, 3
                                      * ask), b: the mask (a bit for each
                                      * signal of the program's, 1 << (sig -
-                                     * 1)) -> the mask before; or a: 4, b:
+                                     * 1)) -> the mask before; second: 0
+                                     * or the errno of a change that
+                                     * failed; or a: 4, b:
                                      * the address of a sigset_t of this
                                      * memory -> the mask it holds */
     GOPERL_INT_SIGSET_STORE = 64,   /* a: the address of a sigset_t of this
@@ -5409,14 +5466,18 @@ static inline SV *goperl_static_immortal(pTHX_ uint64_t v) {
     return NULL;
 }
 
-/* The scalar a number native code handed an operation is, NULL for 0. A
- * freed scalar is refused unless the operation reads its head alone
- * (freed): a freed scalar has no flags left, and perl reads it as undef
- * there, as Tk reads one it has freed (its Tcl_SetVar returns the scalar
- * it frees, and asks SvROK and SvPOK of it). */
-static inline SV *goperl_sv_arg(pTHX_ uint64_t v, int32_t op, bool freed = false) {
+/* The scalar a number native code handed an operation is, NULL for 0
+ * where the operation takes no scalar (nullable; the scalar an operation
+ * works on is never NULL). A freed scalar is refused unless the operation
+ * reads its head alone (freed): a freed scalar has no flags left, and perl
+ * reads it as undef there, as Tk reads one it has freed (its Tcl_SetVar
+ * returns the scalar it frees, and asks SvROK and SvPOK of it). */
+static inline SV *goperl_sv_arg(pTHX_ uint64_t v, int32_t op, bool freed = false, bool nullable = true) {
     SV *const sv = (SV *)(uintptr_t)v;
-    if (!v) return sv;
+    if (!v) {
+        if (!nullable) goperl_arg_refuse(aTHX_ op, v, "a scalar");
+        return sv;
+    }
     if (!goperl_sv_head(aTHX_ sv)) {
         if (SV *const imm = goperl_static_immortal(aTHX_ v)) return imm;
         goperl_arg_refuse(aTHX_ op, v, "a scalar");
@@ -5445,6 +5506,15 @@ static inline void *goperl_mem_arg(pTHX_ uint64_t v, size_t size, int32_t op, co
 #define GOPERL_CVARG(v) ((CV *)goperl_sv_arg(aTHX_ (v), op))
 #define GOPERL_GVARG(v) ((GV *)goperl_sv_arg(aTHX_ (v), op))
 #define GOPERL_IOARG(v) ((IO *)goperl_sv_arg(aTHX_ (v), op))
+/* The scalar, array, hash, code, glob or handle an operation works on (its
+ * a): never NULL, as perl's functions take none. */
+#define GOPERL_SVSUBJ(v) goperl_sv_arg(aTHX_ (v), op, false, false)
+#define GOPERL_AVSUBJ(v) ((AV *)goperl_sv_arg(aTHX_ (v), op, false, false))
+#define GOPERL_HVSUBJ(v) ((HV *)goperl_sv_arg(aTHX_ (v), op, false, false))
+#define GOPERL_HVSUBJ_COMMON(v) ((HV *)goperl_sv_arg(aTHX_ (v), op, true, false))
+#define GOPERL_CVSUBJ(v) ((CV *)goperl_sv_arg(aTHX_ (v), op, false, false))
+#define GOPERL_GVSUBJ(v) ((GV *)goperl_sv_arg(aTHX_ (v), op, false, false))
+#define GOPERL_IOSUBJ(v) ((IO *)goperl_sv_arg(aTHX_ (v), op, false, false))
 #define GOPERL_MEMARG(type, v) ((type *)goperl_mem_arg(aTHX_ (v), sizeof(type), op, "a " #type))
 /* A value an operation only stores, into a slot of a container or of a
  * scalar, is not read there, by perl either: it passes as it is (a module
@@ -5661,7 +5731,8 @@ static goperl_gword_t goperlio_hook(pTHX_ goperlio_class_t *cls, int slot, PerlI
     if (nw) memcpy(buf + sizeof head, w, 8 * nw);
     if (sl) memcpy(buf + 8 * (5 + nw), str, sl);
     const size_t native_below = goperl_native_enter(aTHX);
-    const int64_t rc = wasmify_callback_invoke(g_go_cb, GOPERL_PERLIO_METHOD_ID, buf, n);
+    SV *thrown;
+    const int64_t rc = goperl_invoke_native(aTHX_ &thrown, GOPERL_PERLIO_METHOD_ID, buf, n);
     goperl_native_leave(native_below);
     free(buf);
     if (rc == GOPERL_CALLBACK_JUMPED) {
@@ -5671,16 +5742,7 @@ static goperl_gword_t goperlio_hook(pTHX_ goperlio_class_t *cls, int slot, PerlI
     uint32_t rlen;
     unsigned char *resp = goperl_callback_response(rc, &rlen);
     if (resp == nullptr || rlen < 1) Perl_croak(aTHX_ "PerlIO layer hook: empty response");
-    goperl_die_if_thrown(aTHX_ resp);
-    if (resp[0] == GOPERL_RESP_FAIL) {
-        char msg[512];
-        size_t ml = rlen - 1;
-        if (ml > sizeof(msg) - 1) ml = sizeof(msg) - 1;
-        memcpy(msg, resp + 1, ml);
-        msg[ml] = '\0';
-        free(resp);
-        Perl_croak(aTHX_ "%s", msg);
-    }
+    goperl_die_if_failed(aTHX_ resp, rlen, thrown);
     const goperl_gword_t r = goperl_resp_word(resp, rlen, 0);
     free(resp);
     return r;
@@ -5885,7 +5947,7 @@ static uint64_t goperlio_call(pTHX_ const char *s, uint64_t slen) {
     goperl_gword_t nw = 0;
     if (!s || slen < 8) Perl_croak(aTHX_ "goperl: PerlIO call: short request");
     memcpy(&nw, s, 8);
-    if (nw < 4 || slen < 8 * nw) Perl_croak(aTHX_ "goperl: PerlIO call: short request");
+    if (nw < 4 || nw > slen / 8) Perl_croak(aTHX_ "goperl: PerlIO call: short request");
     std::vector<goperl_gword_t> w(nw);
     memcpy(w.data(), s, 8 * nw);
     const char *tail = s + 8 * nw;
@@ -5964,7 +6026,7 @@ static uint64_t goperlio_call(pTHX_ const char *s, uint64_t slen) {
                 fn)(aTHX_ f, (void *)(uintptr_t)a[1], (Size_t)a[2]);
         case GOPERLIO_SIG_WRITE:
             GOPERLIO_ARGS(3);
-            if (!a[1] && (uint64_t)(tail - s) + a[2] > slen)
+            if (!a[1] && a[2] > slen - (uint64_t)(tail - s))
                 Perl_croak(aTHX_ "goperl: PerlIO call: short request");
             return (uint64_t)(int64_t)reinterpret_cast<SSize_t (*)(pTHX_ PerlIO *, const void *,
                                                                    Size_t)>(fn)(
@@ -6044,6 +6106,7 @@ static MGVTBL goperl_foreign_vtbl = {NULL, NULL, NULL, NULL, goperl_foreign_free
                                      NULL, NULL, NULL};
 /* v is stored in the container: one outside the memory marks it. */
 static SV *goperl_store_into(pTHX_ SV *container, SV *v) {
+    if (!container) return v; /* no hash: hv_common stores nothing */
     /* a freed hash takes nothing (hv_common answers NULL for it) */
     if (goperl_foreign(v) && !SvIS_FREED(container) &&
         !mg_findext(container, PERL_MAGIC_ext, &goperl_foreign_vtbl))
@@ -6053,6 +6116,7 @@ static SV *goperl_store_into(pTHX_ SV *container, SV *v) {
 /* Whether the container may hold such values: a store into it looks at
  * the slot it replaces first. */
 static bool goperl_holds_foreign(SV *container) {
+    if (!container) return false;
     return SvRMAGICAL(container) && mg_findext(container, PERL_MAGIC_ext, &goperl_foreign_vtbl);
 }
 /* The slot a store is about to replace: a value outside the memory in it
@@ -6061,8 +6125,32 @@ static void goperl_slot_unforeign(SV **slot) {
     if (slot && goperl_foreign(*slot)) *slot = NULL;
 }
 
+/* The string of an operation, of which the operation reads n bytes: it dies
+ * when the string has fewer (slen). */
+static const char *goperl_sbytes(pTHX_ const char *s, STRLEN slen, uint64_t n) {
+    if (n > slen)
+        Perl_croak(aTHX_ "goperl: an operation reads %" UVuf " bytes of a string of %" UVuf, (UV)n,
+                   (UV)slen);
+    return s ? s : "";
+}
+
+/* The second of the two strings an operation's string s of slen bytes holds
+ * (the first, a NUL, the second): it dies when s holds one alone. */
+static const char *goperl_second_string(pTHX_ const char *s, STRLEN slen) {
+    const STRLEN first = s ? strnlen(s, slen) : 0;
+    if (first >= slen) Perl_croak(aTHX_ "goperl: an operation's string of %" UVuf " bytes holds one string", (UV)slen);
+    return s + first + 1;
+}
+
+/* The first n words of an operation's string s of slen bytes into w; a word
+ * the string does not hold is 0. */
+static void goperl_swords(const char *s, STRLEN slen, uint64_t *w, size_t n) {
+    memset(w, 0, n * sizeof *w);
+    if (s) memcpy(w, s, slen < n * sizeof *w ? slen : n * sizeof *w);
+}
+
 static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64_t c,
-                                   const char *s) {
+                                   const char *s, STRLEN slen) {
     const int32_t op = GOPERL_OP_INTERNAL;
     /* a: the token or the address; c: the selector, and in its high half a
      * value that goes with an address in b */
@@ -6117,8 +6205,10 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
          * a noncharacter, a code point above Unicode. Its warnings are
          * perl's, at the statement running. */
         static uint64_t w[4 + 2];
-        const U8 *const p = (const U8 *)(s ? s : "");
         const uint32_t what = (uint32_t)(lo >> 32);
+        /* the bytes are b of s, except for an encode, whose b is the code point */
+        const U8 *const p =
+            (const U8 *)goperl_sbytes(aTHX_ s, slen, (what & 0xff) == GOPERL_UTF8_ENCODE ? 0 : b);
         const U32 flags = (U32)lo;
         STRLEN retlen = 0;
         U32 errors = 0;
@@ -6158,7 +6248,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     }
     case GOPERL_INT_HASH: {
         U32 hash;
-        PERL_HASH(hash, s ? s : "", (STRLEN)b);
+        PERL_HASH(hash, goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
         return hash;
     }
     case GOPERL_INT_PUSHSTACK:
@@ -6217,7 +6307,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         const int ran = __wasmify_signal_wait_mask(lo != 0, mask, &old);
         return goperl_two(old, (uint64_t)ran);
     }
-    case GOPERL_INT_SIGMASK:
+    case GOPERL_INT_SIGMASK: {
         if (lo == 4) {
             /* the set of POSIX::SigSet native code hands sigprocmask as it
              * is: one byte here, naming a set (wasmify's host_signal.cc) */
@@ -6225,8 +6315,21 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
                 aTHX_ b, 1, GOPERL_OP_INTERNAL, "a sigset_t"));
         }
         /* sigprocmask and pthread_sigmask of native code: the program's
-         * mask, as POSIX::sigprocmask changes it (wasmify's host_signal.cc) */
-        return __wasmify_signal_native_mask((int)lo, b);
+         * mask, as POSIX::sigprocmask changes it (wasmify's host_signal.cc).
+         * -> the mask before; second: 0, or the errno of a change that
+         * failed, which leaves the mask as it was (the first is the mask
+         * then) */
+        const int saved = errno;
+        uint64_t old = 0;
+        int failure = 0;
+        if (__wasmify_signal_native_mask((int)lo, b, &old) != 0) {
+            failure = errno;
+            if (__wasmify_signal_native_mask(3, 0, &old) != 0)
+                Perl_croak(aTHX_ "goperl: the signal mask cannot be read: %s", Strerror(errno));
+        }
+        errno = saved;
+        return goperl_two(old, (uint64_t)failure);
+    }
     case GOPERL_INT_RAISE: {
         /* a signal native code's call raised for the process (SIGPIPE of a
          * write into a pipe nobody reads), which the kernel delivers as
@@ -6263,9 +6366,9 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_SCAN_VSTRING: {
         /* the spelling native code has, ending where it ends: scan_vstring
          * may look at the byte at the end */
-        SV *sv = GOPERL_SVARG(lo);
+        SV *sv = GOPERL_SVSUBJ(lo);
         if (!sv) Perl_croak(aTHX_ "goperl: scan_vstring into no SV");
-        std::string spelling(s ? s : "", s ? (size_t)b : 0);
+        std::string spelling(goperl_sbytes(aTHX_ s, slen, b), (size_t)b);
         const char *begin = spelling.c_str();
         const char *end = Perl_scan_vstring(aTHX_ begin, begin + spelling.size(), sv);
         return (uint64_t)(end - begin);
@@ -6299,19 +6402,25 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         goperl_save_mem(aTHX_ loc, width, kind);
         return 0;
     }
-    case GOPERL_INT_SAVE_MEM:
+    case GOPERL_INT_SAVE_MEM: { /* the bytes saved are in this memory */
+        const uint64_t width = (b & 0xFF) == GOPERL_SAVEK_INT ? (b >> 8) : sizeof(void *);
+        const uint64_t end = (uint64_t)__builtin_wasm_memory_size(0) << 16;
+        if (!lo || lo >= end || end - lo < width) goperl_arg_refuse(aTHX_ op, lo, "the memory to save");
         goperl_save_mem(aTHX_ (void *)(uintptr_t)lo, (int)(b >> 8), (int)(b & 0xFF));
         return 0;
+    }
     case GOPERL_INT_SAVE_AVELEM: {
-        AV *av = GOPERL_AVARG(lo);
+        AV *av = GOPERL_AVSUBJ(lo);
         const SSize_t ix = (SSize_t)(b >> 8);
         if (!av || SvTYPE((SV *)av) != SVt_PVAV || ix < 0 || ix > AvMAX(av))
             Perl_croak(aTHX_ "goperl: a save of a slot an array does not have");
         goperl_save_mem(aTHX_ (void *)&AvARRAY(av)[ix], (int)sizeof(SV *), (int)(b & 0xFF));
         return 0;
     }
-    case GOPERL_INT_LEAVE_SCOPE:
-        if ((I32)(int64_t)b < PL_savestack_ix) leave_scope((I32)(int64_t)b);
+    case GOPERL_INT_LEAVE_SCOPE: /* an index of the save stack; one at or
+                 * above its top leaves nothing, as perl's LEAVE_SCOPE */
+        if ((int64_t)b < 0) Perl_croak(aTHX_ "goperl: LEAVE_SCOPE(%" IVdf ")", (IV)(int64_t)b);
+        if ((int64_t)b < PL_savestack_ix) leave_scope((I32)(int64_t)b);
         return 0;
     case GOPERL_INT_CV_GET:
     case GOPERL_INT_CV_SET: {
@@ -6362,7 +6471,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_PAD_NEW:
         return (uint64_t)(uintptr_t)pad_new((int)b);
     case GOPERL_INT_PADNAME_NEW:
-        return (uint64_t)(uintptr_t)newPADNAMEpvn(s ? s : "", (STRLEN)b);
+        return (uint64_t)(uintptr_t)newPADNAMEpvn(goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
     case GOPERL_INT_PADNAME_FREE:
         if (lo) PadnameREFCNT_dec(GOPERL_MEMARG(PADNAME, lo));
         return 0;
@@ -6387,13 +6496,13 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         return 0;
     }
     case GOPERL_INT_MROMETA: {
-        HV *const hv = (HV *)GOPERL_SVARG(lo);
+        HV *const hv = (HV *)GOPERL_SVSUBJ(lo);
         if (!hv || SvTYPE((SV *)hv) != SVt_PVHV) Perl_croak(aTHX_ "goperl: HvMROMETA of something that is no hash");
         if (b) return (uint64_t)(uintptr_t)HvMROMETA(hv);
         return HvHasAUX(hv) ? (uint64_t)(uintptr_t)HvAUX(hv)->xhv_mro_meta : 0;
     }
     case GOPERL_INT_MRO_RESOLVE: {
-        HV *const hv = (HV *)GOPERL_SVARG(lo);
+        HV *const hv = (HV *)GOPERL_SVSUBJ(lo);
         const struct mro_alg *const alg = (const struct mro_alg *)(uintptr_t)b;
         if (!hv || SvTYPE((SV *)hv) != SVt_PVHV || !alg) Perl_croak(aTHX_ "goperl: a resolve of no stash or no algorithm");
         /* an algorithm that is registered under its name */
@@ -6409,7 +6518,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
          * memory, which stays, with what native code's op says. */
         if (b < 32) return 0;
         goperl_gword_t w[4];
-        memcpy(w, s, sizeof w);
+        memcpy(w, goperl_sbytes(aTHX_ s, slen, sizeof w), sizeof w);
         const unsigned type = (unsigned)(w[0] & 0xffff);
         if (type >= OP_max && type != OP_CUSTOM) return 0;
         OP *const o = lo ? GOPERL_MEMARG(OP, lo) : (OP *)PerlMemShared_calloc(1, sizeof(LISTOP));
@@ -6445,7 +6554,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         return lo ? (uint64_t)(uintptr_t)CopHINTHASH_get(GOPERL_MEMARG(COP, lo)) : 0;
     case GOPERL_INT_HINTHASH_FETCH:
         return (uint64_t)(uintptr_t)Perl_refcounted_he_fetch_pvn(
-            aTHX_ (const struct refcounted_he *)(uintptr_t)lo, s ? s : "",
+            aTHX_ (const struct refcounted_he *)(uintptr_t)lo, goperl_sbytes(aTHX_ s, slen, (uint32_t)b),
             (STRLEN)(uint32_t)b, 0, (U32)(b >> 32));
     case GOPERL_INT_HINTHASH_2HV:
         return (uint64_t)(uintptr_t)(SV *)Perl_refcounted_he_chain_2hv(
@@ -6453,7 +6562,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     case GOPERL_INT_OBJ_FIELDS:
     case GOPERL_INT_OBJ_MAXFIELD_SET:
     case GOPERL_INT_OBJ_FIELDS_NEW: {
-        SV *obj = GOPERL_SVARG(lo);
+        SV *obj = GOPERL_SVSUBJ(lo);
         if (!obj || SvTYPE(obj) != SVt_PVOBJ)
             Perl_croak(aTHX_ "goperl: the fields of something that is not an object");
         if (sel == GOPERL_INT_OBJ_FIELDS) {
@@ -6510,8 +6619,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
             w[12] = (uint64_t)(int64_t)PL_statcache.st_blocks;
             return (uint64_t)(uintptr_t)w;
         }
-        if (!s) return 0;
-        memcpy(w, s, sizeof w);
+        memcpy(w, goperl_sbytes(aTHX_ s, slen, sizeof w), sizeof w);
         PL_statcache.st_dev = (dev_t)w[0];
         PL_statcache.st_ino = (ino_t)w[1];
         PL_statcache.st_mode = (mode_t)w[2];
@@ -6541,14 +6649,14 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
     }
     case GOPERL_INT_FILTER_READ:
         return (uint64_t)(uint32_t)filter_read((int)(int32_t)(uint32_t)(b >> 32),
-                                               GOPERL_SVARG(lo), (int)(int32_t)(uint32_t)b);
+                                               GOPERL_SVSUBJ(lo), (int)(int32_t)(uint32_t)b);
     case GOPERL_INT_FILTER_ID: {
         SV *datasv = GOPERL_SVARG(lo);
         if (!datasv || SvTYPE(datasv) != SVt_PVIO) return 0;
         return goperl_filter_id(DPTR2FPTR(filter_t, IoANY(datasv)));
     }
     case GOPERL_INT_SV_GETS: /* b: the handle, c_hi: append */
-        return sv_gets(GOPERL_SVARG(lo), GOPERL_MEMARG(PerlIO, b), (I32)(int32_t)c_hi) ? 1 : 0;
+        return sv_gets(GOPERL_SVSUBJ(lo), GOPERL_MEMARG(PerlIO, b), (I32)(int32_t)c_hi) ? 1 : 0;
     case GOPERL_INT_BHK_REGISTER: {
         if (g_native_bhk_n >= GOPERL_BHK_MAX)
             Perl_croak(aTHX_ "goperl: too many block hooks of native code");
@@ -6570,7 +6678,7 @@ static uint64_t goperl_internal_op(pTHX_ int sel, uint64_t a, uint64_t b, uint64
         /* just enough of a parser for the compiler's functions, as a module
          * makes one when there is none; freed with the scope */
         goperl_gword_t w[2] = {NOLINE, NOLINE};
-        if (s) memcpy(w, s, sizeof w);
+        if (slen >= sizeof w) memcpy(w, s, sizeof w);
         yy_parser *p;
         Newxz(p, 1, yy_parser);
         p->copline = (line_t)w[0];
@@ -6595,21 +6703,36 @@ uint32_t perl_xs_op(void) {
      * use the box for operations of its own */
     const int32_t op = g_opbox.op;
     const uint64_t a = g_opbox.a, b = g_opbox.b, c = g_opbox.c;
-    uint32_t slen = g_opbox.slen;
-    if (slen > GOPERL_OPBOX_STR) slen = GOPERL_OPBOX_STR;
+    const uint32_t slen = g_opbox.slen;
+    if (!g_my_perl) {
+        g_opbox.result = 0;
+        return 0;
+    }
+    if (slen > GOPERL_OPBOX_STR) {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        Perl_croak(aTHX_ "goperl: operation %d: a string of %u bytes in the box, which holds %d", (int)op,
+                   (unsigned)slen, GOPERL_OPBOX_STR);
+    }
     char s[GOPERL_OPBOX_STR + 1];
     memcpy(s, g_opbox.s, slen);
     s[slen] = '\0';
-    g_opbox.result = g_my_perl ? goperl_xs_run(op, a, b, c, s, slen) : 0;
+    g_opbox.result = goperl_xs_run(op, a, b, c, s, slen);
     return 0;
 }
 
-/* The string of an operation that comes this way (one longer than the box)
- * ends at its first NUL. */
+/* An operation whose string is longer than the box. s is the bridge's copy
+ * of the request's string: its slen bytes and a NUL. A string with no NUL
+ * where slen says it ends is one whose length the host did not say. */
 uint64_t perl_xs_helper(uint64_t h, int32_t op, uint64_t a, uint64_t b, uint64_t c,
-                        const char *s) {
+                        const char *s, uint64_t slen) {
     if (!g_my_perl || h == 0) return 0;
-    return goperl_xs_run(op, a, b, c, s, s ? strlen(s) : 0);
+    if (s ? s[strnlen(s, (size_t)slen)] != '\0' : slen != 0) {
+        PERL_SET_CONTEXT(g_my_perl);
+        dTHX;
+        Perl_croak(aTHX_ "goperl: operation %d: the string is not %" UVuf " bytes", (int)op, (UV)slen);
+    }
+    return goperl_xs_run(op, a, b, c, s, (STRLEN)slen);
 }
 
 /* An operation of native code; s is its string, slen bytes (with a NUL
@@ -6621,16 +6744,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     dTHX;
     switch (op) {
     case GOPERL_OP_SV_IV: /* b bit 0: as an unsigned value; bit 1: no get magic */
-        return goperl_sv_integer(aTHX_ GOPERL_SVARG(a), cBOOL(b & 1), cBOOL(b & 2));
+        return goperl_sv_integer(aTHX_ GOPERL_SVSUBJ(a), cBOOL(b & 1), cBOOL(b & 2));
     case GOPERL_OP_SV_PV: { /* -> the address of the string; second: its length */
         STRLEN len = 0;
-        const char *p = SvPV(GOPERL_SVARG(a), len);
+        const char *p = SvPV(GOPERL_SVSUBJ(a), len);
         return goperl_two(GOPERL_ADDR(p), (uint64_t)len);
     }
     case GOPERL_OP_NEW_IV:
         return (uint64_t)(uintptr_t)newSViv((IV)(int64_t)a);
     case GOPERL_OP_NEW_PVN:
-        return (uint64_t)(uintptr_t)newSVpvn(s ? s : "", (STRLEN)b);
+        return (uint64_t)(uintptr_t)newSVpvn(goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
     case GOPERL_OP_SV_MORTAL:
         return (uint64_t)(uintptr_t)sv_2mortal(GOPERL_SVARG(a));
     case GOPERL_OP_NEW_UV:
@@ -6640,17 +6763,17 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_NEW_HV:
         return (uint64_t)(uintptr_t)(SV *)newHV();
     case GOPERL_OP_NEW_RV_INC:
-        return (uint64_t)(uintptr_t)newRV_inc(GOPERL_SVARG(a));
+        return (uint64_t)(uintptr_t)newRV_inc(GOPERL_SVSUBJ(a));
     case GOPERL_OP_AV_PUSH: { /* steals a ref, like the C API */
-        AV *const av = GOPERL_AVARG(a);
+        AV *const av = GOPERL_AVSUBJ(a);
         av_push(av, goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b)));
         return 0;
     }
     case GOPERL_OP_AV_LEN:
-        return (uint64_t)(int64_t)av_len(GOPERL_AVARG(a));
+        return (uint64_t)(int64_t)av_len(GOPERL_AVSUBJ(a));
     case GOPERL_OP_AV_FETCH: { /* -> the element; second: the address of
                  * the slot av_fetch gave (native code's SV** is that slot) */
-        SV **slot = av_fetch(GOPERL_AVARG(a), (SSize_t)(int64_t)b, FALSE);
+        SV **slot = av_fetch(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b, FALSE);
         return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_STORE: { /* steals a ref */
@@ -6671,7 +6794,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_GV_STASHPV: /* a = flags, s = the name */
         return (uint64_t)(uintptr_t)gv_stashpvn(s ? s : "", (U32)slen, (I32)(int64_t)a);
     case GOPERL_OP_SV_BLESS:
-        return (uint64_t)(uintptr_t)sv_bless(GOPERL_SVARG(a),
+        return (uint64_t)(uintptr_t)sv_bless(GOPERL_SVSUBJ(a),
                                              GOPERL_HVARG(b));
     case GOPERL_OP_SV_RV: { /* SvRV token when SvROK, else 0 */
         SV *sv = goperl_sv_arg(aTHX_ a, op, true);
@@ -6695,12 +6818,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(flags & SVTYPEMASK);
     }
     case GOPERL_OP_SV_ISA:
-        return sv_isa(GOPERL_SVARG(a), s ? s : "") ? 1 : 0;
+        return sv_isa(GOPERL_SVARG(a), s ? s : "") ? 1 : 0; /* NULL: false, as perl's */
     case GOPERL_OP_SV_DERIVED_FROM:
-        return sv_derived_from(GOPERL_SVARG(a), s ? s : "") ? 1 : 0;
+        return sv_derived_from(GOPERL_SVSUBJ(a), s ? s : "") ? 1 : 0;
     case GOPERL_OP_SETREF_IV: /* bless rv `a` as class s pointing at IV b */
     {
-        SV *rv = GOPERL_SVARG(a);
+        SV *rv = GOPERL_SVSUBJ(a);
         sv_setiv(newSVrv(rv, s ? s : ""), (IV)(int64_t)b);
         return (uint64_t)(uintptr_t)rv;
     }
@@ -6710,32 +6833,32 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
      * a token (an address) always one of its own; s+b carry strings or
      * strings of words. */
     case GOPERL_OP_SV_SETSV:
-        sv_setsv(GOPERL_SVARG(a), GOPERL_SVARG(b));
+        sv_setsv(GOPERL_SVSUBJ(a), GOPERL_SVARG(b));
         return 0;
     case GOPERL_OP_SV_SETSV_NOMG:
-        sv_setsv_nomg(GOPERL_SVARG(a), GOPERL_SVARG(b));
+        sv_setsv_nomg(GOPERL_SVSUBJ(a), GOPERL_SVARG(b));
         return 0;
     case GOPERL_OP_SV_SETSV_MG:
-        sv_setsv_mg(GOPERL_SVARG(a), GOPERL_SVARG(b));
+        sv_setsv_mg(GOPERL_SVSUBJ(a), GOPERL_SVARG(b));
         return 0;
     case GOPERL_OP_SV_SETIV:
-        sv_setiv(GOPERL_SVARG(a), (IV)(int64_t)b);
+        sv_setiv(GOPERL_SVSUBJ(a), (IV)(int64_t)b);
         return 0;
     case GOPERL_OP_SV_SETUV:
-        sv_setuv(GOPERL_SVARG(a), (UV)b);
+        sv_setuv(GOPERL_SVSUBJ(a), (UV)b);
         return 0;
     case GOPERL_OP_SV_SETNV: { /* b = IEEE bits */
         union { uint64_t u; double d; } cvt;
         cvt.u = b;
-        sv_setnv(GOPERL_SVARG(a), (NV)cvt.d);
+        sv_setnv(GOPERL_SVSUBJ(a), (NV)cvt.d);
         return 0;
     }
     case GOPERL_OP_SV_SETPVN:
-        sv_setpvn(GOPERL_SVARG(a), s ? s : "", (STRLEN)b);
+        sv_setpvn(GOPERL_SVSUBJ(a), goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
         return 0;
     case GOPERL_OP_SV_NV: { /* -> IEEE bits */
         union { uint64_t u; double d; } cvt;
-        cvt.d = (double)SvNV(GOPERL_SVARG(a));
+        cvt.d = (double)SvNV(GOPERL_SVSUBJ(a));
         return cvt.u;
     }
     case GOPERL_OP_NEW_NV: { /* a = IEEE bits */
@@ -6748,13 +6871,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_SV_MORTALCOPY:
         return (uint64_t)(uintptr_t)sv_mortalcopy(GOPERL_SVARG(a));
     case GOPERL_OP_SV_CATSV:
-        sv_catsv(GOPERL_SVARG(a), GOPERL_SVARG(b));
+        sv_catsv(GOPERL_SVSUBJ(a), GOPERL_SVARG(b));
         return 0;
     case GOPERL_OP_SV_CATSV_NOMG:
-        sv_catsv_nomg(GOPERL_SVARG(a), GOPERL_SVARG(b));
+        sv_catsv_nomg(GOPERL_SVSUBJ(a), GOPERL_SVARG(b));
         return 0;
     case GOPERL_OP_SV_CATPVN:
-        sv_catpvn(GOPERL_SVARG(a), s ? s : "", (STRLEN)b);
+        sv_catpvn(GOPERL_SVSUBJ(a), goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
         return 0;
     case GOPERL_OP_SV_TRUE:
         return SvTRUE(GOPERL_SVARG(a)) ? 1 : 0;
@@ -6791,7 +6914,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return f;
     }
     case GOPERL_OP_SV_CUR_SET: {
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SvFLAGS(sv), SvPVX(sv), (STRLEN)b))
             goperl_pv_host_refuse(aTHX);
         SvCUR_set(sv, (STRLEN)b);
@@ -6799,7 +6922,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_SV_GROW: { /* (c: sv_grow, not SvGROW) -> new PVX
                  * (linear-memory offset) */
-        SV *const sv = GOPERL_SVARG(a);
+        SV *const sv = GOPERL_SVSUBJ(a);
         char *p = c ? sv_grow(sv, (STRLEN)b) : SvGROW(sv, (STRLEN)b);
         return GOPERL_ADDR(p);
     }
@@ -6808,7 +6931,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_SV_CMP:
         return (uint64_t)(int64_t)sv_cmp(GOPERL_SVARG(a), GOPERL_SVARG(b));
     case GOPERL_OP_SV_RVWEAKEN:
-        sv_rvweaken(GOPERL_SVARG(a));
+        sv_rvweaken(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_SV_2CV: { /* b = lref; c = 1: -> the address of [the cv]
                  * [the glob][the stash], what sv_2cv answers in its
@@ -6833,19 +6956,19 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(uintptr_t)gv_fetchpv(s ? s : "", (I32)(int64_t)a,
                                                (svtype)(int64_t)b);
     case GOPERL_OP_AV_STORE: { /* b = sv, c = idx; takes ownership like the C API */
-        AV *const av = GOPERL_AVARG(a);
+        AV *const av = GOPERL_AVSUBJ(a);
         if (goperl_holds_foreign((SV *)av)) goperl_slot_unforeign(av_fetch(av, (SSize_t)(int64_t)c, 0));
         av_store(av, (SSize_t)(int64_t)c, goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b)));
         return 0;
     }
     case GOPERL_OP_AV_EXTEND:
-        av_extend(GOPERL_AVARG(a), (SSize_t)(int64_t)b);
+        av_extend(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b);
         return 0;
     case GOPERL_OP_AV_FILL:
-        av_fill(GOPERL_AVARG(a), (SSize_t)(int64_t)b);
+        av_fill(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b);
         return 0;
     case GOPERL_OP_AV_READ: { /* like AV_FETCH but lval-safe (never NULL slot) */
-        SV **slot = av_fetch(GOPERL_AVARG(a), (SSize_t)(int64_t)b, TRUE);
+        SV **slot = av_fetch(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b, TRUE);
         return goperl_two(slot ? (uint64_t)(uintptr_t)*slot : 0, GOPERL_ADDR(slot));
     }
     case GOPERL_OP_HV_FETCH_ENT: { /* (b = keysv, c: bit 0 lval, bit 1 an
@@ -6879,13 +7002,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_HE_VAL:
         return (uint64_t)(uintptr_t)HeVAL(GOPERL_MEMARG(HE, a));
     case GOPERL_OP_HV_ITERINIT:
-        return (uint64_t)(int64_t)hv_iterinit(GOPERL_HVARG(a));
+        return (uint64_t)(int64_t)hv_iterinit(GOPERL_HVSUBJ(a));
     case GOPERL_OP_HV_ITERNEXT: /* b = the flags of hv_iternext_flags */
-        return (uint64_t)(uintptr_t)hv_iternext_flags(GOPERL_HVARG(a), (I32)(int64_t)b);
+        return (uint64_t)(uintptr_t)hv_iternext_flags(GOPERL_HVSUBJ(a), (I32)(int64_t)b);
     case GOPERL_OP_HV_ITERKEYSV:
         return (uint64_t)(uintptr_t)hv_iterkeysv(GOPERL_MEMARG(HE, a));
     case GOPERL_OP_HV_ITERVAL: /* a = hv, b = he */
-        return (uint64_t)(uintptr_t)hv_iterval(GOPERL_HVARG(a),
+        return (uint64_t)(uintptr_t)hv_iterval(GOPERL_HVSUBJ(a),
                                                GOPERL_MEMARG(HE, b));
     case GOPERL_OP_ENTER: ENTER; return 0;
     case GOPERL_OP_LEAVE: LEAVE; return 0;
@@ -6896,13 +7019,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         I32 flags = (I32)(int64_t)c;
         if (op == GOPERL_OP_CALL_SV && !GOPERL_SVARG(a))
             goperl_arg_refuse(aTHX_ op, a, "the sub to call");
-        const char *args = s;
+        const char *args = goperl_sbytes(aTHX_ s, slen, b);
         size_t args_len = (size_t)b;
         const char *method = NULL;
         if (op == 66) {
-            method = s ? s : "";
+            method = args;
             size_t nl = strlen(method) + 1;
-            args = s + nl;
+            args = method + nl;
             args_len = args_len >= nl ? args_len - nl : 0;
         }
         size_t n = args_len / 8;
@@ -6932,7 +7055,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
          * interpreter goes on unwinding when it has returned: the SDK's
          * GOPERL_FAILED_JUMP). */
         const I32 count = op == 66 ? call_method(method, flags)
-                                   : call_sv(GOPERL_SVARG(a), flags);
+                                   : call_sv(GOPERL_SVSUBJ(a), flags);
         SPAGAIN;
         /* The results as perl leaves them on the stack for the caller: no
          * reference is taken on them, and the array that hands them over
@@ -7007,7 +7130,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_MAGIC_ATTACH: { /* b = obj token, c = host id */
         SV *obj = GOPERL_SVARG(b);
-        MAGIC *mg = sv_magicext(GOPERL_SVARG(a), obj, PERL_MAGIC_ext,
+        MAGIC *mg = sv_magicext(GOPERL_SVSUBJ(a), obj, PERL_MAGIC_ext,
                                 goperl_anchor_vtbl(0), NULL, 0);
         mg->mg_private = 0;
         mg->mg_ptr = (char *)(uintptr_t)c;
@@ -7015,7 +7138,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     }
     case GOPERL_OP_MAGIC_ID: {
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvTYPE(sv) < SVt_PVMG) return 0;
         for (MAGIC *mg = SvMAGIC(sv); mg; mg = mg->mg_moremagic)
             if (goperl_is_anchor(mg))
@@ -7023,8 +7146,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     }
     case GOPERL_OP_MAGIC_UNATTACH: {
-        MAGIC *mg = goperl_anchor_of(aTHX_ GOPERL_SVARG(a));
-        if (mg) sv_unmagicext(GOPERL_SVARG(a), PERL_MAGIC_ext, mg->mg_virtual);
+        MAGIC *mg = goperl_anchor_of(aTHX_ GOPERL_SVSUBJ(a));
+        if (mg) sv_unmagicext(GOPERL_SVSUBJ(a), PERL_MAGIC_ext, mg->mg_virtual);
         return 0;
     }
     case GOPERL_OP_PLVAR_GET: {
@@ -7299,10 +7422,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     }
     case GOPERL_OP_SV_UTF8_ON:
-        SvUTF8_on(GOPERL_SVARG(a));
+        SvUTF8_on(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_SV_POK_ON: {
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvTYPE(sv) >= SVt_PV && goperl_pv_host_string(aTHX_ sv, SVf_POK, SvPVX(sv), SvCUR(sv)))
             goperl_pv_host_refuse(aTHX);
         SvPOK_on(sv);
@@ -7313,13 +7436,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         if (b)
             do_sv_dump(0, GOPERL_MEMARG(PerlIO, b), GOPERL_SVARG(a), 0, (I32)(int64_t)c, FALSE, 0);
         else
-            sv_dump(GOPERL_SVARG(a));
+            sv_dump(GOPERL_SVARG(a)); /* NULL: "SV = 0", as perl's */
         return 0;
     case GOPERL_OP_SV_REFCNT_DEC: /* a freed scalar is perl's to warn of */
         SvREFCNT_dec(goperl_sv_arg(aTHX_ a, op, true));
         return 0;
     case GOPERL_OP_SV_UNMAGIC: /* a = sv, b = how */
-        sv_unmagic(GOPERL_SVARG(a), (int)(int64_t)b);
+        sv_unmagic(GOPERL_SVSUBJ(a), (int)(int64_t)b);
         return 0;
     case GOPERL_OP_SAVE_HOOK: { /* scope-save a hook variable (a = a GOPERL_PL_ hook id,
                 * b = 0 save_sptr / 1 save_generic_svref). The host assigns
@@ -7335,70 +7458,72 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 * can model CvXSUBANY/alias dispatch). With b the sub has
                 * no name (newXS(NULL, ...)): it is in no glob, and the one
                 * reference to it is the caller's. */
-        CV *cv = newXS(b ? NULL : (s ? s : ""), XS_goperl_native_thunk, __FILE__);
+        CV *cv = newXS(b ? NULL : (s ? s : ""), XS_goperl_native_thunk, __FILE_NAME__);
         CvXSUBANY(cv).any_i32 = (I32)(int64_t)a;
         return (uint64_t)(uintptr_t)cv;
     }
     case GOPERL_OP_SV_STASH: { /* the blessing stash of an object SV, else 0 */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         return SvOBJECT(sv) ? (uint64_t)(uintptr_t)SvSTASH(sv) : 0;
     }
     case GOPERL_OP_NEW_SV:
         return (uint64_t)(uintptr_t)newSV((STRLEN)a);
     case GOPERL_OP_SV_UPGRADE:
-        sv_upgrade(GOPERL_SVARG(a), (svtype)(int64_t)b);
+        sv_upgrade(GOPERL_SVSUBJ(a), (svtype)(int64_t)b);
         return 0;
     case GOPERL_OP_SV_UTF8_UPGRADE:
-        sv_utf8_upgrade(GOPERL_SVARG(a));
+        sv_utf8_upgrade(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_SAVE_DELETE: /* (b = signed klen, negative = UTF-8 key) */
-        save_delete(GOPERL_HVARG(a),
-                    savepvn(s ? s : "", (I32)((int64_t)b < 0 ? -(int64_t)b
-                                                             : (int64_t)b)),
+        save_delete(GOPERL_HVSUBJ(a),
+                    savepvn(goperl_sbytes(aTHX_ s, slen, (int64_t)b < 0 ? -(int64_t)b : b),
+                            (I32)((int64_t)b < 0 ? -(int64_t)b : (int64_t)b)),
                     (I32)(int64_t)b);
         return 0;
     case GOPERL_OP_SAVE_HELEM: { /* (b = keysv, c = flags) */
-        HV *hv = GOPERL_HVARG(a);
+        HV *hv = GOPERL_HVSUBJ(a);
         SV *key = GOPERL_SVARG(b);
         HE *he = hv_fetch_ent(hv, key, TRUE, 0U);
         if (he) save_helem_flags(hv, key, &HeVAL(he), (U32)c);
         return 0;
     }
     case GOPERL_OP_NEW_PVN_SHARE: /* (b = signed len, negative = UTF-8) */
-        return (uint64_t)(uintptr_t)newSVpvn_share(s ? s : "",
-                                                   (SSize_t)(int64_t)b, 0U);
+        return (uint64_t)(uintptr_t)newSVpvn_share(
+            goperl_sbytes(aTHX_ s, slen, (int64_t)b < 0 ? -(int64_t)b : b), (SSize_t)(int64_t)b, 0U);
     case GOPERL_OP_SV_LEN:
         return (uint64_t)sv_len(GOPERL_SVARG(a));
     case GOPERL_OP_NEW_HVHV:
         return (uint64_t)(uintptr_t)(SV *)newHVhv(GOPERL_HVARG(a));
     case GOPERL_OP_AV_MAKE: { /* (s+b = the values, a word each) */
+        (void)goperl_sbytes(aTHX_ s, slen, b);
         size_t n = (size_t)b / 8;
         for (size_t i = 0; i < n; i++) {
             goperl_gword_t tok;
             memcpy(&tok, s + i * 8, 8);
             if (!GOPERL_SVARG(tok)) goperl_arg_refuse(aTHX_ op, tok, "an element");
         }
-        SV **ary = n ? (SV **)malloc(n * sizeof(SV *)) : NULL;
+        SV **ary = NULL;
+        if (n) Newx(ary, n, SV *); /* dies when there is no memory */
         for (size_t i = 0; i < n; i++) {
             goperl_gword_t tok;
             memcpy(&tok, s + i * 8, 8);
             ary[i] = (SV *)(uintptr_t)tok;
         }
         AV *av = av_make((SSize_t)n, ary ? ary : (SV **)&ary);
-        free(ary);
+        Safefree(ary);
         return (uint64_t)(uintptr_t)(SV *)av;
     }
     /* perl's answer as it is: grok_number's flags for a string (the
      * number is fractional, negative, ...), the flags of the numbers it
      * holds otherwise */
     case GOPERL_OP_LOOKS_LIKE_NUMBER:
-        return (uint64_t)(uint32_t)looks_like_number(GOPERL_SVARG(a));
+        return (uint64_t)(uint32_t)looks_like_number(GOPERL_SVSUBJ(a));
     case GOPERL_OP_SV_AMAGIC:
-        return SvAMAGIC(GOPERL_SVARG(a)) ? 1 : 0;
+        return SvAMAGIC(GOPERL_SVSUBJ(a)) ? 1 : 0;
     case GOPERL_OP_AMAGIC_CALL: { /* (a = sv, b = AMGf flags, c = method); the
                 * right operand is fixed at &PL_sv_undef (the deref-overload
                 * calling pattern). */
-        SV *res = amagic_call(GOPERL_SVARG(a), &PL_sv_undef, (int)(int64_t)c,
+        SV *res = amagic_call(GOPERL_SVSUBJ(a), &PL_sv_undef, (int)(int64_t)c,
                               (int)(int64_t)b);
         return (uint64_t)(uintptr_t)res;
     }
@@ -7412,7 +7537,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 * primitive matching a native `AvARRAY(av)[i] = sv`. Any slot
                 * the array has room for: code fills the slots of an array it
                 * has extended and sets AvFILLp afterwards. */
-        AV *av = GOPERL_AVARG(a);
+        AV *av = GOPERL_AVSUBJ(a);
         SSize_t idx = (SSize_t)(int64_t)c;
         if (SvTYPE((SV *)av) == SVt_PVAV && idx >= 0 && idx <= AvMAX(av))
             AvARRAY(av)[idx] = goperl_store_into(aTHX_ (SV *)av, GOPERL_STORED(b));
@@ -7505,14 +7630,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(GOPERL_ADDR(s2), (uint64_t)strlen(s2));
     }
     case GOPERL_OP_CV_INFO: { /* depth<<32 | isxsub */
-        CV *cv = GOPERL_CVARG(a);
+        CV *cv = GOPERL_CVSUBJ(a);
         /* a format is a CV to perl's macros as a sub is */
         if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         return ((uint64_t)(uint32_t)CvDEPTH(cv) << 32) |
                (CvISXSUB(cv) ? 1u : 0u);
     }
     case GOPERL_OP_CV_PTR: { /* b = a GOPERL_CVPTR_ selector */
-        CV *cv = GOPERL_CVARG(a);
+        CV *cv = GOPERL_CVSUBJ(a);
         /* a format is a CV to perl's macros as a sub is */
         if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         switch ((int)b) {
@@ -7524,7 +7649,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     }
     case GOPERL_OP_GV_PTR: { /* b = a GOPERL_GVPTR_ selector */
-        GV *gv = GOPERL_GVARG(a);
+        GV *gv = GOPERL_GVSUBJ(a);
         if (!isGV_with_GP((SV *)gv)) return 0;
         switch ((int)b) {
         case GOPERL_GVPTR_STASH: return (uint64_t)(uintptr_t)(SV *)GvSTASH(gv);
@@ -7541,16 +7666,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return 0;
     }
     case GOPERL_OP_GV_NAME: {
-        GV *gv = GOPERL_GVARG(a);
+        GV *gv = GOPERL_GVSUBJ(a);
         if (!isGV_with_GP((SV *)gv)) return 0;
         const char *n = GvNAME(gv);
         if (!n) return 0;
         return goperl_two(GOPERL_ADDR(n), (uint64_t)GvNAMELEN(gv));
     }
     case GOPERL_OP_SV_ISGV_GP:
-        return isGV_with_GP(GOPERL_SVARG(a)) ? 1 : 0;
+        return isGV_with_GP(GOPERL_SVSUBJ(a)) ? 1 : 0;
     case GOPERL_OP_HV_NAME: { /* (0 for anonymous stashes) */
-        HV *hv = GOPERL_HVARG(a);
+        HV *hv = GOPERL_HVSUBJ(a);
         if (SvTYPE((SV *)hv) != SVt_PVHV) return 0;
         const char *n = HvNAME(hv);
         if (!n) return 0;
@@ -7604,7 +7729,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(GOPERL_ADDR(n), (uint64_t)strlen(n));
     }
     case GOPERL_OP_CV_FILE: { /* CvFILE */
-        CV *cv = GOPERL_CVARG(a);
+        CV *cv = GOPERL_CVSUBJ(a);
         /* a format is a CV to perl's macros as a sub is */
         if (SvTYPE((SV *)cv) != SVt_PVCV && SvTYPE((SV *)cv) != SVt_PVFM) return 0;
         const char *f = CvFILE(cv);
@@ -7612,32 +7737,34 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(GOPERL_ADDR(f), (uint64_t)strlen(f));
     }
     case GOPERL_OP_GV_FETCHFILE: /* (s = name, b = len) */
-        return (uint64_t)(uintptr_t)gv_fetchfile_flags(s ? s : "",
+        return (uint64_t)(uintptr_t)gv_fetchfile_flags(goperl_sbytes(aTHX_ s, slen, b),
                                                        (STRLEN)b, 0);
     case GOPERL_OP_HV_CLEAR:
         hv_clear(GOPERL_HVARG(a));
         return 0;
     case GOPERL_OP_HV_DELETE: { /* a = hv, s = the key's bytes, b = flags,
                  * c = the key's length */
-        SV *r = hv_delete(GOPERL_HVARG_COMMON(a), s ? s : "", (I32)(int64_t)c, (I32)(int64_t)b);
+        const I32 klen = (I32)(int64_t)c;
+        SV *r = hv_delete(GOPERL_HVARG_COMMON(a), goperl_sbytes(aTHX_ s, slen, klen < 0 ? -(int64_t)klen : klen),
+                          klen, (I32)(int64_t)b);
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_EXISTS:
-        return av_exists(GOPERL_AVARG(a), (SSize_t)(int64_t)b) ? 1 : 0;
+        return av_exists(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b) ? 1 : 0;
     case GOPERL_OP_SV_UTF8_OFF:
-        SvUTF8_off(GOPERL_SVARG(a));
+        SvUTF8_off(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_SAVE_SCALAR: /* (a = gv) -> localized SV */
-        return (uint64_t)(uintptr_t)save_scalar(GOPERL_GVARG(a));
+        return (uint64_t)(uintptr_t)save_scalar(GOPERL_GVSUBJ(a));
     case GOPERL_OP_SV_READONLY_ON:
-        SvREADONLY_on(GOPERL_SVARG(a));
+        SvREADONLY_on(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_EVAL_PV: { /* (s = code, a = croak_on_error) */
         SV *r = eval_pv(s ? s : "", (I32)(int64_t)a);
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_UNSHIFT:
-        av_unshift(GOPERL_AVARG(a), (SSize_t)(int64_t)b);
+        av_unshift(GOPERL_AVSUBJ(a), (SSize_t)(int64_t)b);
         return 0;
     case GOPERL_OP_NEW_CONSTSUB: { /* (a = stash, s = name, b = sv; takes over the
                  * sv reference like the C API) */
@@ -7646,7 +7773,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_SV_PVX_RAW: { /* the raw PV buffer pointer, NO stringification
                  * (the SvPVX lvalue-buffer idiom: sv_grow then write). */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvTYPE(sv) < SVt_PV) return 0;
         return GOPERL_ADDR(SvPVX(sv));
     }
@@ -7656,7 +7783,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * has_meta<<32 | pkg_gen (0 when the hash has no aux/meta).
                  * The moral equivalent of mro::get_pkg_gen($stash), read the
                  * same way Moose's mop.c reads it. */
-        HV *hv = GOPERL_HVARG(a);
+        HV *hv = GOPERL_HVSUBJ(a);
         if (b == 1) { /* HvMROMETA, which makes the meta when there is none:
                  * pkg_gen<<32 | cache_gen */
             if (SvTYPE((SV *)hv) != SVt_PVHV) return 0;
@@ -7675,7 +7802,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
          * of the arenas reads (Devel::Leak). Reading it changes nothing; an
          * address outside the memory is refused. */
         const SV *const sv = (const SV *)(uintptr_t)a;
-        if (!a || goperl_sv_head(aTHX_ sv)) return (uint64_t)SvREFCNT(goperl_sv_arg(aTHX_ a, op, true));
+        if (!a) goperl_arg_refuse(aTHX_ op, a, "a scalar");
+        if (goperl_sv_head(aTHX_ sv)) return (uint64_t)SvREFCNT(goperl_sv_arg(aTHX_ a, op, true));
         const uint64_t end = (uint64_t)__builtin_wasm_memory_size(0) << 16;
         if (a >= end || end - a < sizeof(SV)) goperl_arg_refuse(aTHX_ op, a, "a scalar");
         U32 refcnt;
@@ -7684,59 +7812,59 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_GV_INIT: { /* expand a stash stub into a real glob
                  * (b = stash, c = flags, s = name) -> the gv token */
-        GV *gv = GOPERL_GVARG(a);
+        GV *gv = GOPERL_GVSUBJ(a);
         HV *stash = GOPERL_HVARG(b);
         gv_init_pvn(gv, stash, s ? s : "", slen, (U32)c);
         return (uint64_t)(uintptr_t)gv;
     }
     case GOPERL_OP_GV_AMG: { /* Gv_AMG: does the stash have a (freshly
                  * updated) overload magic table? */
-        HV *stash = GOPERL_HVARG(a);
+        HV *stash = GOPERL_HVSUBJ(a);
         if (SvTYPE((SV *)stash) != SVt_PVHV) return 0;
         return Gv_AMG(stash) ? 1 : 0;
     }
     case GOPERL_OP_SV_AMAGIC_SET: /* b ? SvAMAGIC_on : SvAMAGIC_off (a must
                  * be a reference, per the core macros) */
-        if (!SvROK(GOPERL_SVARG(a))) return 0;
-        if (b) SvAMAGIC_on(GOPERL_SVARG(a));
-        else SvAMAGIC_off(GOPERL_SVARG(a));
+        if (!SvROK(GOPERL_SVSUBJ(a))) return 0;
+        if (b) SvAMAGIC_on(GOPERL_SVSUBJ(a));
+        else SvAMAGIC_off(GOPERL_SVSUBJ(a));
         return 1;
     case GOPERL_OP_GV_FETCHMETHOD: { /* method resolution with ISA walk
                  * (a = stash, b = autoload flag, s = name) -> GV token */
-        HV *stash = GOPERL_HVARG(a);
+        HV *stash = GOPERL_HVSUBJ(a);
         if (SvTYPE((SV *)stash) != SVt_PVHV) return 0;
         GV *gv = gv_fetchmethod_autoload(stash, s ? s : "", b ? TRUE : FALSE);
         return (uint64_t)(uintptr_t)gv;
     }
     case GOPERL_OP_SV_READONLY_OFF:
-        SvREADONLY_off(GOPERL_SVARG(a));
+        SvREADONLY_off(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_SV_PV_FORCE: { /* -> the writable PV; second: its length */
         STRLEN len = 0;
-        char *p = SvPV_force(GOPERL_SVARG(a), len);
+        char *p = SvPV_force(GOPERL_SVSUBJ(a), len);
         return goperl_two(GOPERL_ADDR(p), (uint64_t)len);
     }
     case GOPERL_OP_SV_CHOP: { /* b = byte offset from SvPVX to chop to */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvTYPE(sv) < SVt_PV || !SvPOK(sv)) return 0;
         sv_chop(sv, SvPVX(sv) + (STRLEN)b);
         return 0;
     }
     case GOPERL_OP_SV_INSERT: /* b = off, c = replace_len, s = little */
-        sv_insert(GOPERL_SVARG(a), (STRLEN)b, (STRLEN)c, s ? s : "", slen);
+        sv_insert(GOPERL_SVSUBJ(a), (STRLEN)b, (STRLEN)c, s ? s : "", slen);
         return 0;
     case GOPERL_OP_SV_UTF8_DECODE:
-        return sv_utf8_decode(GOPERL_SVARG(a)) ? 1 : 0;
+        return sv_utf8_decode(GOPERL_SVSUBJ(a)) ? 1 : 0;
     case GOPERL_OP_SV_UTF8_DOWNGRADE: /* b = fail_ok; c: 0 (SV_GMAGIC), or
                  * with its high half 1 the flags in its low half */
-        return sv_utf8_downgrade_flags(GOPERL_SVARG(a), b ? TRUE : FALSE,
+        return sv_utf8_downgrade_flags(GOPERL_SVSUBJ(a), b ? TRUE : FALSE,
                                        (c >> 32) ? (U32)c : SV_GMAGIC)
                    ? 1
                    : 0;
     case GOPERL_OP_MG_SET: { /* SvSETMAGIC semantics: only a set-magical
                  * SV has a magic chain to run (SvMAGIC on smaller bodies
                  * reads past the struct). */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         if (SvSMAGICAL(sv)) mg_set(sv);
         return 0;
     }
@@ -7754,20 +7882,21 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_CKWARN: /* a = warning category; b = ckWARN_d variant */
         return (b ? ckWARN_d((U32)a) : ckWARN((U32)a)) ? 1 : 0;
     case GOPERL_OP_SV_LEN_BUF: /* SvLEN: the ALLOCATED buffer size */
-        return (SvTYPE(GOPERL_SVARG(a)) < SVt_PV)
+        return (SvTYPE(GOPERL_SVSUBJ(a)) < SVt_PV)
                    ? 0
-                   : (uint64_t)SvLEN(GOPERL_SVARG(a));
+                   : (uint64_t)SvLEN(GOPERL_SVSUBJ(a));
     case GOPERL_OP_HV_STORE_KLEN: { /* a = hv, b = value token, c = utf8<<32 |
                  * key length, s = the key's bytes; takes over the value
                  * ref -> stored SV token. hv_common with JUST_SV returns
                  * the SLOT (SV**). */
         HV *const hv = GOPERL_HVARG_COMMON(a);
         const int kflags = (c >> 32) ? HVhek_UTF8 : 0;
+        const char *const key = goperl_sbytes(aTHX_ s, slen, (uint32_t)c);
         if (goperl_holds_foreign((SV *)hv))
-            goperl_slot_unforeign((SV **)hv_common(hv, NULL, s ? s : "", (STRLEN)(uint32_t)c,
+            goperl_slot_unforeign((SV **)hv_common(hv, NULL, key, (STRLEN)(uint32_t)c,
                                                    kflags, HV_FETCH_JUST_SV, NULL, 0));
         SV *val = goperl_store_into(aTHX_ (SV *)hv, GOPERL_STORED(b));
-        SV **svp = (SV **)hv_common(hv, NULL, s ? s : "",
+        SV **svp = (SV **)hv_common(hv, NULL, key,
                                     (STRLEN)(uint32_t)c, kflags,
                                     HV_FETCH_ISSTORE | HV_FETCH_JUST_SV, val, 0);
         /* second: the address of the slot (HeVAL of the entry) */
@@ -7775,7 +7904,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_HV_FETCH_KLEN: { /* a = hv, b = lval, c = utf8<<32 | key
                  * length, s = the key's bytes */
-        SV **svp = (SV **)hv_common(GOPERL_HVARG_COMMON(a), NULL, s ? s : "",
+        SV **svp = (SV **)hv_common(GOPERL_HVARG_COMMON(a), NULL, goperl_sbytes(aTHX_ s, slen, (uint32_t)c),
                                     (STRLEN)(uint32_t)c, (c >> 32) ? HVhek_UTF8 : 0,
                                     HV_FETCH_JUST_SV | (b ? HV_FETCH_LVALUE : 0), NULL, 0);
         /* second: the address of the slot (HeVAL of the entry) */
@@ -7786,18 +7915,18 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(uintptr_t)r;
     }
     case GOPERL_OP_AV_POP:
-        return (uint64_t)(uintptr_t)av_pop(GOPERL_AVARG(a));
+        return (uint64_t)(uintptr_t)av_pop(GOPERL_AVSUBJ(a));
     case GOPERL_OP_COP_HINTS: /* CopHINTS of a caller-vouched COP */
         return (uint64_t)CopHINTS_get(GOPERL_MEMARG(COP, a));
     case GOPERL_OP_SV_IS_BOOL:
-        return SvIsBOOL(GOPERL_SVARG(a)) ? 1 : 0;
+        return SvIsBOOL(GOPERL_SVSUBJ(a)) ? 1 : 0;
     case GOPERL_OP_SV_POK_ONLY:
-        SvPOK_only(GOPERL_SVARG(a));
+        SvPOK_only(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_EVAL_SV: { /* a = sv, c = flags; results like CALL_SV:
                  * their words; second: died<<63 | count */
         I32 flags = (I32)(int64_t)c;
-        I32 count = eval_sv(GOPERL_SVARG(a), flags);
+        I32 count = eval_sv(GOPERL_SVSUBJ(a), flags);
         const uint64_t words = goperl_call_results(aTHX_ count);
         /* eval_sv traps a die in $@ and with G_RETHROW throws it again
          * itself; the truth of $@ is not asked here, which would run the
@@ -7806,7 +7935,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return goperl_two(words, (died << 63) | (uint32_t)count);
     }
     case GOPERL_OP_AV_SHIFT:
-        return (uint64_t)(uintptr_t)av_shift(GOPERL_AVARG(a));
+        return (uint64_t)(uintptr_t)av_shift(GOPERL_AVSUBJ(a));
     case GOPERL_OP_SV_2IO: /* the IO sv behind a handle-ish sv (croaks the
                  * way the real one does on non-handles; b = no_croak) */
         if (b) {
@@ -7814,17 +7943,17 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             dJMPENV;
             int jmp;
             JMPENV_PUSH(jmp);
-            if (jmp == 0) io = sv_2io(GOPERL_SVARG(a));
+            if (jmp == 0) io = sv_2io(GOPERL_SVSUBJ(a));
             JMPENV_POP;
             return (uint64_t)(uintptr_t)(SV *)io;
         }
-        return (uint64_t)(uintptr_t)(SV *)sv_2io(GOPERL_SVARG(a));
+        return (uint64_t)(uintptr_t)(SV *)sv_2io(GOPERL_SVSUBJ(a));
     case GOPERL_OP_SV_FORCE_NORMAL:
-        sv_force_normal(GOPERL_SVARG(a));
+        sv_force_normal(GOPERL_SVSUBJ(a));
         return 0;
     case GOPERL_OP_PERLIO_OPEN: { /* s = "mode\0path" -> PerlIO token */
         const char *mode = s ? s : "r";
-        const char *path = mode + strlen(mode) + 1;
+        const char *path = goperl_second_string(aTHX_ s, slen);
         PerlIO *io = PerlIO_open(path, mode);
         return (uint64_t)(uintptr_t)io;
     }
@@ -7832,37 +7961,33 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         return (uint64_t)(int64_t)PerlIO_close(GOPERL_MEMARG(PerlIO, a));
     case GOPERL_OP_PERLIO_PUTS: /* s+b = bytes */
         return (uint64_t)(int64_t)PerlIO_write(GOPERL_MEMARG(PerlIO, a),
-                                               s ? s : "", (Size_t)b);
+                                               goperl_sbytes(aTHX_ s, slen, b), (Size_t)b);
     case GOPERL_OP_PERLIO_FLUSH:
         return (uint64_t)(int64_t)PerlIO_flush(GOPERL_MEMARG(PerlIO, a));
     case GOPERL_OP_PERLIO_WRITE:
         return (uint64_t)(int64_t)PerlIO_write(GOPERL_MEMARG(PerlIO, a),
-                                               s ? s : "", (Size_t)b);
+                                               goperl_sbytes(aTHX_ s, slen, b), (Size_t)b);
     case GOPERL_OP_IO_OFP: { /* output PerlIO of an IO sv (IoOFP) */
-        IO *io = GOPERL_IOARG(a);
+        IO *io = GOPERL_IOSUBJ(a);
         if (SvTYPE((SV *)io) != SVt_PVIO) return 0;
         return (uint64_t)(uintptr_t)IoOFP(io);
     }
     case GOPERL_OP_SV_CUR: /* raw SvCUR — NO stringification/get-magic
                  * (SvPV on an undef buffer warns; SvCUR must not) */
-        return (SvTYPE(GOPERL_SVARG(a)) < SVt_PV)
+        return (SvTYPE(GOPERL_SVSUBJ(a)) < SVt_PV)
                    ? 0
-                   : (uint64_t)SvCUR(GOPERL_SVARG(a));
-    /* b: the length of s (a request longer than the operation box comes
-     * through perl_xs_helper, which has none) */
-    case GOPERL_OP_PERLIO_DEFINE: return goperlio_define(aTHX_ s, b);
-    case GOPERL_OP_PERLIO_CALL: return goperlio_call(aTHX_ s, b);
+                   : (uint64_t)SvCUR(GOPERL_SVSUBJ(a));
+    /* b: the length of s */
+    case GOPERL_OP_PERLIO_DEFINE: return goperlio_define(aTHX_ goperl_sbytes(aTHX_ s, slen, b), b);
+    case GOPERL_OP_PERLIO_CALL: return goperlio_call(aTHX_ goperl_sbytes(aTHX_ s, slen, b), b);
     case GOPERL_OP_OPTREE_NEW: { /* a = class<<32|type, b = flags,
                  * s = kid tokens (u64 each; count fixed by class) */
         int cls = (int)(a >> 32);
         I32 type = (I32)(uint32_t)(a & 0xFFFFFFFFu);
         I32 flags = (I32)(uint32_t)b;
-        uint64_t k1 = 0, k2 = 0, k3 = 0;
-        if (s) {
-            memcpy(&k1, s, 8);
-            memcpy(&k2, s + 8, 8);
-            if (cls == GOPERL_OPC_CONDOP) memcpy(&k3, s + 16, 8);
-        }
+        uint64_t k[3];
+        goperl_swords(s, slen, k, cls == GOPERL_OPC_CONDOP ? 3 : 2);
+        const uint64_t k1 = k[0], k2 = k[1], k3 = cls == GOPERL_OPC_CONDOP ? k[2] : 0;
         OP *first = GOPERL_MEMARG(OP, k1);
         OP *second = GOPERL_MEMARG(OP, k2);
         OP *o = NULL;
@@ -7930,12 +8055,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * s = op tokens (u64 each) */
         int sel = (int)(a >> 32);
         I32 aux = (I32)(uint32_t)(a & 0xFFFFFFFFu);
-        uint64_t k1 = 0, k2 = 0, k3 = 0;
-        if (s) {
-            memcpy(&k1, s, 8);
-            memcpy(&k2, s + 8, 8);
-            if (sel == GOPERL_OPM_SIBLING_SPLICE) memcpy(&k3, s + 16, 8);
-        }
+        uint64_t k[3];
+        goperl_swords(s, slen, k, sel == GOPERL_OPM_SIBLING_SPLICE ? 3 : 2);
+        const uint64_t k1 = k[0], k2 = k[1], k3 = sel == GOPERL_OPM_SIBLING_SPLICE ? k[2] : 0;
         OP *o1 = GOPERL_MEMARG(OP, k1);
         OP *o2 = GOPERL_MEMARG(OP, k2);
         switch (sel) {
@@ -8037,7 +8159,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         case GOPERL_LEX_BUFUTF8: return lex_bufutf8() ? 1 : 0;
         case GOPERL_LEX_STUFF_PVN: /* b = flags<<32|len */
-            lex_stuff_pvn(s ? s : "", (STRLEN)(uint32_t)b, (U32)(b >> 32));
+            lex_stuff_pvn(goperl_sbytes(aTHX_ s, slen, (uint32_t)b), (STRLEN)(uint32_t)b, (U32)(b >> 32));
             return 0;
         case GOPERL_LEX_UNSTUFF: /* b = the address in the buffer to discard to */
             lex_unstuff((char *)(uintptr_t)b);
@@ -8055,8 +8177,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 goperl_gword_t len;
                 char word[256];
             } r;
-            goperl_gword_t w[2] = {0, 0};
-            if (s) memcpy(w, s, sizeof w);
+            goperl_gword_t w[2];
+            goperl_swords(s, slen, w, 2);
             STRLEN destlen = w[0] < sizeof r.word ? (STRLEN)w[0] : sizeof r.word;
             STRLEN len = 0;
             char *end = Perl_scan_word(aTHX_ (char *)(uintptr_t)b, r.word,
@@ -8070,8 +8192,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 goperl_gword_t end;
                 goperl_gword_t delim;
             } r;
-            goperl_gword_t w[3] = {0, 0, 0};
-            if (s) memcpy(w, s, sizeof w);
+            goperl_gword_t w[3];
+            goperl_swords(s, slen, w, 3);
             char *delim = NULL;
             char *end = Perl_scan_str(aTHX_ (char *)(uintptr_t)b, (int)w[0],
                                       (int)w[1], (int)w[2], &delim);
@@ -8080,8 +8202,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return (uint64_t)(uintptr_t)&r;
         }
         case GOPERL_LEX_SKIPSPACE: {
-            goperl_gword_t flags = 0;
-            if (s) memcpy(&flags, s, sizeof flags);
+            goperl_gword_t flags;
+            goperl_swords(s, slen, &flags, 1);
             return (uint64_t)(uintptr_t)Perl_skipspace_flags(
                 aTHX_ (char *)(uintptr_t)b, (U32)flags);
         }
@@ -8191,8 +8313,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_BLOCK: { /* a: 0 = block_start(b=full) -> floor,
                  * 1 = block_end(b=floor, s=[u64 seq]) -> op token */
         if ((int)a == 0) return (uint64_t)(uint32_t)block_start((int)b);
-        uint64_t k1 = 0;
-        if (s) memcpy(&k1, s, 8);
+        uint64_t k1;
+        goperl_swords(s, slen, &k1, 1);
         return (uint64_t)(uintptr_t)block_end((I32)(uint32_t)b, GOPERL_MEMARG(OP, k1));
     }
     case GOPERL_OP_PAD: { /* a = selector */
@@ -8201,10 +8323,10 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return (uint64_t)pad_alloc((I32)(uint32_t)(b >> 32),
                                        (U32)(uint32_t)b);
         case GOPERL_PAD_ADD_NAME_PVN: /* b = flags<<32|len, s = name */
-            return (uint64_t)pad_add_name_pvn(s ? s : "", (STRLEN)(uint32_t)b,
+            return (uint64_t)pad_add_name_pvn(goperl_sbytes(aTHX_ s, slen, (uint32_t)b), (STRLEN)(uint32_t)b,
                                               (U32)(b >> 32), NULL, NULL);
         case GOPERL_PAD_FINDMY_PVN: /* b = flags<<32|len, s = name */
-            return (uint64_t)pad_findmy_pvn(s ? s : "", (STRLEN)(uint32_t)b,
+            return (uint64_t)pad_findmy_pvn(goperl_sbytes(aTHX_ s, slen, (uint32_t)b), (STRLEN)(uint32_t)b,
                                             (U32)(b >> 32));
         case GOPERL_PAD_INTRO_MY: return (uint64_t)intro_my();
         case GOPERL_PAD_SETSV: { /* b = sv token, c = pad index */
@@ -8326,17 +8448,16 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_SV_CLASSIFY: { /* a = sv token; b = len<<32|flags<<8|mode;
                  * s = name bytes (mode 0) or an 8-byte sv token */
-        SV *sv = GOPERL_SVARG(a);
         int mode = (int)(b & 0xFF);
+        /* sv_numeq_flags and sv_streq_flags take NULL (NULLOK) */
+        SV *sv = mode == 5 || mode == 6 ? GOPERL_SVARG(a) : GOPERL_SVSUBJ(a);
         U32 flags = (U32)((b >> 8) & 0xFFFFFF);
         STRLEN len = (STRLEN)(uint32_t)(b >> 32);
         uint64_t k1 = 0;
-        if (mode == 1 || mode == 2 || mode == 5 || mode == 6) {
-            if (s) memcpy(&k1, s, 8);
-        }
+        if (mode == 1 || mode == 2 || mode == 5 || mode == 6) goperl_swords(s, slen, &k1, 1);
         SV *other = GOPERL_SVARG(k1);
         switch (mode) {
-        case 0: return sv_derived_from_pvn(sv, s ? s : "", len, flags) ? 1 : 0;
+        case 0: return sv_derived_from_pvn(sv, goperl_sbytes(aTHX_ s, slen, len), len, flags) ? 1 : 0;
         case 1: return sv_derived_from_sv(sv, other, flags) ? 1 : 0;
         case 2: return sv_isa_sv(sv, other) ? 1 : 0;
         case 3: {
@@ -8362,7 +8483,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_SV_SLOT_SET: { /* a = sv, c = a GOPERL_SVSLOT_ selector;
                  * b = the value: the SvXXX_set macros of sv.h */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         switch ((int)c) {
         case GOPERL_SVSLOT_RV: SvRV_set(sv, GOPERL_STORED(b)); return 0;
         case GOPERL_SVSLOT_STASH: SvSTASH_set(sv, (HV *)GOPERL_STORED(b)); return 0;
@@ -8470,7 +8591,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * a word each, then the mode text; b = the length of all of
                  * it */
         goperl_gword_t head[5];
-        if (!s || b < sizeof head) Perl_croak(aTHX_ "goperl: do_openn: short request");
+        if (!s || b < sizeof head || b > slen) Perl_croak(aTHX_ "goperl: do_openn: short request");
         memcpy(head, s, sizeof head);
         const size_t num = (size_t)head[4];
         if (num > b / 8 || b < sizeof head + num * 8)
@@ -8487,7 +8608,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         const char *mode = s + sizeof head + num * 8;
         const size_t mode_len = (size_t)b - sizeof head - num * 8;
-        return do_openn(GOPERL_GVARG(a), mode, (I32)mode_len, (int)head[0],
+        return do_openn(GOPERL_GVSUBJ(a), mode, (I32)mode_len, (int)head[0],
                         (int)head[1], (int)head[2],
                         GOPERL_MEMARG(PerlIO, head[3]), svs, (I32)num)
                    ? 1
@@ -8698,7 +8819,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
             return 0;
         case GOPERL_PIO_OPENN: {
             goperl_gword_t head[4];
-            if (!s || b < sizeof head) Perl_croak(aTHX_ "goperl: PerlIO_openn: short request");
+            if (!s || b < sizeof head || b > slen) Perl_croak(aTHX_ "goperl: PerlIO_openn: short request");
             memcpy(head, s, sizeof head);
             const size_t narg = (size_t)head[3];
             if (narg > b / 8 || b < sizeof head + narg * 8 + 2)
@@ -8714,7 +8835,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 }
             }
             const char *layers = s + sizeof head + narg * 8;
-            const char *mode = layers + strlen(layers) + 1;
+            const char *mode = goperl_second_string(aTHX_ layers, slen - (sizeof head + narg * 8));
             return (uint64_t)(uintptr_t)PerlIO_openn(aTHX_ *layers ? layers : NULL, mode,
                                                      (int)(int64_t)head[0], (int)(int64_t)head[1],
                                                      (int)(int64_t)head[2], f, (int)narg, args);
@@ -8758,13 +8879,13 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_PIO_UNGETC:
             return (uint64_t)(int64_t)PerlIO_ungetc(f, (int)(int64_t)b);
         case GOPERL_PIO_UNREAD: /* s + b = bytes */
-            return (uint64_t)(int64_t)PerlIO_unread(f, s ? s : "", (Size_t)b);
+            return (uint64_t)(int64_t)PerlIO_unread(f, goperl_sbytes(aTHX_ s, slen, b), (Size_t)b);
         case GOPERL_PIO_BINMODE: /* b = iotype<<32 | open mode, s = layers */
             return PerlIO_binmode(aTHX_ f, (int)(b >> 32), (int)(uint32_t)b,
                                   (s && *s) ? s : NULL) ? 1 : 0;
         case GOPERL_PIO_APPLY_LAYERS: { /* s = the mode, NUL, the layers */
             const char *mode = s ? s : "";
-            const char *names = mode + strlen(mode) + 1;
+            const char *names = goperl_second_string(aTHX_ s, slen);
             return (uint64_t)(int64_t)PerlIO_apply_layers(
                 aTHX_ f, *mode ? mode : NULL, names);
         }
@@ -8790,11 +8911,26 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * the two-SV calls), and c's high half a 32-bit value that
                  * goes with it (hi: flags, a form) */
         SV *sv = (SV *)(uintptr_t)a;
-        switch ((int)(uint32_t)c) { /* the selectors that take no scalar in a */
-        case GOPERL_SVCALL_TAINT_ENV:
+        switch ((int)(uint32_t)c) {
+        case GOPERL_SVCALL_TAINT_ENV: /* no scalar in a */
         case GOPERL_SVCALL_MAGIC_IS_VALUE:
             break;
-        default: (void)GOPERL_SVARG(a);
+        /* a scalar or NULL, as perl's functions take it (NULLOK in embed.fnc) */
+        case GOPERL_SVCALL_CMP:
+        case GOPERL_SVCALL_CMP_LOCALE:
+        case GOPERL_SVCALL_NUMCMP:
+        case GOPERL_SVCALL_EQ:
+        case GOPERL_SVCALL_LEN_UTF8:
+        case GOPERL_SVCALL_DEC:
+        case GOPERL_SVCALL_INC:
+        case GOPERL_SVCALL_CV_CONST_SV:
+        case GOPERL_SVCALL_NEWSVSV:
+        case GOPERL_SVCALL_NEWAVAV:
+        case GOPERL_SVCALL_NEWAVHV:
+        case GOPERL_SVCALL_2BOOL:
+            sv = GOPERL_SVARG(a);
+            break;
+        default: sv = GOPERL_SVSUBJ(a);
         }
         U32 hi = (U32)(c >> 32);
         switch ((int)(uint32_t)c) {
@@ -8987,7 +9123,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     case GOPERL_OP_GV_CALL: { /* a = gv or cv, c = a GOPERL_GVCALL_ selector;
                  * b = the remaining argument, and c's high half a 32-bit
                  * value that goes with it (hi) */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         GV *gv = (GV *)sv;
         CV *cv = (CV *)sv;
         const U32 hi = (U32)(c >> 32);
@@ -9069,14 +9205,18 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVSTR_TAINT_PROPER:
         case GOPERL_SVSTR_WARNER: /* the category */
             break;
+        case GOPERL_SVSTR_FETCHMETH: /* a stash or NULL, as gv_fetchmeth_pvn takes */
+        case GOPERL_SVSTR_FETCHMETH_AUTOLOAD:
+            sv = GOPERL_SVARG(a);
+            break;
         case GOPERL_SVSTR_COP_HINT:
             (void)GOPERL_MEMARG(COP, a);
             break;
-        default: (void)GOPERL_SVARG(a);
+        default: sv = GOPERL_SVSUBJ(a);
         }
         STRLEN len = (STRLEN)(uint32_t)b;
         U32 flags = (U32)(b >> 32);
-        const char *str = s ? s : "";
+        const char *str = goperl_sbytes(aTHX_ s, slen, len);
         switch ((int)c) {
         case GOPERL_SVSTR_CATPVN: sv_catpvn_flags(sv, str, len, (I32)flags); return 0;
         case GOPERL_SVSTR_NEWSVRV: /* flags bit 0: no class */
@@ -9098,8 +9238,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_SVSTR_WHICHSIG: return (uint64_t)(int64_t)whichsig_pvn(str, len);
         case GOPERL_SVSTR_SETENV: { /* str = name NUL value; flags bit 0:
                  * remove the variable */
-            const char *val = str + strlen(str) + 1;
-            my_setenv(str, (flags & 1) ? NULL : val);
+            my_setenv(str, (flags & 1) ? NULL : goperl_second_string(aTHX_ str, len));
             return 0;
         }
         case GOPERL_SVSTR_COP_HINT: /* sv slot = COP token, 0 for PL_curcop */
@@ -9166,7 +9305,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_FIELD_IS_FREED:
             (void)goperl_sv_arg(aTHX_ a, op, true);
             break;
-        default: (void)GOPERL_SVARG(a);
+        default: sv = GOPERL_SVSUBJ(a);
         }
         switch ((int)c) {
         case GOPERL_FIELD_REFCNT_SET: /* the count itself: nothing is freed */
@@ -9300,20 +9439,25 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         Perl_croak(aTHX_ "goperl: unknown field %d", (int)c);
     }
     case GOPERL_OP_REGEXP: { /* a = token, c = a GOPERL_RX_ selector */
-        SV *sv = GOPERL_SVARG(a);
+        /* NULL for SvRX (get_re_arg is NULLOK), for the selectors that test
+         * it and for the one that takes no scalar */
+        SV *sv = (int)c == GOPERL_RX_OF_SV || (int)c == GOPERL_RX_COMP_PV || (int)c == GOPERL_RX_BODY ||
+                         (int)c == GOPERL_RX_OFFS
+                     ? GOPERL_SVARG(a)
+                     : GOPERL_SVSUBJ(a);
         switch ((int)c) {
         case GOPERL_RX_OF_SV: return (uint64_t)(uintptr_t)(SV *)SvRX(sv);
         case GOPERL_RX_COMP: return (uint64_t)(uintptr_t)(SV *)pregcomp(sv, (U32)b);
         case GOPERL_RX_COMP_PV: { /* the pattern as bytes; flags bit 31: UTF-8 */
             const U32 flags = (U32)(b >> 32);
-            SV *pat = newSVpvn_flags(s ? s : "", (STRLEN)(uint32_t)b,
+            SV *pat = newSVpvn_flags(goperl_sbytes(aTHX_ s, slen, (uint32_t)b), (STRLEN)(uint32_t)b,
                                      SVs_TEMP | ((flags & 0x80000000u) ? SVf_UTF8 : 0));
             return (uint64_t)(uintptr_t)(SV *)pregcomp(pat, flags & 0x7FFFFFFFu);
         }
         case GOPERL_RX_EXEC: { /* s = words [stringarg][strend][strbeg][minend]
                  * [screamer][nosave], addresses of this memory */
             goperl_gword_t w[6];
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short pregexec request");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short pregexec request");
             memcpy(w, s, sizeof w);
             return (uint64_t)(int64_t)pregexec(
                 (REGEXP *)sv, (char *)(uintptr_t)w[0], (char *)(uintptr_t)w[1],
@@ -9322,7 +9466,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case GOPERL_RX_EXEC_FLAGS: {
             goperl_gword_t w[7];
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short regexec request");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short regexec request");
             memcpy(w, s, sizeof w);
             return (uint64_t)(int64_t)CALLREGEXEC(
                 (REGEXP *)sv, (char *)(uintptr_t)w[0], (char *)(uintptr_t)w[1],
@@ -9489,7 +9633,14 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_MARK_ROOM:
         case GOPERL_CALL_FN_CLASSES:
             break;
-        default: (void)GOPERL_SVARG(a);
+        /* a scalar or NULL, as perl's functions take it (NULLOK in embed.fnc) */
+        case GOPERL_CALL_SV_PEEK:
+        case GOPERL_CALL_PV_ESCAPE:
+        case GOPERL_CALL_LEX_START:
+        case GOPERL_CALL_QERROR:
+            sv = GOPERL_SVARG(a);
+            break;
+        default: sv = GOPERL_SVSUBJ(a);
         }
         const uint32_t hi = (uint32_t)(c >> 32);
         switch ((int)(uint32_t)c) {
@@ -9501,7 +9652,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * of it. -> the address of the result in the SV; second
                  * (pv_escape): how many bytes of the text it took */
             goperl_gword_t w[6];
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short display request");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short display request");
             memcpy(w, s, sizeof w);
             if (w[4] > b || w[5] > b || w[0] > b || (uint64_t)sizeof w + w[4] + w[5] + w[0] > b)
                 Perl_croak(aTHX_ "goperl: short display request");
@@ -9531,7 +9682,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * The SDK's headers carry WARNsize and WARN_ALLstring. */
             static_assert(WARNsize == 21, "the SDK's warnings.h values are this build's");
             return (uint64_t)(uintptr_t)Perl_new_warnings_bitfield(
-                aTHX_ (char *)(uintptr_t)a, s ? s : "", (STRLEN)b);
+                aTHX_ (char *)(uintptr_t)a, goperl_sbytes(aTHX_ s, slen, b), (STRLEN)b);
         }
         case GOPERL_CALL_GETCWD_SV: return getcwd_sv(sv) ? 1 : 0;
         case GOPERL_CALL_MESS_SV: /* b = consume */
@@ -9704,7 +9855,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                 Perl_croak(aTHX_ "goperl: too many registered custom ops");
             const int at = a ? (int)a - 1 : g_xop_n;
             const char *name = s ? s : "";
-            const char *desc = name + strlen(name) + 1;
+            const char *desc = goperl_second_string(aTHX_ s, slen);
             XOP *xop = &g_xops[at];
             XopENTRY_set(xop, xop_name, savepv(name));
             XopENTRY_set(xop, xop_desc, savepv(desc));
@@ -9764,9 +9915,9 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_SV_CAT_DECODE: { /* a = dsv; s = words [encoding][ssv]
                  * [offset][tlen] and the terminator's bytes -> the result;
                  * second: the offset */
-            goperl_gword_t w[4] = {0, 0, 0, 0};
-            if (!s) return goperl_two(0, 0);
-            memcpy(w, s, sizeof w);
+            goperl_gword_t w[4];
+            memcpy(w, goperl_sbytes(aTHX_ s, slen, sizeof w), sizeof w);
+            (void)goperl_sbytes(aTHX_ s, slen - sizeof w, w[3]);
             int offset = (int)(int64_t)w[2];
             const bool r = sv_cat_decode(sv, GOPERL_SVARG(w[0]), GOPERL_SVARG(w[1]),
                                          &offset, (char *)(s + sizeof w), (int)w[3]);
@@ -9837,12 +9988,12 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CALL_PACKLIST: {
             static std::vector<SV *> values;
             goperl_gword_t w[2];
-            if (!s || slen < sizeof w) return 0;
-            memcpy(w, s, sizeof w);
+            memcpy(w, goperl_sbytes(aTHX_ s, slen, sizeof w), sizeof w);
             const size_t plen = (size_t)w[0], n = (size_t)w[1];
             if (n > (slen - sizeof w) / sizeof(goperl_gword_t) ||
                 plen > slen - sizeof w - n * sizeof(goperl_gword_t))
-                return 0;
+                Perl_croak(aTHX_ "goperl: packlist: %lu values and a pattern of %lu bytes are more than the request has",
+                           (unsigned long)n, (unsigned long)plen);
             values.resize(n + 1);
             for (size_t i = 0; i < n; i++) {
                 goperl_gword_t t;
@@ -9855,9 +10006,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case GOPERL_CALL_UNPACKSTRING: {
             goperl_gword_t plen;
-            if (!s || slen < sizeof plen) return 0;
-            memcpy(&plen, s, sizeof plen);
-            if (plen > slen - sizeof plen) return 0;
+            memcpy(&plen, goperl_sbytes(aTHX_ s, slen, sizeof plen), sizeof plen);
+            (void)goperl_sbytes(aTHX_ s, slen - sizeof plen, plen);
             const char *const pat = s + sizeof plen;
             const SSize_t count = unpackstring(pat, pat + plen, pat + plen, s + slen, hi);
             return goperl_two(goperl_call_results(aTHX_ (I32)count), (uint32_t)count);
@@ -9899,7 +10049,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
     }
     case GOPERL_OP_TREE: { /* a = a GOPERL_TREE_ selector; s = words */
         goperl_gword_t w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        if (s && b) memcpy(w, s, b < sizeof w ? (size_t)b : sizeof w);
+        if (s && b) memcpy(w, goperl_sbytes(aTHX_ s, slen, b), b < sizeof w ? (size_t)b : sizeof w);
 #define GOPERL_W_OP(i) (GOPERL_MEMARG(OP, w[i]))
 #define GOPERL_W_SV(i) (GOPERL_SVARG(w[i]))
         switch ((int)a) {
@@ -10029,8 +10179,8 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_TREE_CV_NAME: {
             CV *cv = (CV *)GOPERL_W_SV(0);
             if (w[1]) { /* CvNAME_HEK_set: the name follows the four words */
-                const char *name = (s && b > 32) ? s + 32 : "";
                 const I32 len = (I32)w[3];
+                const char *name = goperl_sbytes(aTHX_ s, slen, 32 + (uint64_t)(uint32_t)len) + 32;
                 U32 hash;
                 PERL_HASH(hash, name, len);
                 HEK *hek = share_hek(name, w[2] ? -len : len, hash);
@@ -10046,7 +10196,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case GOPERL_TREE_NEWPVOP: { /* the string follows the two words; the
                  * op owns a copy */
-            const char *str = (s && b > 16) ? s + 16 : "";
+            const char *str = (s && slen > 16) ? s + 16 : "";
             return (uint64_t)(uintptr_t)newPVOP((I32)w[0], (I32)w[1], savepv(str));
         }
         }
@@ -10146,7 +10296,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * block: on the current stackinfo, with the stack as it is
                  * (native code's own has been handed back) */
             goperl_gword_t w[3] = {0, 0, 0};
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short context push");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short context push");
             memcpy(w, s, sizeof w);
             if (si != PL_curstackinfo)
                 Perl_croak(aTHX_ "goperl: a context is pushed on the current stackinfo only");
@@ -10162,7 +10312,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         }
         case GOPERL_CX_PUSHEVAL: {
             goperl_gword_t w[3] = {0, 0, 0};
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short eval context push");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short eval context push");
             memcpy(w, s, sizeof w);
             if (si != PL_curstackinfo || (I32)(int64_t)w[0] != cxstack_ix || cxstack_ix < 0)
                 Perl_croak(aTHX_ "goperl: cx_pusheval is given a context that is not the top one");
@@ -10173,7 +10323,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         case GOPERL_CX_PUSHTRY: { /* s = [index][retop]: try/catch's eval
                  * context, as Future::AsyncAwait resumes one */
             goperl_gword_t w[2] = {0, 0};
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short try context push");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short try context push");
             memcpy(w, s, sizeof w);
             if (si != PL_curstackinfo || (I32)(int64_t)w[0] != cxstack_ix || cxstack_ix < 0)
                 Perl_croak(aTHX_ "goperl: cx_pushtry is given a context that is not the top one");
@@ -10202,7 +10352,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * op): the field takes the value, nothing else happens */
             /* s = words [index][field][value]; b = their length */
             goperl_gword_t w[3] = {0, 0, 0};
-            if (!s || b < sizeof w) Perl_croak(aTHX_ "goperl: short context store");
+            if (!s || b < sizeof w || b > slen) Perl_croak(aTHX_ "goperl: short context store");
             memcpy(w, s, sizeof w);
             const I32 ix = (I32)(int64_t)w[0];
             const goperl_gword_t v = w[2];
@@ -10278,7 +10428,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
         Perl_croak(aTHX_ "goperl: unknown context call %d", (int)c);
     }
     case GOPERL_OP_INTERNAL:
-        return goperl_internal_op(aTHX_ (int)(uint32_t)c, a, b, c, s);
+        return goperl_internal_op(aTHX_ (int)(uint32_t)c, a, b, c, s, slen);
     case GOPERL_OP_SV_MAGIC_STD: { /* real sv_magic: BEHAVIORAL core magic
                  * (ties and friends) must live guest-side to take effect
                  * (b = obj token, c = how, s+len = name or empty; with c's
@@ -10286,20 +10436,22 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * magic owns a copy of: mg_len -1; with 2, s is the 8 bytes
                  * of the name SV: HEf_SVKEY) */
         if ((c >> 32) == 2) {
-            uint64_t name = 0;
-            if (s) memcpy(&name, s, sizeof name);
-            sv_magic(GOPERL_SVARG(a), GOPERL_SVARG(b), (int)(uint32_t)c,
+            uint64_t name;
+            memcpy(&name, goperl_sbytes(aTHX_ s, slen, sizeof name), sizeof name);
+            sv_magic(GOPERL_SVSUBJ(a), GOPERL_SVARG(b), (int)(uint32_t)c,
                      (const char *)(uintptr_t)name, HEf_SVKEY);
             return 0;
         }
         if ((c >> 32) == 1) {
+            const char *const positions =
+                goperl_sbytes(aTHX_ s, slen, PERL_MAGIC_UTF8_CACHESIZE * 2 * sizeof(STRLEN));
             STRLEN *cache;
             Newxz(cache, PERL_MAGIC_UTF8_CACHESIZE * 2, STRLEN);
-            if (s) memcpy(cache, s, PERL_MAGIC_UTF8_CACHESIZE * 2 * sizeof(STRLEN));
-            sv_magic(GOPERL_SVARG(a), GOPERL_SVARG(b), (int)(uint32_t)c, (const char *)cache, -1);
+            memcpy(cache, positions, PERL_MAGIC_UTF8_CACHESIZE * 2 * sizeof(STRLEN));
+            sv_magic(GOPERL_SVSUBJ(a), GOPERL_SVARG(b), (int)(uint32_t)c, (const char *)cache, -1);
             return 0;
         }
-        sv_magic(GOPERL_SVARG(a), GOPERL_SVARG(b), (int)(int64_t)c, s && *s ? s : NULL,
+        sv_magic(GOPERL_SVSUBJ(a), GOPERL_SVARG(b), (int)(int64_t)c, s && *s ? s : NULL,
                  s ? (I32)strlen(s) : 0);
         return 0;
     }
@@ -10307,7 +10459,7 @@ static uint64_t goperl_xs_run(int32_t op, uint64_t a, uint64_t b, uint64_t c,
                  * of the mask b as well (see goperl_anchor_vtbl; no mask is
                  * set magic alone); mg_magical refreshes the SV's magic
                  * flags so that the interpreter calls them. */
-        SV *sv = GOPERL_SVARG(a);
+        SV *sv = GOPERL_SVSUBJ(a);
         MAGIC *mg = goperl_anchor_of(aTHX_ sv);
         if (!mg) return 0;
         const unsigned have = (unsigned)(mg->mg_virtual - &goperl_anchor_vtbls[0]);

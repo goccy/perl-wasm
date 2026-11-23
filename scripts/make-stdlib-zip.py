@@ -93,6 +93,11 @@ the directory of $^X, as perl's relocatable installations have it) is then
 the directory $^X is in; what is installed goes to the site's directory of
 programs (installbin, installscript), as perl's own library does.
 
+%Config names no directory of the machine that built the library: the
+compiler is clang, which finds the sysroot wasi-sdk installs it with, the
+include of scripts/wasi-posix-shim.h is left out of the flags, and libc and
+the host miniperl the build ran (hostperl, hostgenerate) are empty.
+
 An embedding application that runs the interpreter for a build on another
 system than the interpreter's (a native module built with the host's C
 compiler) gives %Config the values of that system in %Config::Override
@@ -145,6 +150,9 @@ def included(rel_path: str) -> bool:
     if any(p in ANYWHERE_DIR_EXCLUDES for p in parts[:-1]):
         return False
     if base == ".exists":
+        return False
+    # the @INC of the build's miniperl, which installperl does not install
+    if rel_path == "buildcustomize.pl":
         return False
     if parts[0] == "unicore":
         if base.endswith(".txt"):
@@ -354,6 +362,29 @@ def present_errno(text: str) -> str:
                         ERRNO_PM_TAGS + "sub TIEHASH { bless \\%err }", "Errno.pm: TIEHASH")
 
 
+def without_build_paths(config: str) -> str:
+    """Config_heavy.pl without the directories of the machine that built
+    it (see the module docstring)."""
+    sysroot = re.search(r"^ccflags='[^'\n]* --sysroot=(\S+)", config, flags=re.M)
+    shim = re.search(r"^ccflags='[^'\n]* -include (\S+/scripts/wasi-posix-shim\.h)", config, flags=re.M)
+    clang = re.search(r"^cpp='(\S+)/clang -E'$", config, flags=re.M)
+    if sysroot is None or shim is None or clang is None:
+        raise SystemExit("make-stdlib-zip: Config_heavy.pl: the sysroot, the shim header or cpp's clang was not found")
+    config = config.replace(" --sysroot=" + sysroot.group(1), "")
+    config = config.replace(" -include " + shim.group(1), "")
+    config = config.replace(clang.group(1) + "/clang", "clang")
+    for key in ("libc", "hostperl", "hostgenerate"):
+        config = replace_once(config, rf"^{key}='[^'\n]*'$", f"{key}=''", f"Config_heavy.pl: {key}")
+    # the build's directories, as the whole of a path or its first components,
+    # also after a compiler option (-I/x, -L/x, -isystem/x)
+    for directory in (os.path.dirname(os.path.dirname(shim.group(1))), os.path.dirname(clang.group(1)),
+                      sysroot.group(1)):
+        if re.search(r"(?:^|[\s'\"=(:]|(?:^|(?<=[\s'\"=]))-(?:I|L|isystem|iquote|idirafter))" + re.escape(directory)
+                     + r"(?![^/\s'\")])", config, flags=re.M):
+            raise SystemExit(f"make-stdlib-zip: Config_heavy.pl: {directory} is still named")
+    return config
+
+
 def relocate_config(rel_path: str, data: bytes) -> bytes:
     """Returns the content to ship for a file of lib/: Config.pm and
     Config_heavy.pl with the library directories taken from where the
@@ -395,7 +426,7 @@ def relocate_config(rel_path: str, data: bytes) -> bytes:
     if rel_path == "Errno.pm":
         return present_errno(data.decode("utf-8")).encode("utf-8")
     if rel_path == "Config_heavy.pl":
-        text = data.decode("utf-8")
+        text = without_build_paths(data.decode("utf-8"))
         # The text of config.sh is the here-document assigned to $_ through
         # the alias made just before it.
         start = text.find("local *_ = \\my $a;\n$_ = <<'!END!';\n")

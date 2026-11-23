@@ -49,11 +49,26 @@ enum wasi_exec_failure {
 static void wasi_exec_failed_in_child(const char *file, int err, int child_stdout,
                                       int child_stderr);
 
+/* exec: this process becomes the program file (execvp), its fds 0 / 1 / 2
+ * first moved from the fds given (a negative one stays), as perl's exec
+ * moves them for a trailing 2>&1 (doio.c, Perl_do_exec3); they stay moved
+ * when the command could not be started. Returns only then, with the
+ * errno. */
+static int wasi_exec_file(const char *file, char *const argv[], int child_stdin,
+                          int child_stdout, int child_stderr) {
+    const int from[3] = {child_stdin, child_stdout, child_stderr};
+    for (int to = 0; to < 3; to++)
+        if (from[to] >= 0 && from[to] != to && dup2(from[to], to) < 0) return errno;
+    execvp(file, argv);
+    return errno;
+}
+
 /* Starts the program file with the arguments argv. child_stdin /
  * child_stdout / child_stderr name the fds of this process that become the
  * command's fds 0 / 1 / 2; a negative one stands for this process's own fd
  * of that number. how says where a failure is told. Returns the pid, or -1
- * with errno set. */
+ * with errno set. With WASI_EXEC_IN_PLACE this process becomes the command
+ * (execvp), and only a command that could not be started returns. */
 static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_stdin,
                              int child_stdout, int child_stderr, int how) {
     posix_spawn_file_actions_t fa;
@@ -68,7 +83,8 @@ static pid_t wasi_spawn_file(const char *file, char *const argv[], int child_std
     posix_spawn_file_actions_adddup2(&fa, child_stderr >= 0 ? child_stderr : 2, 2);
     pid_t pid = -1;
     /* perl runs commands with execvp: a bare name is looked up on PATH. */
-    int rc = posix_spawnp(&pid, file, &fa, NULL, argv, environ);
+    int rc = how == WASI_EXEC_IN_PLACE ? wasi_exec_file(file, argv, child_stdin, child_stdout, child_stderr)
+                                       : posix_spawnp(&pid, file, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
         /* What perl says when its exec fails (doio.c, S_exec_failed); a
@@ -455,20 +471,13 @@ extern "C" int wasi_fork_child_run(pTHX_ int *status_out) {
     return 0;
 }
 
-/* pp_exec (configure patch): starts the command and becomes it
- * (wasmify's __wasmify_exec_become). Returns only when the command could not be started, with
- * errno set. */
+/* pp_exec (configure patch): becomes the command. Returns only when the
+ * command could not be started, with errno set. */
 extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
-    pid_t pid;
     if (!stacked && sp - mark == 1) {
-        /* exec STRING */
+        /* exec STRING; one with no word in it fails, as perl's does */
         bool blank = false;
-        __wasmify_host_proc_exec_next(1);
-        pid = wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank, WASI_EXEC_IN_PLACE);
-        if (blank) {
-            __wasmify_host_proc_exec_next(0);
-            return; /* nothing to run: exec fails, as perl's does */
-        }
+        (void)wasi_spawn_command(SvPV_nolen(*sp), -1, -1, &blank, WASI_EXEC_IN_PLACE);
     } else {
         SV *really = NULL;
         if (stacked) really = *++mark;
@@ -487,19 +496,9 @@ extern "C" void wasi_exec(pTHX_ SV **mark, SV **sp, int stacked) {
         }
         if (really && SvPOK(really) && SvCUR(really))
             argv[0] = SvPV_nolen(really);
-        __wasmify_host_proc_exec_next(1);
-        pid = wasi_spawn_argv(argv, -1, -1, -1, WASI_EXEC_IN_PLACE);
+        (void)wasi_spawn_argv(argv, -1, -1, -1, WASI_EXEC_IN_PLACE);
         free(argv);
     }
-    if (pid < 0) {
-        /* (the spawn has said "Can't exec") */
-        const int e = errno;
-        __wasmify_host_proc_exec_next(0);
-        errno = e;
-        return;
-    }
-    /* The program is gone from here on: only the command remains. */
-    __wasmify_exec_become(pid);
 }
 
 extern "C" PerlIO *wasi_spawn_popen(pTHX_ const char *cmd, const char *mode) {

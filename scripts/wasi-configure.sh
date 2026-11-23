@@ -157,7 +157,7 @@ cc='clang'
 # helper steps — dependency scanning (makedepend) and header probing such as
 # Errno_pm.PL scanning <errno.h> for E* defs. They never produce object files,
 # so they do NOT need to go through wasmify's capture wrapper. Pin them to the
-# ABSOLUTE wasi-sdk clang ($CLANG, resolved per-machine at configure time so it
+# ABSOLUTE wasi-sdk clang (\$WASI_SDK_PATH/bin/clang, resolved per-machine at configure time so it
 # stays host-OS-independent) rather than a bare name. Rationale:
 #   * A bare 'cc' resolves (via the wrapper's WASMIFY_REAL_cc / PATH) to the
 #     HOST macOS cc — wasi-sdk ships no 'cc' — dragging in macOS SDK headers
@@ -224,7 +224,7 @@ d_nanosleep='define'
 # natively: process clocks (times), signals (%SIG), mman (mmap), getpid (\$\$).
 # Each pairs a -D_WASI_EMULATED_* compile define with a -lwasi-emulated-* lib
 # at link time (see libs). The headers #error without the define. $WASI_EMU and
-# $SYSROOT expand here (heredoc), baking literal flags into config.sh.
+# \$SYSROOT expand here (heredoc), baking literal flags into config.sh.
 #
 # Do NOT put -DPERL_CORE in ccflags/cppflags. The core .c files need PERL_CORE,
 # but the generated \`cflags\` script adds it itself, per file, as
@@ -360,10 +360,7 @@ d_wait4='undef'
 # and the functions in its host_ipc.cc, which ask the host (its semaphore
 # sets, message queues and shared memory segments).
 # perl.h gates the headers on HAS_SEM/HAS_MSG/HAS_SHM (d_sem/d_msg/d_shm).
-# semctl takes perl's own union semun. A segment cannot be mapped into the
-# interpreter's memory: shmread and shmwrite copy through shm_copy (the
-# doio.c patch below), and IPC::SysV's functions of an attached segment's
-# address die (the SysV.xs patch below).
+# semctl takes perl's own union semun.
 i_sysipc='define'
 i_sysmsg='define'
 i_syssem='define'
@@ -475,6 +472,20 @@ sPRIEUldbl='"LE"'
 sSCNfldbl='"Lf"'
 # A double is aligned on 8 bytes.
 alignbytes='8'
+# The compiler is clang (wasi-sdk's), which Configure names by its name.
+ccname='clang'
+# time_t is 64 bits wide. gmtime gives a year as long as tm_year, an int,
+# holds it: from the start of year INT_MIN + 1900 to the end of year
+# INT_MAX + 1900 (musl's __secs_to_tm, the proleptic Gregorian calendar).
+# localtime does the same at the time zone's offset from UTC. No offset is
+# 25 hours: a POSIX TZ string gives at most 24:59:59, and the tz database's
+# widest (the local mean times of Asia/Manila until 1844 and of
+# America/Metlakatla until 1867) are under 16 hours. Its range is 25 hours
+# narrower at each end. The base has the range of a 32-bit time_t.
+sGMTIME_max='67768036191676799'
+sGMTIME_min='-67768040609827200'
+sLOCALTIME_max='67768036191586799'
+sLOCALTIME_min='-67768040609737200'
 
 # ---- the C data model: LP64 -------------------------------------------------
 # A pointer, a long and a size_t are 8 bytes, an int is 4, a long long is 8:
@@ -948,6 +959,8 @@ else:
            "    $syslog_send = \\&_syslog_send_native;\n")
     new = ("    # openlog fails where the program has no system logger: the\n"
            "    # mechanism is then unavailable, like one that cannot connect.\n"
+           "    # The caller's $@ is left as it was.\n"
+           "    local $@;\n"
            "    if (!eval { openlog_xs($ident, $logopt, xlate($facility)); 1 }) {\n"
            "        chomp(my $why = $@);\n"
            "        push @$errs, \"native: $why\";\n"
@@ -1013,12 +1026,12 @@ patch("ext/B/typemap", "GOPERL_NUMBER_OP", [
 ])
 PYPATCH
 # ---- B: an op number that is no address of this memory ------------------------
-# A number without bit 62 that B takes as an op is an address of this
-# memory, or one of the host process: a native module that makes a B::OP
-# object of an op of its own (B::CallChecker builds one on its C stack and
-# asks B for its next op) hands B an address outside this memory. B is given
-# an op of this memory that stands for it (perl.cc goperl_native_op).
-# Idempotent.
+# A number without bit 62 that B takes as an op is native code's: an address
+# of the host process, which is this memory's where the host has this memory
+# (perl.cc goperl_memory_address), or one of native code's own: a native
+# module that makes a B::OP object of an op of its own (B::CallChecker builds
+# one on its C stack and asks B for its next op). B is given an op of this
+# memory that stands for that (perl.cc goperl_native_op). Idempotent.
 python3 - <<'PYPATCH'
 path = "ext/B/B.xs"
 t = open(path).read()
@@ -1028,12 +1041,13 @@ else:
     old = ('#define GOPERL_NUMBER_OP(type, iv) INT2PTR(type, (iv) & ~GOPERL_OP_NUMBER_TAG)\n')
     new = ('#define GOPERL_NUMBER_OP(type, iv) ((type)goperl_number_op(aTHX_ (iv)))\n'
            'extern OP *goperl_native_op(pTHX_ UV addr);\n'
+           'extern int goperl_memory_address(UV addr, UV *at);\n'
            'static void *goperl_number_op(pTHX_ IV iv) {\n'
            '    const UV addr = (UV)iv & ~(UV)GOPERL_OP_NUMBER_TAG;\n'
-           '    if (!(iv & GOPERL_OP_NUMBER_TAG) &&\n'
-           '        addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
-           '        return goperl_native_op(aTHX_ addr);\n'
-           '    return INT2PTR(void *, addr);\n'
+           '    UV at;\n'
+           '    if (iv & GOPERL_OP_NUMBER_TAG) return INT2PTR(void *, addr);\n'
+           '    if (!goperl_memory_address(addr, &at)) return goperl_native_op(aTHX_ addr);\n'
+           '    return INT2PTR(void *, at);\n'
            '}\n')
     assert t.count(old) == 1, (path, t.count(old))
     open(path, "w").write(t.replace(old, new))
@@ -1208,10 +1222,41 @@ PYPATCH
 # ---- Encode: a table that is no address of this memory ------------------------
 # An Encode::XS object holds the address of its encode_t table. A native
 # module made by enc2xs (Encode::EUCJPASCII, Encode::HanExtra) defines its
-# encodings with tables of its own, in the host process: an address outside
-# this memory. Encode is given a copy of the table in this memory (perl.cc
+# encodings with tables of its own, in the host process. The objects of the
+# encodings built here (Encode's own and those of Encode::Byte, CN, EBCDIC,
+# JP, KR, Symbol and TW) say that their table is this memory's: their number
+# carries bit 62 (GOPERL_ENCODE_TABLE_TAG, encode.h), as B's op numbers do,
+# which no address of the host process has and which a copy of the memory
+# (a clone, a fork) keeps meaning. A number without it is native code's:
+# Encode is given a copy of that table in this memory (perl.cc
 # goperl_native_encode_table). Idempotent.
 python3 - <<'PYPATCH'
+tag_define = ('/* The number of an Encode::XS object whose table is this memory\'s\n'
+              ' * carries this bit (perl-wasm scripts/wasi-configure.sh). */\n'
+              '#define GOPERL_ENCODE_TABLE_TAG ((IV)1 << 62)\n')
+path = "cpan/Encode/Encode/encode.h"
+t = open(path).read()
+if "GOPERL_ENCODE_TABLE_TAG" in t:
+    print(f"the tag of tables of this memory already present in {path}")
+else:
+    anchor = "typedef struct encode_s encode_t;\n"
+    assert t.count(anchor) == 1, path
+    open(path, "w").write(t.replace(anchor, anchor + tag_define))
+    print(f"the tag of tables of this memory applied to {path}")
+# The objects of the encodings built here: Encode's own, and the
+# Encode_XSEncoding each sub-distribution's Makefile.PL writes into its .xs.
+# (Encode/Makefile_PL.e2x and bin/enc2xs write those of modules built
+# elsewhere, whose tables are native code's: they keep untagged numbers.)
+for path, own in [("cpan/Encode/Encode.xs", "    SV *iv    = newSViv(PTR2IV(enc));\n")] + [
+        (f"cpan/Encode/{d}/Makefile.PL", " SV *iv    = newSViv(PTR2IV(enc));\n")
+        for d in ("Byte", "CN", "EBCDIC", "JP", "KR", "Symbol", "TW")]:
+    t = open(path).read()
+    if "GOPERL_ENCODE_TABLE_TAG" in t:
+        print(f"tagged table numbers already present in {path}")
+        continue
+    assert t.count(own) == 1, path
+    open(path, "w").write(t.replace(own, own.replace("PTR2IV(enc)", "PTR2IV(enc) | GOPERL_ENCODE_TABLE_TAG")))
+    print(f"tagged table numbers applied to {path}")
 path = "cpan/Encode/Encode.xs"
 t = open(path).read()
 if "goperl_encode_table" in t:
@@ -1230,10 +1275,10 @@ else:
         'static encode_t *\n'
         'goperl_encode_table(pTHX_ SV *obj)\n'
         '{\n'
-        '    const UV addr = (UV)SvIV(SvRV(obj));\n'
-        '    if (addr >= ((UV)__builtin_wasm_memory_size(0) << 16))\n'
-        '        return (encode_t *)goperl_native_encode_table(aTHX_ addr);\n'
-        '    return INT2PTR(encode_t *, addr);\n'
+        '    const IV number = SvIV(SvRV(obj));\n'
+        '    if (number & GOPERL_ENCODE_TABLE_TAG)\n'
+        '        return INT2PTR(encode_t *, number & ~GOPERL_ENCODE_TABLE_TAG);\n'
+        '    return (encode_t *)goperl_native_encode_table(aTHX_ (UV)number);\n'
         '}\n' + anchor)
     open(path, "w").write(t)
     print(f"tables outside the memory taken in {path} ({n} places)")
@@ -1446,76 +1491,6 @@ else:
         t = t.replace(old, new)
     open(path, "w").write(t)
     print(f"op release reports applied to {path}")
-PYPATCH
-# ---- doio.c: shmread and shmwrite copy through the host ------------------------
-# A shared memory segment is the host's memory, which cannot be mapped into
-# the interpreter's (shmat fails, wasmify's host_ipc.cc): do_shmio copies between the
-# segment and the string with shm_copy where it attached the segment and
-# copied. Idempotent.
-python3 - <<'PYPATCH'
-path = "doio.c"
-t = open(path).read()
-if "shm_copy" in t:
-    print(f"shm_copy already present in {path}")
-else:
-    start = t.index("    char *const shm = (char *)shmat(id, NULL, (optype == OP_SHMREAD) ? SHM_RDONLY : 0);\n")
-    end = t.index("    return shmdt(shm);\n", start) + len("    return shmdt(shm);\n")
-    t = (t[:start] +
-         "    if (optype == OP_SHMREAD) {\n"
-         "        char *buf;\n"
-         "        Newx(buf, msize ? msize : 1, char);\n"
-         "        if (shm_copy(id, buf, mpos, msize, 0) == -1) {\n"
-         "            Safefree(buf);\n"
-         "            return -1;\n"
-         "        }\n"
-         "        sv_setpvn(mstr, buf, msize);\n"
-         "        Safefree(buf);\n"
-         "        SvUTF8_off(mstr);\n"
-         "        SvSETMAGIC(mstr);\n"
-         "        /* who knows who has been playing with this shared memory? */\n"
-         "        SvTAINTED_on(mstr);\n"
-         "        return 0;\n"
-         "    }\n"
-         "    else {\n"
-         "        assert(optype == OP_SHMWRITE);\n"
-         "\n"
-         "        STRLEN len;\n"
-         "        const char *const mbuf = SvPVbyte(mstr, len);\n"
-         "        const STRLEN n = (len > msize) ? msize : len;\n"
-         "        char *buf;\n"
-         "        Newxz(buf, msize ? msize : 1, char);\n"
-         "        Copy(mbuf, buf, n, char);\n"
-         "        const int ret = shm_copy(id, buf, mpos, msize, 1);\n"
-         "        Safefree(buf);\n"
-         "        return ret;\n"
-         "    }\n" +
-         t[end:])
-    open(path, "w").write(t)
-    print(f"shm_copy applied to {path}")
-PYPATCH
-# ---- IPC::SysV: no segment is attached to the interpreter's memory --------------
-# shmat, shmdt, memread and memwrite hand out or take the address a segment
-# is attached at, and no segment can be attached here (wasmify's host_ipc.cc): each
-# dies, saying so, where it would have made the call. Idempotent.
-python3 - <<'PYPATCH'
-path = "cpan/IPC-SysV/SysV.xs"
-t = open(path).read()
-if "GOPERL_NO_ATTACH" in t:
-    print(f"the refusal of attached segments already present in {path}")
-else:
-    t = t.replace('#include "XSUB.h"\n',
-                  '#include "XSUB.h"\n'
-                  '#define GOPERL_NO_ATTACH(what) croak("%s: a shared memory segment cannot be "'
-                  ' "attached to the interpreter\'s memory under gperl; use shmread and shmwrite", what)\n', 1)
-    for name, at in [("shmat", "    if (id >= 0) {\n"),
-                     ("shmdt", "    void *caddr = sv2addr(addr);\n"),
-                     ("memread", "    char *caddr = (char *) sv2addr(addr);\n"),
-                     ("memwrite", "    char *caddr = (char *) sv2addr(addr);\n")]:
-        head = t.index("\n" + name + "(")
-        i = t.index(at, head)
-        t = t[:i] + '    GOPERL_NO_ATTACH("' + name + '");\n' + t[i:]
-    open(path, "w").write(t)
-    print(f"the refusal of attached segments applied to {path}")
 PYPATCH
 # Snapshot the old config.h so we can tell whether this reconfigure changed the
 # compile inputs. Perl's Makefile does NOT list config.h as a prerequisite of

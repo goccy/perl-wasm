@@ -50,7 +50,6 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <termios.h>
 #include <unordered_map>
 #include <vector>
 
@@ -66,12 +65,11 @@ extern "C" {
 pid_t __real_waitpid(pid_t pid, int *status, int options);
 char *__real_strerror(int number);
 
-/* A socket address of this C library as the host's C library has it, and
- * the reverse (wasmify's host sockets). 0 or an errno. */
-int __wasmify_sockaddr_to_host(const struct sockaddr *addr, socklen_t addrlen, void *out,
-                               size_t cap, size_t *out_len);
-int __wasmify_sockaddr_from_host(const void *raw, size_t len, struct sockaddr *out,
-                                 socklen_t *out_len);
+/* The host's answer to a question about a socket address of its C library
+ * (perl.cc): the bytes after the answer's status, or NULL for an address
+ * the other side has no form of. */
+SV *goperl_host_sockaddr(pTHX_ const void *req, size_t req_len);
+int goperl_host_sockaddr_answered(void);
 }
 
 namespace {
@@ -145,10 +143,14 @@ Family &family(int id) {
     Family &f = g_families[id];
     if (f.loaded) return f;
     char name[64];
-    int len = 0;
-    long long value = 0;
-    for (int i = 0; __wasmify_host_number_at(id, i, name, (int)sizeof(name), &len, &value) == 0; i++)
+    uint32_t len = 0;
+    int64_t value = 0;
+    for (int i = 0;; i++) {
+        const int rc = __wasmify_host_number_at(id, i, name, (int)sizeof(name), &len, &value);
+        if (rc == -ENOENT) break; /* past the last one */
+        if (rc != 0) croak("goperl: number %d of the host's family %d: %s", i, id, strerror(-rc));
         f.host.emplace_back(std::string(name, (size_t)len), value);
+    }
     for (const GuestNumber &g : guest_numbers) {
         if (g.family != id) continue;
         for (const auto &h : f.host) {
@@ -360,8 +362,24 @@ void slot_to_guest(pTHX_ SV **slot, int id) {
 /* The bytes of a packed address; at most this many are an address. */
 union AddressBytes {
     struct sockaddr sa;
+    struct sockaddr_in in4;
+    struct sockaddr_in6 in6;
+    struct sockaddr_un un;
     char bytes[256];
 };
+
+/* The host turns an address into the other side's (goperl_host_sockaddr).
+ * The question is words of 64 bits: the direction, then, for an address of
+ * this C library, the words of the address (its kind, its port, its IPv6
+ * flow information and its scope, as numbers) and its bytes: the 4 or 16
+ * bytes of an IP address, the name of a Unix-domain address (none for a
+ * socket without a name). For an address of the host's, the direction is
+ * followed by the bytes of its struct sockaddr, and the answer is the words
+ * and the bytes of the address. */
+enum : uint64_t { ADDRESS_TO_HOST = 0, ADDRESS_FROM_HOST = 1 };
+enum : uint64_t { ADDRESS_IPV4 = 1, ADDRESS_IPV6 = 2, ADDRESS_UNIX = 3 };
+const size_t kAddressWords = 4;
+const size_t kUnixHead = offsetof(struct sockaddr_un, sun_path);
 
 /* The C library's address for a packed address of the host's: a new value,
  * or the program's own where it is no address of the host's. */
@@ -376,10 +394,53 @@ SV *guest_address(pTHX_ SV *host) {
     }
     STRLEN len;
     const char *const raw = SvPV_nomg(bytes, len);
+    const uint64_t direction = ADDRESS_FROM_HOST;
+    std::string question(reinterpret_cast<const char *>(&direction), sizeof direction);
+    question.append(raw, len);
+    SV *const answer = goperl_host_sockaddr(aTHX_ question.data(), question.size());
+    if (!answer) return host;
+    STRLEN answer_len;
+    const char *const a = SvPV_const(answer, answer_len);
+    uint64_t words[kAddressWords];
+    if (answer_len < sizeof words)
+        Perl_croak(aTHX_ "goperl: the host's socket address is %lu bytes", (unsigned long)answer_len);
+    memcpy(words, a, sizeof words);
+    const char *const name = a + sizeof words;
+    const size_t name_len = answer_len - sizeof words;
     AddressBytes guest;
-    socklen_t guest_len = sizeof(guest);
-    if (__wasmify_sockaddr_from_host(raw, len, &guest.sa, &guest_len) != 0) return host;
-    if (guest_len > sizeof(guest)) return host;
+    memset(&guest, 0, sizeof guest);
+    size_t guest_len = 0;
+    switch (words[0]) {
+    case ADDRESS_IPV4:
+        if (name_len != sizeof guest.in4.sin_addr) break;
+        guest.in4.sin_family = AF_INET;
+        guest.in4.sin_port = htons((uint16_t)words[1]);
+        memcpy(&guest.in4.sin_addr, name, name_len);
+        guest_len = sizeof guest.in4;
+        break;
+    case ADDRESS_IPV6:
+        if (name_len != sizeof guest.in6.sin6_addr) break;
+        guest.in6.sin6_family = AF_INET6;
+        guest.in6.sin6_port = htons((uint16_t)words[1]);
+        guest.in6.sin6_flowinfo = htonl((uint32_t)words[2]);
+        guest.in6.sin6_scope_id = (uint32_t)words[3];
+        memcpy(&guest.in6.sin6_addr, name, name_len);
+        guest_len = sizeof guest.in6;
+        break;
+    case ADDRESS_UNIX:
+        if (name_len > sizeof guest.un.sun_path) break;
+        guest.un.sun_family = AF_UNIX;
+        memcpy(guest.un.sun_path, name, name_len);
+        /* Linux's lengths, which tell the kinds of address apart: a path
+         * is the whole structure, padded with NULs; an abstract name (one
+         * that starts with a NUL) ends where the address does; a socket
+         * without a name has the head alone. */
+        guest_len = name_len == 0 || name[0] == '\0' ? kUnixHead + name_len : sizeof guest.un;
+        break;
+    }
+    if (guest_len == 0)
+        Perl_croak(aTHX_ "goperl: the host's socket address of kind %lu with %lu bytes is none of this C library's",
+                   (unsigned long)words[0], (unsigned long)name_len);
     return sv_2mortal(newSVpvn(guest.bytes, guest_len));
 }
 
@@ -388,12 +449,48 @@ SV *guest_address(pTHX_ SV *host) {
 void address_slot_to_host(pTHX_ SV **slot) {
     SV *const sv = *slot;
     if (!SvPOK(sv) || SvCUR(sv) < sizeof(sa_family_t) || SvCUR(sv) > sizeof(AddressBytes)) return;
+    const size_t len = SvCUR(sv);
     AddressBytes guest;
-    memcpy(guest.bytes, SvPVX(sv), SvCUR(sv));
-    char host[sizeof(AddressBytes)];
-    size_t host_len = 0;
-    if (__wasmify_sockaddr_to_host(&guest.sa, (socklen_t)SvCUR(sv), host, sizeof(host), &host_len) != 0) return;
-    *slot = sv_2mortal(newSVpvn(host, host_len));
+    memcpy(guest.bytes, SvPVX(sv), len);
+    uint64_t words[1 + kAddressWords] = {ADDRESS_TO_HOST, 0, 0, 0, 0};
+    const void *data;
+    size_t data_len;
+    switch (guest.sa.sa_family) {
+    case AF_INET:
+        if (len < sizeof guest.in4) return;
+        words[1] = ADDRESS_IPV4;
+        words[2] = ntohs(guest.in4.sin_port);
+        data = &guest.in4.sin_addr;
+        data_len = sizeof guest.in4.sin_addr;
+        break;
+    case AF_INET6:
+        if (len < sizeof guest.in6) return;
+        words[1] = ADDRESS_IPV6;
+        words[2] = ntohs(guest.in6.sin6_port);
+        words[3] = ntohl(guest.in6.sin6_flowinfo);
+        words[4] = guest.in6.sin6_scope_id;
+        data = &guest.in6.sin6_addr;
+        data_len = sizeof guest.in6.sin6_addr;
+        break;
+    case AF_UNIX: {
+        /* an abstract name (one that starts with a NUL) is every byte the
+         * length covers, a path ends at its NUL, a socket without a name
+         * has none */
+        size_t room = len > kUnixHead ? len - kUnixHead : 0;
+        if (room > sizeof guest.un.sun_path) room = sizeof guest.un.sun_path;
+        words[1] = ADDRESS_UNIX;
+        data = guest.un.sun_path;
+        data_len = room > 0 && guest.un.sun_path[0] == '\0' ? room : strnlen(guest.un.sun_path, room);
+        break;
+    }
+    default:
+        return;
+    }
+    char question[sizeof words + sizeof guest.un.sun_path];
+    memcpy(question, words, sizeof words);
+    memcpy(question + sizeof words, data, data_len);
+    SV *const host = goperl_host_sockaddr(aTHX_ question, sizeof words + data_len);
+    if (host) *slot = host;
 }
 
 /* The XSUB (or built-in) that a routine of this file stands in front of.
@@ -458,76 +555,22 @@ OP *builtin_fcntl(pTHX) {
 }
 
 /* ioctl FILEHANDLE, FUNCTION, SCALAR. A request this C library answers
- * (perl_numbers.inc) goes to it, under its number. Every other request is
- * the host's: one of a terminal's, say, whose number the program has from
- * a native module or a header of the host. It goes to the host as it is,
- * and what pp_ioctl does around the call is done here: the third argument
- * is a number, or a buffer the request reads and writes, which is at least
- * as long as a request takes (IOCPARM_LEN, 256 where the system does not
- * say) and guarded against a request that writes more. */
+ * (perl_numbers.inc) goes to it, under its number. Every other request
+ * goes to the C library as it is: its ioctl takes a terminal's requests,
+ * in Linux's numbers, to the host's terminal (wasmify's host_tty.cc). */
 OP *builtin_ioctl(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
     SV *const function = SP[-1];
     SvGETMAGIC(function);
     const long long request = SvOK(function) ? (long long)SvUV_nomg(function) : 0;
-    const Family &requests = family(FAMILY_ioctl);
-    if (requests.host.empty()) return behind(aTHX);
-    for (const Pair &p : requests.pairs) {
+    for (const Pair &p : family(FAMILY_ioctl).pairs) {
         if (p.host == request) {
             SP[-1] = sv_2mortal(newSViv((IV)p.guest));
-            return behind(aTHX);
+            break;
         }
     }
-
-    dTARGET;
-    SV *const argsv = POPs;
-    (void)POPs;
-    GV *const gv = MUTABLE_GV(POPs);
-    IO *const io = GvIOn(gv);
-    if (!IoIFP(io)) {
-        Perl_report_evil_fh(aTHX_ gv);
-        SETERRNO(EBADF, RMS_IFI);
-        RETPUSHUNDEF;
-    }
-    const bool buffer = SvPOK(argsv) || !SvNIOK(argsv);
-    char *s = NULL;
-    IV value = 0;
-    if (buffer) {
-        const STRLEN need = 256;
-        STRLEN len;
-        s = SvPV_force(argsv, len);
-        if (len < need) {
-            s = Sv_Grow(argsv, need + 1);
-            SvCUR_set(argsv, need);
-        }
-        s[SvCUR(argsv)] = 17; /* the guard pp_ioctl puts behind the buffer */
-    } else {
-        value = SvIV(argsv);
-    }
-    TAINT_PROPER(PL_op_desc[OP_IOCTL]);
-    int result = 0;
-    const int rc = __wasmify_host_fd_ioctl(PerlIO_fileno(IoIFP(io)), (unsigned int)request, buffer,
-                                      buffer ? (uintptr_t)s : (uintptr_t)value,
-                                      buffer ? (unsigned int)SvCUR(argsv) : 0, &result);
-    IV retval = result;
-    if (rc != 0) {
-        errno = -rc;
-        retval = -1;
-    }
-    if (SvPOK(argsv)) {
-        if (s[SvCUR(argsv)] != 17)
-            DIE(aTHX_ "Possible memory corruption: %s overflowed 3rd argument", OP_NAME(PL_op));
-        s[SvCUR(argsv)] = 0;
-        SvSETMAGIC(argsv);
-    }
-    if (retval == -1) RETPUSHUNDEF;
-    if (retval != 0) {
-        PUSHi(retval);
-    } else {
-        PUSHp("0 but true", 10);
-    }
-    RETURN;
+    return behind(aTHX);
 }
 
 /* socket SOCKET, DOMAIN, TYPE, PROTOCOL and socketpair SOCKET1, SOCKET2,
@@ -596,6 +639,21 @@ void message_flags_to_guest(pTHX_ SV **slot) {
     *slot = sv_2mortal(newSViv((IV)to_guest(FAMILY_msg, flags & ~reported)));
 }
 
+/* A built-in of a packed address where the host has no dispatcher to turn
+ * the host's addresses into this C library's (goperl_host_sockaddr): it
+ * fails with ENOSYS before it does anything, as one the system lacks. */
+OP *address_unanswered(pTHX) {
+    dSP;
+    if (PL_opargs[PL_op->op_type] & OA_MARK)
+        SP = PL_stack_base + POPMARK;
+    else
+        SP -= PL_op->op_type == OP_GETPEERNAME || PL_op->op_type == OP_GETSOCKNAME ? 1 : 2;
+    SETERRNO(ENOSYS, LIB_INVARG);
+    PUSHs(&PL_sv_undef);
+    PUTBACK;
+    return NORMAL;
+}
+
 /* send SOCKET, MSG, FLAGS [, TO] and recv SOCKET, SCALAR, LENGTH, FLAGS:
  * the flags are the third and the fourth argument; send's TO is a packed
  * address, and so is what recv returns (the sender's). */
@@ -603,6 +661,7 @@ OP *builtin_send(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
     SV **const mark = PL_stack_base + TOPMARK;
+    if (SP - mark >= 4 && !goperl_host_sockaddr_answered()) return address_unanswered(aTHX);
     if (SP - mark >= 3) message_flags_to_guest(aTHX_ mark + 3);
     if (SP - mark >= 4) mark[4] = guest_address(aTHX_ mark[4]);
     return behind(aTHX);
@@ -611,6 +670,7 @@ OP *builtin_send(pTHX) {
 OP *builtin_recv(pTHX) {
     if (!active()) return behind(aTHX);
     dSP;
+    if (!goperl_host_sockaddr_answered()) return address_unanswered(aTHX);
     SV **const mark = PL_stack_base + TOPMARK;
     if (SP - mark >= 4) message_flags_to_guest(aTHX_ mark + 4);
     OP *const next = behind(aTHX);
@@ -622,6 +682,7 @@ OP *builtin_recv(pTHX) {
  * address. */
 OP *builtin_address_in(pTHX) {
     if (!active()) return behind(aTHX);
+    if (!goperl_host_sockaddr_answered()) return address_unanswered(aTHX);
     dSP;
     *SP = guest_address(aTHX_ *SP);
     return behind(aTHX);
@@ -631,6 +692,7 @@ OP *builtin_address_in(pTHX) {
  * SOCKET return a packed address. */
 OP *builtin_address_out(pTHX) {
     if (!active()) return behind(aTHX);
+    if (!goperl_host_sockaddr_answered()) return address_unanswered(aTHX);
     OP *const next = behind(aTHX);
     address_slot_to_host(aTHX_ PL_stack_sp);
     return next;
@@ -1019,14 +1081,57 @@ SV *constant_of(pTHX_ HV *stash, const char *name, STRLEN len) {
     return NULL;
 }
 
-/* The number the program is to see for one of this C library's names. */
+/* The number the program is to see for one of this C library's names: the
+ * host's, or, for a name the host has none of, a marked number (ENUM). A
+ * flag the host has no name for has no number to show (host_lacks_flag). */
 long long shown_number(const GuestNumber &g) {
     const Family &f = family(g.family);
     if (f.host.empty()) return g.value;
     for (const Pair &p : f.pairs)
         if (strcmp(p.name, g.name) == 0) return p.host;
-    /* the host has no such name */
-    return kind_of(g.family) == ENUM ? enum_to_host(g.family, g.value) : 0;
+    return enum_to_host(g.family, g.value);
+}
+
+/* Whether g is a flag the host has no name for: no bit of the host's does
+ * what it does, so the program is shown no such constant, as perl shows
+ * none of a flag its system lacks. */
+bool host_lacks_flag(const GuestNumber &g) {
+    if (kind_of(g.family) != FLAGS) return false;
+    const Family &f = family(g.family);
+    if (f.host.empty()) return false;
+    for (const Pair &p : f.pairs)
+        if (strcmp(p.name, g.name) == 0) return false;
+    return true;
+}
+
+/* The constant a package has under a name is taken away, as the extension
+ * (ExtUtils::Constant::ProxySubs) leaves one of a macro the system lacks:
+ * the name is a sub declared and not defined, and it is in the package's
+ * hash of missing names, so that its AUTOLOAD dies saying "Your vendor has
+ * not defined ..." where it is used. false for a constant that is no
+ * extension's (a constant sub of perl code), which stays. */
+bool take_constant_away(pTHX_ HV *stash, const char *name) {
+    const STRLEN len = strlen(name);
+    SV **const entry = hv_fetch(stash, name, (I32)len, 0);
+    if (!entry) return false;
+    if (isGV(*entry)) {
+        CV *const cv = GvCV((GV *)*entry);
+        if (!cv || !CvCONST(cv) || !CvISXSUB(cv)) return false;
+        SvREFCNT_dec((SV *)CvXSUBANY(cv).any_ptr);
+        CvCONST_off(cv);
+        CvXSUB(cv) = NULL;
+        CvXSUBANY(cv).any_ptr = NULL;
+    } else {
+        sv_setpvn(*entry, "", 0); /* a prototype of "" */
+    }
+    HV *const missing = get_hv("ExtUtils::Constant::ProxySubs::Missing", GV_ADD | GVf_MULTI);
+    const char *const package = HvNAME(stash);
+    SV **const ref = hv_fetch(missing, package, (I32)strlen(package), TRUE);
+    if (!ref) croak("goperl: no hash of the missing names of %s", package);
+    if (!SvROK(*ref)) sv_setrv_noinc(*ref, (SV *)newHV());
+    if (!hv_store((HV *)SvRV(*ref), name, (I32)len, SvREFCNT_inc_simple_NN(&PL_sv_yes), 0))
+        croak("goperl: %s cannot be added to the missing names of %s", name, package);
+    return true;
 }
 
 /* Names the extensions have for a number that the table knows under
@@ -1052,7 +1157,9 @@ void show_constant(pTHX_ HV *stash, const char *name, const GuestNumber &g) {
     if (!constant || SvIMMORTAL(constant) || !(SvIOK(constant) || SvNOK(constant))) return;
     const long long now = SvIsUV(constant) ? (long long)SvUV(constant) : (long long)SvIV(constant);
     if (now != g.value) return;
-    const long long shown = shown_number(g);
+    /* a flag the host lacks that cannot be taken away is no bit at all */
+    if (host_lacks_flag(g) && take_constant_away(aTHX_ stash, name)) return;
+    const long long shown = host_lacks_flag(g) ? 0 : shown_number(g);
     if (shown == now) return;
     const bool readonly = SvREADONLY(constant);
     SvREADONLY_off(constant);

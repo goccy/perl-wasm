@@ -16,7 +16,7 @@ wasm build:
   bootstrap that registers each `boot_<Module>`). This is the direct parallel
   to CPython's C extensions being compiled *into* `python.wasm`.
 
-The policy is **"link everything EXCEPT what is meaningless under wasm32-wasi"**
+The policy is **"link everything EXCEPT what is meaningless under wasm64-wasi"**
 (OS-specific, external-library/syscall dependent, threads, or test/author-only).
 Selection is against upstream Perl **v5.42.2**
 (`b62845c7186b0b6a8e4e83419e6b5ef64ceef3ed`).
@@ -32,7 +32,7 @@ Selection is against upstream Perl **v5.42.2**
 ### cpan/
 `Compress-Raw-Zlib`, `Compress-Raw-Bzip2` (both bundle their own
 zlib/bzip2 sources, so no external library is required), `Digest-MD5`,
-`Digest-SHA`, `Encode`, `Filter-Util-Call`, `Math-BigInt-FastCalc`,
+`Digest-SHA`, `Encode`, `Filter-Util-Call`, `IPC-SysV`, `Math-BigInt-FastCalc`,
 `MIME-Base64`, `Scalar-List-Utils`, `Socket`, `Sys-Syslog`, `Time-Piece`,
 `Unicode-Collate`
 
@@ -56,18 +56,18 @@ Notes:
   mechanism is unavailable", so the module falls through to its other
   mechanisms (`tcp`, `udp`, `unix`, ...) instead of dying or losing the
   message.
-- `I18N-Langinfo` (`nl_langinfo`) and `Sys-Hostname` (`gethostname`) may need a
-  small host-capability stub under wasi; they are kept as porting targets.
+- `I18N-Langinfo` uses the C library's `nl_langinfo`, and `Sys-Hostname` its
+  `gethostname`, which answers from `uname` (wasmify's `host_system.cc`).
 - `Socket` is included because the wasm layer enables host sockets
   (`"network": true` in `wasmify.json`'s `host`); connection *policy* is enforced on the
   go-perl side.
 - `Time-HiRes`: `time`/`gettimeofday`/`tv_interval`/`sleep`/`usleep`/
   `nanosleep` are the real implementations, and so are `clock_gettime` and
-  `clock_getres` (`CLOCK_REALTIME`, `CLOCK_MONOTONIC`, and the process and
-  thread CPU-time clocks). wasi's `clockid_t` is a struct pointer while
-  Time::HiRes moves clock ids through Perl as integers, so
-  `wasi-configure.sh` gives its XS integer clock ids (Linux's numbers) over
-  the wasi clocks. `clock_nanosleep` is configured off and fails cleanly, so
+  `clock_getres` of `CLOCK_REALTIME` and `CLOCK_MONOTONIC`, the clocks wasi
+  has. wasi's `clockid_t` is a struct pointer while Time::HiRes moves clock
+  ids through Perl as integers, so `wasi-configure.sh` gives its XS integer
+  clock ids (Linux's numbers) over the wasi clocks; any other clock id (the
+  process and thread CPU-time clocks) fails with `EINVAL`. `clock_nanosleep` is configured off and fails cleanly, so
   feature probes fall back. The interval timer (`alarm`/`ualarm`/`setitimer`/`getitimer`
   with `ITIMER_REAL`) is implemented in wasmify's `host_signal.cc` over a
   timer the host keeps; the CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) do not
@@ -77,9 +77,8 @@ Notes:
 
 | Module(s) | Reason for exclusion |
 | --- | --- |
-| `Amiga-ARexx`, `Amiga-Exec`, `VMS-DCLsym`, `VMS-Stdio`, `Win32`, `Win32API-File` | OS-specific (AmigaOS / VMS / Windows) — meaningless on wasm32-wasi. |
+| `Amiga-ARexx`, `Amiga-Exec`, `VMS-DCLsym`, `VMS-Stdio`, `Win32`, `Win32API-File` | OS-specific (AmigaOS / VMS / Windows) — meaningless on wasm64-wasi. |
 | `GDBM_File`, `NDBM_File`, `ODBM_File`, `DB_File` | Require external DBM libraries (gdbm / ndbm / Berkeley DB) that are not available in the wasi sysroot. (`SDBM_File`, which bundles its own implementation, is kept instead.) |
-| `IPC-SysV` | System V IPC (`shmget` / `semget` / `msgget`) does not exist under wasi. |
 | `PerlIO-mmap` | Relies on `mmap`, which wasi implements only partially. |
 | `threads`, `threads-shared` | The interpreter is built without ithreads (`useithreads=undef`); the wasm target is single-threaded. |
 | `XS-APItest`, `XS-Typemap` | Test-only / module-author tooling; not needed at runtime. |
@@ -87,5 +86,5 @@ Notes:
 
 If a use case later needs one of the excluded modules, the fix is either to
 port the missing capability into the wasi host layer or
-to build the required third-party library for wasm32-wasi and add the module to
+to build the required third-party library for wasm64-wasi and add the module to
 `static_ext`.

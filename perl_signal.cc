@@ -54,8 +54,10 @@ extern "C" {
  * when it has nothing to learn. */
 void wasi_signal_attach(pTHX) {
     PL_signalhook = signal_hook;
-    if (__wasmify_host_proc_signal_register((void *)&PL_sig_pending) == 0)
-        __wasmify_signal_report();
+    const int registered = __wasmify_host_proc_signal_register((volatile uint32_t *)&PL_sig_pending);
+    if (registered < 0)
+        Perl_croak(aTHX_ "goperl: registering PL_sig_pending with the host: %s", Strerror(-registered));
+    if (registered == 0) __wasmify_signal_report();
 }
 
 } /* extern "C" */
