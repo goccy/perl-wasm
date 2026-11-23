@@ -101,6 +101,7 @@ wasip1_posix_extension proc_user_by_id func
 wasip1_posix_extension proc_user_by_name func
 wasip1_posix_extension proc_wait func
 wasip1_posix_extension proc_wait_any func
+wasip1_posix_extension proc_wait_group func
 wasip1_posix_extension sock_bind_addr func
 wasip1_posix_extension sock_connect_addr func
 wasip1_posix_extension sock_getopt func
