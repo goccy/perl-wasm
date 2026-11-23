@@ -1026,12 +1026,12 @@ patch("ext/B/typemap", "GOPERL_NUMBER_OP", [
 ])
 PYPATCH
 # ---- B: an op number that is no address of this memory ------------------------
-# A number without bit 62 that B takes as an op is native code's: an address
-# of the host process, which is this memory's where the host has this memory
-# (perl.cc goperl_memory_address), or one of native code's own: a native
-# module that makes a B::OP object of an op of its own (B::CallChecker builds
-# one on its C stack and asks B for its next op). B is given an op of this
-# memory that stands for that (perl.cc goperl_native_op). Idempotent.
+# A number without bit 62 that B takes as an op is native code's: an
+# address of the host process (a native module that makes a B::OP object of
+# an op of its own: B::CallChecker builds one on its C stack and asks B for
+# its next op). B is given an op of this memory that stands for it (perl.cc
+# goperl_native_op). The tag alone decides, whatever the address is.
+# Idempotent.
 python3 - <<'PYPATCH'
 path = "ext/B/B.xs"
 t = open(path).read()
@@ -1041,13 +1041,10 @@ else:
     old = ('#define GOPERL_NUMBER_OP(type, iv) INT2PTR(type, (iv) & ~GOPERL_OP_NUMBER_TAG)\n')
     new = ('#define GOPERL_NUMBER_OP(type, iv) ((type)goperl_number_op(aTHX_ (iv)))\n'
            'extern OP *goperl_native_op(pTHX_ UV addr);\n'
-           'extern int goperl_memory_address(UV addr, UV *at);\n'
            'static void *goperl_number_op(pTHX_ IV iv) {\n'
-           '    const UV addr = (UV)iv & ~(UV)GOPERL_OP_NUMBER_TAG;\n'
-           '    UV at;\n'
-           '    if (iv & GOPERL_OP_NUMBER_TAG) return INT2PTR(void *, addr);\n'
-           '    if (!goperl_memory_address(addr, &at)) return goperl_native_op(aTHX_ addr);\n'
-           '    return INT2PTR(void *, at);\n'
+           '    if (!iv) return NULL;\n'
+           '    if (iv & GOPERL_OP_NUMBER_TAG) return INT2PTR(void *, iv & ~GOPERL_OP_NUMBER_TAG);\n'
+           '    return goperl_native_op(aTHX_ (UV)iv);\n'
            '}\n')
     assert t.count(old) == 1, (path, t.count(old))
     open(path, "w").write(t.replace(old, new))
@@ -1055,11 +1052,11 @@ else:
 PYPATCH
 # ---- B: the links of an op of native code ------------------------------------
 # An op of native code that B is given (perl.cc goperl_native_op) keeps the
-# addresses its links have in the host process: B follows one when it is
-# asked for it, as perl reads a link only then. Every op B makes an object
-# of, and every op its walks step to, is taken through goperl_number_op,
-# which gives an address outside this memory the op that stands for it.
-# Idempotent.
+# addresses its links have in the host process, marked as native code's: B
+# follows one when it is asked for it, as perl reads a link only then. Every
+# op B makes an object of, and every op its walks step to, is taken through
+# perl.cc goperl_op_link, which gives such a link the op that stands for it
+# and leaves the links of the interpreter's ops as they are. Idempotent.
 python3 - <<'PYPATCH'
 path = "ext/B/B.xs"
 t = open(path).read()
@@ -1068,8 +1065,9 @@ if "GOPERL_LINK" in t:
 else:
     pairs = [
         ('static SV *\nmake_op_object(pTHX_ const OP *o)\n{\n    SV *opsv = sv_newmortal();\n',
-         '/* the op a link holds, as B follows it (goperl_number_op) */\n'
-         '#define GOPERL_LINK(o) ((OP *)goperl_number_op(aTHX_ PTR2IV(o)))\n\n'
+         '/* the op a link holds, as B follows it (perl.cc goperl_op_link) */\n'
+         'extern OP *goperl_op_link(pTHX_ const OP *o);\n'
+         '#define GOPERL_LINK(o) goperl_op_link(aTHX_ (o))\n\n'
          'static SV *\nmake_op_object(pTHX_ const OP *o)\n{\n    SV *opsv = sv_newmortal();\n'
          '    o = GOPERL_LINK(o);\n'),
         ('    const char *const classname = opclassnames[op_class(o)];\n    dMY_CXT;\n',

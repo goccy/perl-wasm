@@ -2485,23 +2485,6 @@ extern "C" const char *goperl_pack_address(const char *p) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) + base));
 }
 
-/* Whether addr, an address native code handed over, is one of this memory:
- * *at is then its address here. Native code has this memory at the host's
- * base of it; without a base there is no native code, and every address is
- * this memory's. */
-extern "C" int goperl_memory_address(UV addr, UV *at) {
-    const uint64_t base = g_hostwords.membase;
-    const uint64_t a = (uint64_t)addr;
-    if (!base) {
-        *at = addr;
-        return 1;
-    }
-    const uint64_t size = static_cast<uint64_t>(__builtin_wasm_memory_size(0)) << 16;
-    if (a < base || a - base >= size) return 0;
-    *at = (UV)(a - base);
-    return 1;
-}
-
 extern "C" SV *goperl_unpack_address(pTHX_ const char *p, SSize_t len) {
     const uint64_t base = g_hostwords.membase;
     const uint64_t a = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
@@ -2619,6 +2602,14 @@ static const char *goperl_procmem_string(pTHX_ uint64_t addr) {
  * for it (B.xs's make_op_object and its walks of ops), as perl reads a
  * link only then, so a link the module left holding stack bytes is never
  * read unless the program asks for it. */
+/* A link of an op of native code in the op goperl_native_op gives B: the
+ * address in the host process, marked as native code's by bit 63, which no
+ * address of the host process has (goperl_op_link). */
+#define GOPERL_NATIVE_LINK_TAG ((uint64_t)1 << 63)
+static inline OP *goperl_native_link(uint64_t addr) {
+    return addr ? (OP *)(uintptr_t)(addr | GOPERL_NATIVE_LINK_TAG) : NULL;
+}
+
 extern "C" OP *goperl_native_op(pTHX_ UV addr) {
     static std::unordered_map<uint64_t, OP *> ghosts;
     const uint64_t addr64 = (uint64_t)addr;
@@ -2650,11 +2641,20 @@ extern "C" OP *goperl_native_op(pTHX_ UV addr) {
     o->op_folded = (w[1] >> 37) & 1;
     o->op_ppaddr = PL_ppaddr[o->op_type];
     o->op_targ = (PADOFFSET)w[2];
-    o->op_next = (OP *)(uintptr_t)w[3];
-    o->op_sibparent = (OP *)(uintptr_t)w[4];
-    cUNOPx(o)->op_first = (OP *)(uintptr_t)w[5];
-    cBINOPx(o)->op_last = (OP *)(uintptr_t)w[6];
+    o->op_next = goperl_native_link(w[3]);
+    o->op_sibparent = goperl_native_link(w[4]);
+    cUNOPx(o)->op_first = goperl_native_link(w[5]);
+    cBINOPx(o)->op_last = goperl_native_link(w[6]);
     return o;
+}
+
+/* The op a link of an op holds, as B follows it (scripts/wasi-configure.sh,
+ * GOPERL_LINK): the op that stands for native code's op a link of
+ * goperl_native_op's op names, an op of the interpreter as it is. */
+extern "C" OP *goperl_op_link(pTHX_ const OP *o) {
+    const uint64_t v = (uint64_t)(uintptr_t)o;
+    if (v & GOPERL_NATIVE_LINK_TAG) return goperl_native_op(aTHX_ (UV)(v & ~GOPERL_NATIVE_LINK_TAG));
+    return const_cast<OP *>(o);
 }
 
 /* The encode_t table of an Encode::XS object of native code: a module made
